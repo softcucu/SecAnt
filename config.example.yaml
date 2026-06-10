@@ -1,0 +1,80 @@
+# ════════════════════════════════════════════════════════════════════
+# proto-vuln-hunt (python) 配置示例
+# 用法:python -m proto_vuln_hunt --config config.example.yaml --target /path/to/repo
+# ════════════════════════════════════════════════════════════════════
+
+# ── 后端:用哪个 CLI 来跑每一个 agent ──
+# 可选内置:claude | opencode | codex(也可在下方 backends: 里自定义/覆盖调用方式)
+backend: claude
+
+# ── 模型:按阶段(role)分别指定;缺省回落到 default ──
+# role 取值:recon / decompose / audit / verify / report / poc / synthesis / util
+# 注意:
+#   · claude   模型名形如  claude-opus-4-8 / claude-sonnet-4-6 / claude-haiku-4-5-20251001
+#   · opencode 模型名形如  provider/model,如 anthropic/claude-sonnet-4-6、openai/gpt-5
+#   · codex    模型名形如  gpt-5-codex / o3 等
+models:
+  default: claude-sonnet-4-6
+  recon: claude-opus-4-8        # 侦察/威胁建模用更强的模型
+  verify: claude-sonnet-4-6     # 对抗验证
+  synthesis: claude-sonnet-4-6
+
+# ── 并发:任意时刻最多同时运行多少个 agent(其余排队) ──
+concurrency: 4
+
+# ── 流水线参数(全部可选,下面是默认值) ──
+params:
+  finders_per_lens: 2           # 每个攻击面每个 lens 每轮派几个 finder
+  dry_rounds: 2                 # 连续几轮无新增即收敛
+  max_rounds: 6                 # 审计循环硬上限
+  verify_votes: 3               # 每条候选的对抗验证票数(多数否决即杀)
+  threat_model: REMOTE          # REMOTE | LOCAL_UNPRIVILEGED | BOTH
+  enable_poc: true              # 高危项是否进隔离 worktree 编译 PoC
+  lenses: [memory, integer, race, injection, authn, crypto, dos, infoleak]
+  decompose: true               # 审计前把大 region 拆成有界子任务
+  unit_line_budget: 1500
+  max_subtasks_per_region: 16
+  max_files_per_unit: 4
+
+# ── 方法库目录(.md 审计方法,agent 运行时会 Read) ──
+# 默认使用项目自带的 proto_vuln_hunt/methods/(随项目分发,无需任何外部依赖)。
+# 只有想用自定义方法库时才取消注释并指向你自己的目录:
+# methods_dir: /path/to/your/methods
+
+# ── 断点续跑 ──
+resume: true                    # 重跑相同命令自动从断点继续
+# fresh: true                   # 取消注释 = 忽略断点从头跑
+
+# ── Web 控制台(仅 `serve` 子命令使用) ──
+web:
+  host: 127.0.0.1               # 绑定地址(对外暴露需自行加反代/鉴权)
+  port: 8000
+  runs_dir: ./pvh-runs          # 各 run 的根目录(每个 run 一个子目录)
+
+# ── 后端 CLI 任务执行失败后的重试 ──
+# 注意:opencode/claude/codex 内部已自行重试瞬时 API 抖动;这一层只在 **CLI 任务整体失败** 时重试,
+# 即:子进程非零退出 / 超时 / 输出无法解析为所需的结构化 JSON。耗尽后跳过该 agent(漏洞靠续跑挽回)。
+retry:
+  max_attempts: 4               # 失败后最多再重试几次(总尝试 = 1 + max_attempts)
+  backoff_base_ms: 2000         # 退避基数(指数增长;疑似限流时自动延长)
+  backoff_cap_ms: 30000         # 单次退避封顶
+  timeout_ms: 1800000           # 单次子进程墙钟超时(超时也算一次失败 → 计入重试)
+
+# ── 后端调用方式(可选;不写则用内置默认模板) ──
+# command 是 token 列表;运行时替换:{model}=当前角色模型,{prompt}=提示词(仅 arg 模式)。
+# prompt_mode: stdin(提示词从标准输入喂入) | arg(提示词作为命令行参数,用 {prompt} 占位)。
+# parse: claude_json(把 stdout 当 JSON 取 .result) | text(stdout 即文本)。
+# env: 给该后端注入的环境变量(可选)。
+backends:
+  claude:
+    command: ["claude", "-p", "--output-format", "json", "--model", "{model}", "--dangerously-skip-permissions"]
+    prompt_mode: stdin
+    parse: claude_json
+  opencode:
+    command: ["opencode", "run", "--model", "{model}", "{prompt}"]
+    prompt_mode: arg
+    parse: text
+  codex:
+    command: ["codex", "exec", "--model", "{model}", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "{prompt}"]
+    prompt_mode: arg
+    parse: text

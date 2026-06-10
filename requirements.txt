@@ -1,0 +1,6 @@
+# CLI(run 子命令)依赖:
+PyYAML>=5.1          # 用 JSON 配置则连这个也可省
+
+# Web 控制台(serve 子命令)额外依赖(纯 CLI 用户可不装):
+fastapi>=0.100
+uvicorn[standard]>=0.23
