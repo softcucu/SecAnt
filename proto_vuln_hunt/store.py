@@ -217,6 +217,18 @@ class RunStore:
         os.makedirs(self.risks_dir, exist_ok=True)
         _atomic_write(os.path.join(self.risks_dir, f"{rec['id']}.json"), json.dumps(rec, ensure_ascii=False, indent=2))
 
+    def update_risk_severity(self, rid: str, severity: str) -> Optional[Dict[str, Any]]:
+        """直接改写某条风险文件的 severity_hint(供运行已结束时的人工调级)。返回更新后的记录或 None。"""
+        if not self._safe_id(rid):
+            return None
+        path = os.path.join(self.risks_dir, f"{rid}.json")
+        d = self._read_json(path)
+        if not d:
+            return None
+        d["severity_hint"] = severity
+        _atomic_write(path, json.dumps(d, ensure_ascii=False, indent=2))
+        return d
+
     def load_risks(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         if os.path.isdir(self.risks_dir):

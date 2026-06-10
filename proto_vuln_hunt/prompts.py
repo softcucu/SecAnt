@@ -260,6 +260,27 @@ class PromptBuilder:
             + must_struct(schema)
         )
 
+    # ── 风险点复查(专用优先排查角色) ──
+    def recheck_risk(self, item: Dict[str, Any], schema) -> str:
+        return (
+            f"你在对 C/C++ 源码做白盒**定向人工审计**。目标:{self.target}{self.scope_note}(威胁模型:{self.threat})\n"
+            f"审计对象:**潜在风险点复查**「{item.get('area')}」\n"
+            f"相关文件:{item.get('file') or '(自行定位)'}\n"
+            f"风险说明:{item.get('note')}\n\n"
+            "这条风险点的典型形态是「校验只在调用方、被调点本身不自洽」——某个被调函数 / 危险原语 / 共享 helper(记为 B)的安全"
+            "**依赖调用方传入已校验的参数**,B 自身并不重新校验;已知某条调用路径(调用方做了充分校验)是安全的,"
+            "但**全仓其它调用 B 的地方未必都做了等价校验**。\n"
+            "请据风险说明先定位 B,然后:\n"
+            "- 用 rg / semgrep / tree-sitter 脚本 / CodeQL(免编译)把**全仓所有调用 B 的站点**枚举出来(广度优先,别漏);\n"
+            "- 逐一精读每个调用点:核实 B 保持安全所依赖的前提 / 不变量(长度已夹紧、指针非空、已认证等)在该调用点是否真的成立;\n"
+            "- 对**不满足前提**的调用点,回溯 source→sink 并判可控性 / 可达性;坐实为漏洞的报成 finding;\n"
+            "- 仍可疑但未坐实的继续放进 risk_notes(写清新的待核实点);新的可疑数据流 / 入口放进 new_surfaces。\n"
+            f"{PROTO_EXTRA}\n\n"
+            "要求:看真实代码、回溯数据流,不要臆测;**宁缺毋滥**——没有可信外部输入路径、或已被上游夹紧的不要报。\n"
+            "(这是有的放矢的定向变体排查,不是全仓盲扫。)"
+            + must_struct(schema)
+        )
+
     # ── 对抗性验证 ──
     def verify(self, f: Dict[str, Any], lens: str, schema) -> str:
         return (

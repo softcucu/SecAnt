@@ -99,6 +99,17 @@ class RunManager:
         rec["stop"].set()
         return True
 
+    def set_risk_severity(self, run_id: str, rid: str, severity: str) -> bool:
+        """人工调整某条风险点级别。run 在跑 → 走 pipeline(联动入队/出队);否则直接改文件。"""
+        rec = self.active.get(run_id)
+        if rec and not rec["task"].done():
+            if rec["pipeline"].adjust_risk_severity(rid, severity):
+                return True
+        store = self.registry.get(run_id)
+        if not store:
+            return False
+        return store.update_risk_severity(rid, severity) is not None
+
     def recheck_health(self, run_id: str) -> bool:
         """对正在运行的 run 触发一次全模型健康复检(后台任务,实时经 SSE 回传)。"""
         rec = self.active.get(run_id)
@@ -213,6 +224,15 @@ def create_app(cfg: Config):
     @app.get("/api/runs/{run_id}/risks")
     async def risks(run_id: str):
         return _store_or_404(run_id).load_risks()
+
+    @app.post("/api/runs/{run_id}/risks/{rid}/severity")
+    async def set_risk_severity(run_id: str, rid: str, req: Request):
+        _store_or_404(run_id)
+        body = await req.json()
+        sev = (body or {}).get("severity_hint") or (body or {}).get("severity")
+        if sev not in ("high", "medium", "low", "info"):
+            raise HTTPException(400, "severity_hint 必须是 high/medium/low/info 之一")
+        return {"ok": manager.set_risk_severity(run_id, rid, sev)}
 
     @app.get("/api/runs/{run_id}/recon")
     async def recon(run_id: str):

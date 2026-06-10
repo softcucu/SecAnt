@@ -55,6 +55,8 @@ def item_key(it: Dict[str, Any]) -> str:
         return f"region:{it.get('name')}"
     if k == "variant":
         return f"variant:{it.get('pattern')}"
+    if k == "risk":
+        return f"risk:{it.get('id')}"
     if k == "task":
         return f"task:{it.get('region') or ''}:{it.get('objective') or it.get('name')}"
     return f"surface:{it.get('name')}"

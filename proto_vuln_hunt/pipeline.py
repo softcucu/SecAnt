@@ -50,6 +50,13 @@ class Pipeline:
         self.history_keys = set()                    # 历史模式去重(按 pattern 文本)
         self.history_done = set()                    # 已分析过的 git 提交 hash(续跑跳过)
         self._history_task: Optional[asyncio.Task] = None
+        # ── 专用优先排查通道(历史变体 + 风险点复查) ──
+        self.pq: List[Dict[str, Any]] = []           # 优先排查队列(kind ∈ {variant, risk};variant 优先)
+        self.risk_by_id: Dict[str, Dict[str, Any]] = {}  # rid -> 风险记录(便于人工调级时联动入队/出队)
+        self._recheck_task: Optional[asyncio.Task] = None
+        self._recheck_inflight = 0                   # 正在排查 + 已 pop 待起的项数(收敛判据)
+        self._recheck_stop: Optional[asyncio.Event] = None
+        self._audit_done = False                     # 主审计循环是否已收敛(供 recheck_loop 收尾)
         self.build_hint: str = ""
         self.seq = 0
         self.start_round = 0
@@ -173,6 +180,7 @@ class Pipeline:
             "completedItems": list(self.completed_items),
             "historyDone": list(self.history_done),
             "pendingQueue": self.queue,
+            "pendingPriorityQueue": self.pq,
             "pendingFindings": list(self.pending_findings.values()),
         }
 
@@ -221,7 +229,24 @@ class Pipeline:
             "progress": {"done": n_done, "clean": n_clean, "total": len(self.ledger_arr)},
         })
 
-    def record_risk(self, n: Dict[str, Any], lens: str, rnd: int) -> bool:
+    # 风险点 severity_hint 排序(用于判断是否够格自动入排查队列)
+    _RISK_SEV_ORDER = {"high": 3, "medium": 2, "low": 1, "info": 0}
+
+    def _risk_sev_ok(self, sev: Optional[str]) -> bool:
+        """severity_hint 是否达到自动入排查队列的阈值(cfg.recheck.risk_min_severity)。"""
+        th = self.cfg.recheck.risk_min_severity
+        return self._RISK_SEV_ORDER.get(sev or "info", 0) >= self._RISK_SEV_ORDER.get(th, 2)
+
+    def _enqueue_risk(self, note: Dict[str, Any]) -> None:
+        """把一条风险点放进优先排查队列(置 recheck_status=queued)。调用方负责落盘。"""
+        note["recheck_status"] = "queued"
+        self.pq.append({"kind": "risk", "id": note["id"], "area": note.get("area"),
+                        "note": note.get("note"), "file": note.get("file"),
+                        "severity_hint": note.get("severity_hint"), "lens": note.get("lens")})
+        self.emit(EV.RECHECK_ENQUEUED, {"kind": "risk", "id": note["id"], "area": note.get("area"),
+                                        "severity_hint": note.get("severity_hint")})
+
+    def record_risk(self, n: Dict[str, Any], lens: str, rnd: int, from_recheck: bool = False) -> bool:
         area = (n.get("area") or "").strip()
         if not area:
             return False
@@ -232,10 +257,44 @@ class Pipeline:
         self.risk_seq += 1
         note = {"id": f"RISK-{pad3(self.risk_seq)}", "area": area, "note": n.get("note") or "",
                 "file": n.get("file") or "", "severity_hint": n.get("severity_hint") or "info",
-                "lens": lens, "round": rnd}
+                "lens": lens, "round": rnd, "recheck_status": "none"}
         self.risk_notes.append(note)
-        self.store.save_risk(note)            # 写一次即终态:risks/<id>.json
+        self.risk_by_id[note["id"]] = note
+        # 达阈值且非复查自身产出的风险点 → 自动进专用优先排查队列(防自激:复查产出的不再回灌)
+        enq = self.cfg.recheck.enabled and not from_recheck and self._risk_sev_ok(note["severity_hint"])
+        if enq:
+            note["recheck_status"] = "queued"
+        self.store.save_risk(note)            # 写一次即落盘:risks/<id>.json
         self.emit(EV.RISK_ADDED, note)
+        if enq:
+            self.pq.append({"kind": "risk", "id": note["id"], "area": note.get("area"),
+                            "note": note.get("note"), "file": note.get("file"),
+                            "severity_hint": note.get("severity_hint"), "lens": note.get("lens")})
+            self.emit(EV.RECHECK_ENQUEUED, {"kind": "risk", "id": note["id"], "area": note.get("area"),
+                                            "severity_hint": note.get("severity_hint")})
+        return True
+
+    def adjust_risk_severity(self, rid: str, sev: str) -> bool:
+        """人工调整某条风险点的级别,并联动入队 / 出队(供 Web 接口在运行中调用)。
+        升到 ≥ 阈值且尚未排查过 → 入排查队列;降到 < 阈值且仍排队未跑 → 出队。"""
+        note = self.risk_by_id.get(rid)
+        if not note:
+            return False
+        old = note.get("severity_hint")
+        note["severity_hint"] = sev
+        status = note.get("recheck_status") or "none"
+        action = "none"
+        if self._risk_sev_ok(sev):
+            if status == "none":
+                self._enqueue_risk(note)
+                action = "enqueued"
+        else:
+            if status == "queued":
+                self.pq = [it for it in self.pq if not (it.get("kind") == "risk" and it.get("id") == rid)]
+                note["recheck_status"] = "none"
+                action = "dequeued"
+        self.store.save_risk(note)
+        self.emit(EV.RISK_SEVERITY_CHANGED, {"id": rid, "severity_hint": sev, "old": old, "action": action})
         return True
 
     # ──────────────────────── lens 选择 ────────────────────────
@@ -393,14 +452,29 @@ class Pipeline:
             self.seen_surface.update(ckpt.get("seenSurface") or [])
             self.completed_items.update(ckpt.get("completedItems") or [])
             self.queue = ckpt.get("pendingQueue") or []
+            self.pq = ckpt.get("pendingPriorityQueue") or []
+            # 兼容旧断点:历史变体过去落在主队列,迁移到优先排查队列
+            legacy_variants = [it for it in self.queue if it.get("kind") == "variant"]
+            if legacy_variants:
+                self.queue = [it for it in self.queue if it.get("kind") != "variant"]
+                self.pq.extend(legacy_variants)
             asf = self.store.load_attack_surface()
             self.surface_log = asf.get("surfaces") or []
             self.ledger_arr = asf.get("ledger") or []
             for r in self.ledger_arr:
                 self.ledger_map[r["key"]] = r
             self.risk_notes = self.store.load_risks()              # 扫 risks/<id>.json 恢复
+            pq_risk_ids = {it.get("id") for it in self.pq if it.get("kind") == "risk"}
             for r in self.risk_notes:
                 self.risk_keys.add(f"{(r.get('area') or '').strip().lower()}::{(r.get('file') or '').strip()}")
+                rid = r.get("id")
+                if rid:
+                    self.risk_by_id[rid] = r
+                # 中断时正在排查 / 排队但未落进 pq 的风险点 → 重新入队补排
+                st = r.get("recheck_status")
+                if rid and st in ("queued", "running") and rid not in pq_risk_ids and self._risk_sev_ok(r.get("severity_hint")):
+                    self._enqueue_risk(r)
+                    self.store.save_risk(r)
             for f in (ckpt.get("pendingFindings") or []):
                 fk = finding_key(f)
                 self.pending_findings[fk] = f
@@ -554,9 +628,8 @@ class Pipeline:
                  "files": res.get("files") or [], "rationale": res.get("rationale") or ""}
         self.history.append(entry)
         self.surface_data["history"] = self.history
-        # 回灌为「同类变体排查」队列项,供后续审计轮次处理(不阻塞当前流程)
-        self.queue.append({"kind": "variant", "pattern": entry["pattern"], "source": entry["source"],
-                           "files": entry["files"], "lens_hint": entry["lens_hint"]})
+        # 回灌为「同类变体排查」项,放进专用优先排查队列(最高优先,由 recheck 角色逐条处理)
+        self._enqueue_variant(entry)
         self.emit(EV.HISTORY_ADDED, {**entry, "total": len(self.history)})
         self.persist_recon()
         self.log(f"🕮 历史模式 +1[{entry['lens_hint']}]:{pattern[:60]} ← {source[:40]}")
@@ -587,8 +660,8 @@ class Pipeline:
         while (self.queue or dry_streak < self.cfg.dry_rounds or self._history_active()) \
                 and self.round < self.cfg.max_rounds and not self.stop_requested():
             if not self.queue:
-                if self._history_active():
-                    # 队列暂空但 git 历史挖掘仍在跑:等它把变体灌进来,不空烧回合数
+                # 主队列暂空:只要 git 历史挖掘 / 优先排查队列还有活,就等它们(不空烧回合数、不提前收敛)
+                if self._history_active() or self.pq or self._recheck_inflight > 0:
                     await asyncio.sleep(self.cfg.history.poll_interval_s)
                     continue
                 self.log(f"轮 {self.round}: 队列已空且无新攻击面回灌,提前收敛")
@@ -669,6 +742,19 @@ class Pipeline:
                 await self._history_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        # 优先排查通道收尾:主审计已收敛、历史挖掘已结束 → 通知 recheck 排空剩余优先项后退出
+        self._audit_done = True
+        if self._recheck_task is not None:
+            if self._recheck_stop is not None:
+                self._recheck_stop.set()
+            if not self._recheck_task.done() and self.stop_requested():
+                self._recheck_task.cancel()
+            if self.pq or self._recheck_inflight > 0:
+                self.log(f"等待优先排查通道排空:队列 {len(self.pq)} 项、在途 {self._recheck_inflight} 项…")
+            try:
+                await self._recheck_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         self.log(f"审计循环结束:{stop_reason}。等待 {len(self.in_flight)} 条流水线(验证/PoC/报告)排空…")
         await asyncio.gather(*self.in_flight, return_exceptions=True)
         self.checkpoint(self.round)
@@ -689,6 +775,12 @@ class Pipeline:
         if not res:
             item["failedFinders"] = item.get("failedFinders", 0) + 1
             return
+        self._consume(res, item, rec, lens_key)
+
+    def _consume(self, res: Dict[str, Any], item: Dict[str, Any], rec: Dict[str, Any],
+                 lens_key: str, from_recheck: bool = False) -> None:
+        """消化一次审计 / 复查 agent 的结果:findings→验证流水线、new_surfaces→主队列、risk_notes→登记。
+        from_recheck=True 时,产出的 risk_notes 不再二次回灌优先队列(防自激)。"""
         for f in (res.get("findings") or []):
             fk = finding_key(f)
             if fk in self.dedup_keys:
@@ -714,8 +806,106 @@ class Pipeline:
             self.surface_log.append(entry)
             self.emit(EV.SURFACE_ADDED, entry)
         for n in (res.get("risk_notes") or []):
-            if self.record_risk(n, lens_key, self.round):
+            if self.record_risk(n, lens_key, self.round, from_recheck=from_recheck):
                 rec["risks"] = rec.get("risks", 0) + 1
+
+    # ──────── 专用优先排查通道:历史变体 + 风险点复查(并发上限独立,懒占全局名额)────────
+    def _recheck_active(self) -> bool:
+        return self._recheck_task is not None and not self._recheck_task.done()
+
+    def _enqueue_variant(self, entry: Dict[str, Any]) -> None:
+        """git 历史挖掘提炼出的问题模式 → 进优先排查队列(同类变体排查)。"""
+        self.pq.append({"kind": "variant", "pattern": entry["pattern"], "source": entry["source"],
+                        "files": entry["files"], "lens_hint": entry["lens_hint"]})
+        self.emit(EV.RECHECK_ENQUEUED, {"kind": "variant", "pattern": entry["pattern"],
+                                        "lens_hint": entry["lens_hint"]})
+
+    def _pop_priority(self) -> Optional[Dict[str, Any]]:
+        """取下一个优先项:历史变体(variant)优先于风险点(risk);跳过已完成的。"""
+        while self.pq:
+            idx = next((i for i, it in enumerate(self.pq) if it.get("kind") == "variant"), 0)
+            it = self.pq.pop(idx)
+            if item_key(it) in self.completed_items:
+                continue
+            return it
+        return None
+
+    def _start_recheck(self) -> None:
+        if not self.cfg.recheck.enabled or self._recheck_task is not None:
+            return
+        self._recheck_stop = asyncio.Event()
+        self._recheck_task = asyncio.create_task(self.recheck_loop())
+
+    async def recheck_loop(self) -> None:
+        """专用排查 agent:从优先队列取项排查。并发上限 = cfg.recheck.concurrency(默认 1);
+        懒占全局并发名额——有活才占、用完即还,队列空时不占用主池。"""
+        sem = asyncio.Semaphore(max(1, self.cfg.recheck.concurrency))
+        inflight: List[asyncio.Task] = []
+        self.log(f"🔁 优先排查通道就绪(并发上限 {self.cfg.recheck.concurrency},"
+                 f"风险点入队阈值 ≥{self.cfg.recheck.risk_min_severity};历史变体与风险点复查优先处理)")
+
+        async def worker(it: Dict[str, Any]) -> None:
+            try:
+                async with sem:
+                    if self.stop_requested():
+                        return
+                    got = await self.runner.reserve_slots(1)   # 懒占:用时才占 1 个全局名额
+                    try:
+                        await self._run_recheck(it)
+                    finally:
+                        self.runner.release_slots(got)          # 用完即还,主池回满
+            finally:
+                self._recheck_inflight -= 1
+
+        while not self.stop_requested():
+            inflight = [t for t in inflight if not t.done()]
+            it = self._pop_priority()
+            if it is None:
+                if (self._recheck_stop and self._recheck_stop.is_set()
+                        and self._recheck_inflight == 0 and not inflight):
+                    break
+                await asyncio.sleep(self.cfg.recheck.poll_interval_s)
+                continue
+            self._recheck_inflight += 1                          # pop 与计数之间无 await,原子
+            inflight.append(asyncio.create_task(worker(it)))
+        await asyncio.gather(*inflight, return_exceptions=True)
+
+    async def _run_recheck(self, item: Dict[str, Any]) -> None:
+        if self.stop_requested():
+            return
+        kind = item.get("kind")
+        rid = item.get("id")
+        rec = self.ledger_rec(item)
+        rec["status"] = "in-progress"
+        rec["passes"] = rec.get("passes", 0) + 1
+        rec["lastRound"] = self.round
+        item["pass"] = item.get("pass", 0) + 1
+        item["newThisRound"] = 0
+        item["newSurfacesThisRound"] = 0
+        if kind == "risk" and rid in self.risk_by_id:
+            self.risk_by_id[rid]["recheck_status"] = "running"
+            self.store.save_risk(self.risk_by_id[rid])
+        if kind == "variant":
+            lens_key = item.get("lens_hint") if item.get("lens_hint") in self.cfg.lenses else "memory"
+            prompt = self.pb.audit(item, lens_key, 0, S.FINDINGS_SCHEMA)
+            label = f"recheck:variant:{str(item.get('pattern') or '')[:24]}"
+        else:
+            lens_key = item.get("lens") if item.get("lens") in self.cfg.lenses else "memory"
+            prompt = self.pb.recheck_risk(item, S.FINDINGS_SCHEMA)
+            label = f"recheck:risk:{str(item.get('area') or rid or '')[:24]}"
+        if lens_key not in rec["lenses"]:
+            rec["lenses"].append(lens_key)
+        res = await self.runner.run(prompt, role="recheck", label=label, schema=S.FINDINGS_SCHEMA,
+                                    use_global_gate=False)   # 名额已由 worker 预占,复用、不重复申请全局门
+        if res:
+            self._consume(res, item, rec, lens_key, from_recheck=True)
+        self.completed_items.add(item_key(item))
+        rec["status"] = "completed-findings" if rec.get("candidates", 0) > 0 else "completed-clean"
+        if kind == "risk" and rid in self.risk_by_id:
+            self.risk_by_id[rid]["recheck_status"] = "done"
+            self.store.save_risk(self.risk_by_id[rid])
+        self.emit(EV.RECHECK_DONE, {"kind": kind, "id": rid, "label": label,
+                                    "new_candidates": item.get("newThisRound", 0)})
 
     # ──────────────────────── 阶段 ③ 汇总(结构化,无文件写盘) ────────────────────────
     def synthesis(self, stop_reason: str) -> Dict[str, Any]:
@@ -782,6 +972,7 @@ class Pipeline:
                 await self.health_check_all()
             await self.recon()
             self._start_history_mining()   # 与拆解/审计并行;不阻塞后续阶段开展
+            self._start_recheck()          # 专用优先排查通道:历史变体 + 风险点复查,与审计并行
             stop_reason = await self.audit()
             result = self.synthesis(stop_reason)
             self.emit(EV.RUN_STATUS, {"status": result["status"]})

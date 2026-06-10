@@ -28,7 +28,8 @@ ALL_LENSES = ["memory", "integer", "race", "injection", "authn", "crypto", "dos"
 
 # 流水线里会用到的 agent 角色;每个角色都可在 models 里单独指定模型,缺省回落到 default。
 # history:独立于侦察、与主流程并行的「git 历史问题模式挖掘」(每条提交一个 agent)。
-ROLES = ["recon", "history", "decompose", "audit", "verify", "report", "poc", "synthesis", "util"]
+# recheck:专用优先排查角色——处理历史问题变体 + 已登记风险点的复查(独立优先队列、默认并发 1)。
+ROLES = ["recon", "history", "recheck", "decompose", "audit", "verify", "report", "poc", "synthesis", "util"]
 
 
 # ──────────────────────────── 后端默认调用模板 ────────────────────────────
@@ -137,6 +138,21 @@ class HistorySpec:
 
 
 @dataclass
+class RecheckSpec:
+    """专用「优先排查」通道:把历史问题变体排查 + 已登记风险点复查抽到一条独立优先队列,
+    由专用 agent(role=recheck)处理。优先级最高——只要队列里有项,空出的 agent 名额就先来处理它
+    (懒占全局并发名额:有活才占、用完即还,队列空时不占用主池)。
+
+    风险点复查的典型对象:被调函数/危险原语(B)的安全依赖调用方传入已校验的参数,当前路径安全但
+    全仓其它调用 B 的地方未必都做了等价校验——即变体排查的种子。
+    """
+    enabled: bool = True
+    concurrency: int = 1            # 该角色并发上限(默认 1:逐条串行排查)
+    risk_min_severity: str = "medium"  # 风险点自动入排查队列的最低 severity_hint(high/medium/low/info)
+    poll_interval_s: int = 3        # 优先队列空时的轮询等待间隔(秒)
+
+
+@dataclass
 class Config:
     # 目标
     target: str = "."
@@ -172,6 +188,7 @@ class Config:
     retry: RetrySpec = field(default_factory=RetrySpec)
     health: HealthCheckSpec = field(default_factory=HealthCheckSpec)
     history: HistorySpec = field(default_factory=HistorySpec)
+    recheck: RecheckSpec = field(default_factory=RecheckSpec)
 
     # ── Web / serve(仅 `serve` 子命令使用) ──
     host: str = "127.0.0.1"
@@ -195,6 +212,10 @@ class Config:
         self.verify_votes = max(1, int(self.verify_votes))
         self.max_subtasks_per_region = max(1, int(self.max_subtasks_per_region))
         self.max_files_per_unit = max(1, int(self.max_files_per_unit))
+        self.recheck.concurrency = max(1, int(self.recheck.concurrency))
+        if self.recheck.risk_min_severity not in ("high", "medium", "low", "info"):
+            self.recheck.risk_min_severity = "medium"
+        self.recheck.poll_interval_s = max(1, int(self.recheck.poll_interval_s))
         if self.fresh:
             self.resume = False
         self.port = int(self.port)
@@ -396,10 +417,20 @@ def load_config(path: Optional[str], overrides: Optional[Dict[str, Any]] = None)
         poll_interval_s=max(1, int(hist_data.get("poll_interval_s", _h_default.poll_interval_s))),
     )
 
+    # 专用优先排查通道配置(历史变体 + 风险点复查)。
+    rc_data = data.pop("recheck", {}) or {}
+    _rc_default = RecheckSpec()
+    recheck = RecheckSpec(
+        enabled=bool(rc_data.get("enabled", True)),
+        concurrency=max(1, int(rc_data.get("concurrency", _rc_default.concurrency))),
+        risk_min_severity=str(rc_data.get("risk_min_severity", _rc_default.risk_min_severity) or _rc_default.risk_min_severity),
+        poll_interval_s=max(1, int(rc_data.get("poll_interval_s", _rc_default.poll_interval_s))),
+    )
+
     if overrides:
         data.update({k: v for k, v in overrides.items() if v is not None})
 
     known = {f for f in Config.__dataclass_fields__}  # type: ignore[attr-defined]
-    kwargs = {k: v for k, v in data.items() if k in known and k not in ("retry", "health", "history", "backends")}
-    cfg = Config(backends=backends, retry=retry, health=health, history=history, **kwargs)
+    kwargs = {k: v for k, v in data.items() if k in known and k not in ("retry", "health", "history", "recheck", "backends")}
+    cfg = Config(backends=backends, retry=retry, health=health, history=history, recheck=recheck, **kwargs)
     return cfg

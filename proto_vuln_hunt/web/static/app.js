@@ -495,12 +495,36 @@ function viewDashboard(runId) {
   const STATUS_TXT = { "decomposed": "🧩 已拆解", "completed-clean": "✅ 未发现", "completed-findings": "⚠️ 有候选", "in-progress": "🔄 进行中", "incomplete": "⛔ 未审完", "pending": "⏳ 待审" };
   function statusBadge(s) { return el("span", {}, STATUS_TXT[s] || s || "?"); }
 
+  const RECHECK_TXT = { none: "—", queued: "排队中", running: "排查中", done: "已排查" };
+
+  function severitySelect(r) {
+    const sel = el("select", { class: "sevsel" });
+    for (const s of ["high", "medium", "low", "info"]) {
+      const o = el("option", { value: s }, s);
+      if (s === (r.severity_hint || "info")) o.selected = true;
+      sel.append(o);
+    }
+    sel.onchange = async () => {
+      const sev = sel.value;
+      try {
+        await api("POST", `/api/runs/${encodeURIComponent(runId)}/risks/${encodeURIComponent(r.id)}/severity`, { severity_hint: sev });
+        r.severity_hint = sev;
+        flash(`✔ ${r.id} 风险级别已改为 ${sev}`);
+        fetchRisks();
+      } catch (e) { flash("⚠ 调级失败:" + e.message); }
+    };
+    return sel;
+  }
+
   function renderRisks() {
     const list = [...S.risks.values()].sort((a, b) => SEVS.indexOf(a.severity_hint) - SEVS.indexOf(b.severity_hint));
     if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无风险登记。")); return; }
-    const tbl = el("table", {}, el("thead", {}, el("tr", {}, el("th", {}, "风险"), el("th", {}, "主题"), el("th", {}, "位置"), el("th", {}, "说明"), el("th", {}, "lens"))));
+    const tbl = el("table", {}, el("thead", {}, el("tr", {}, el("th", {}, "风险"), el("th", {}, "主题"), el("th", {}, "位置"), el("th", {}, "说明"), el("th", {}, "lens"), el("th", {}, "排查"))));
     const tb = el("tbody");
-    for (const r of list) tb.append(el("tr", {}, el("td", {}, sevPill(r.severity_hint)), el("td", {}, r.area || ""), el("td", { class: "loc" }, r.file || "—"), el("td", {}, r.note || ""), el("td", {}, r.lens || "")));
+    for (const r of list) {
+      const sevCell = r.id ? severitySelect(r) : sevPill(r.severity_hint);
+      tb.append(el("tr", {}, el("td", {}, sevCell), el("td", {}, r.area || ""), el("td", { class: "loc" }, r.file || "—"), el("td", {}, r.note || ""), el("td", {}, r.lens || ""), el("td", {}, RECHECK_TXT[r.recheck_status] || r.recheck_status || "—")));
+    }
     tbl.append(tb);
     tabBody.append(el("div", { class: "panel" }, tbl));
   }
@@ -621,6 +645,8 @@ function viewDashboard(runId) {
         else if (d.id) S.findings.set(d.id, d);
         renderHeader(); renderTabs(); if (activeTab === "findings") renderTab(); break;
       case "risk_added": { const k = (d.area || "") + "::" + (d.file || ""); S.risks.set(k, d); renderHeader(); renderTabs(); if (activeTab === "risks") renderTab(); break; }
+      case "recheck_enqueued": case "recheck_done": case "risk_severity_changed":
+        fetchRisks(); break;
       case "surface_added": case "coverage_update":
         if (ev.type === "coverage_update") S.coverage = Object.assign({}, S.coverage, d);
         if (activeTab === "coverage") renderTab(); break;
@@ -637,7 +663,7 @@ function viewDashboard(runId) {
   }
   async function fetchRecon() { try { S.recon = await api("GET", `/api/runs/${encodeURIComponent(runId)}/recon`); if (activeTab === "recon") renderTab(); } catch (e) {} }
   async function fetchCoverage() { try { const c = await api("GET", `/api/runs/${encodeURIComponent(runId)}/coverage`); if (c) { S.coverage = Object.assign({}, S.coverage, c); if (activeTab === "coverage") renderTab(); } } catch (e) {} }
-  async function fetchRisks() { try { const list = await api("GET", `/api/runs/${encodeURIComponent(runId)}/risks`); for (const r of (list || [])) { const k = (r.area || "") + "::" + (r.file || ""); if (!S.risks.has(k)) S.risks.set(k, r); } renderHeader(); renderTabs(); if (activeTab === "risks") renderTab(); } catch (e) {} }
+  async function fetchRisks() { try { const list = await api("GET", `/api/runs/${encodeURIComponent(runId)}/risks`); for (const r of (list || [])) { const k = (r.area || "") + "::" + (r.file || ""); S.risks.set(k, r); } renderHeader(); renderTabs(); if (activeTab === "risks") renderTab(); } catch (e) {} }
   async function fetchHealth() { try { const h = await api("GET", `/api/runs/${encodeURIComponent(runId)}/health`); for (const r of (h.models || [])) if (r.model) S.health.set(r.model, r); renderTabs(); if (activeTab === "health") renderTab(); } catch (e) {} }
 
   async function boot() {
@@ -647,7 +673,7 @@ function viewDashboard(runId) {
     // SSE:从 seq 0 重放历史事件(重建 findings/coverage/risks/log)再接实时;EventSource 断线自动带 Last-Event-ID 续传
     const es = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events`);
     window._es = es;
-    const TYPES = ["run_status", "metrics", "usage", "agent_update", "candidate_found", "finding_confirmed", "risk_added", "surface_added", "coverage_update", "round_start", "round_done", "recon_done", "history_added", "run_done", "log", "decompose_done", "poc_done", "error", "model_health", "health_check_start", "health_check_done"];
+    const TYPES = ["run_status", "metrics", "usage", "agent_update", "candidate_found", "finding_confirmed", "risk_added", "recheck_enqueued", "recheck_done", "risk_severity_changed", "surface_added", "coverage_update", "round_start", "round_done", "recon_done", "history_added", "run_done", "log", "decompose_done", "poc_done", "error", "model_health", "health_check_start", "health_check_done"];
     for (const t of TYPES) es.addEventListener(t, (e) => { try { applyEvent(JSON.parse(e.data)); } catch (_) {} });
     es.onerror = () => { /* EventSource 自动重连 */ };
   }

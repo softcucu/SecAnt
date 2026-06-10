@@ -122,10 +122,12 @@ def render_risks_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
     sn = _scope_note(meta)
     rows_data = sorted(state.get("riskNotes") or [], key=lambda r: SEV_RANK.get(r.get("severity_hint"), 9))
     if rows_data:
-        rows = ["| 风险高低 | 主题 | 位置 | 说明 | lens | 轮次 |", "|---|---|---|---|---|---|"]
+        rows = ["| 风险高低 | 主题 | 位置 | 说明 | lens | 轮次 | 排查 |", "|---|---|---|---|---|---|---|"]
+        _rc_label = {"none": "—", "queued": "排队中", "running": "排查中", "done": "已排查"}
         for r in rows_data:
+            rc = _rc_label.get(r.get("recheck_status") or "none", r.get("recheck_status") or "—")
             rows.append(f"| {r.get('severity_hint') or 'info'} | {r.get('area') or ''} | {r.get('file') or '—'} | "
-                        f"{_nl(r.get('note'))} | {r.get('lens') or ''} | r{r.get('round') or '?'} |")
+                        f"{_nl(r.get('note'))} | {r.get('lens') or ''} | r{r.get('round') or '?'} | {rc} |")
         table = "\n".join(rows)
     else:
         table = "(本次审计未登记潜在风险)"

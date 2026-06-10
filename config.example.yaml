@@ -18,6 +18,7 @@ models:
   default: claude-sonnet-4-6
   recon: claude-opus-4-8        # 侦察/威胁建模用更强的模型
   history: claude-sonnet-4-6    # git 历史问题模式挖掘(每条提交一个 agent;独立于侦察、与主流程并行)
+  recheck: claude-sonnet-4-6    # 专用优先排查 agent(历史变体 + 风险点复查;独立优先队列、默认并发 1)
   audit:                         # 审计 finder 可用多模型轮换,分散容量/视角
     - claude-sonnet-4-6
     - claude-opus-4-8
@@ -60,6 +61,20 @@ history:
   # since: "1 year ago"         # 可选:只看某时间段的提交(git log --since)
   # paths: "src lib"            # 可选:限定 git log 路径(留空则用 scope;空格分隔多个)
   poll_interval_s: 3            # 审计循环等待历史变体灌入的轮询间隔(秒)
+
+# ── 专用优先排查通道(历史变体 + 风险点复查) ──
+# 把「历史问题模式的同类变体排查」与「已登记风险点的复查」抽到一条独立的**优先队列**,
+# 由专用 agent(role=recheck)处理,优先级最高:只要队列里有项,空出的 agent 名额就先来处理它
+# (懒占全局并发名额——有活才占、用完即还;队列空时不占用主池)。
+# 风险点复查的对象:被调函数/危险原语(B)的安全依赖调用方传入已校验的参数,当前路径安全但
+# 全仓其它调用 B 的地方未必都做了等价校验——即变体排查的种子。
+# 风险点产出后:severity_hint ≥ risk_min_severity 的自动入队;低于阈值的只登记进 RISKS.md,
+# 人工在 Web 调高级别后会自动入队补排(调低则在未开排前出队)。
+recheck:
+  enabled: true                 # 总开关
+  concurrency: 1                # 该角色并发上限(默认 1:逐条串行排查)
+  risk_min_severity: medium     # 风险点自动入排查队列的最低 severity_hint(high/medium/low/info)
+  poll_interval_s: 3            # 优先队列空时的轮询等待间隔(秒)
 
 # ── 方法库目录(.md 审计方法,agent 运行时会 Read) ──
 # 默认使用项目自带的 proto_vuln_hunt/methods/(随项目分发,无需任何外部依赖)。
