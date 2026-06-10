@@ -300,23 +300,18 @@ def extract_json(text: str, schema: Optional[Dict[str, Any]] = None) -> Optional
     return candidates[-1][0]
 
 
-# step_finish 的 reason:工具步(中途)用 tool-calls/tool_use 之类收尾;真正"这一轮答完了"用 stop/end_turn/length。
-# 只有看到**终止性** step_finish,才说明 assistant 的最终输出已完整;否则事件流是被截断/提前结束的(不能用)。
-_OC_NONTERMINAL_REASONS = {"tool_calls", "tool_use", "tools", "continue", "incomplete"}
+def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str, int]]]]:
+    """识别并解析 opencode `--format json` 的事件流(每行一个 JSON 事件),重建 assistant 的最终文本。
 
+    返回 (text, usage);若 stdout 不像事件流则返回 None(交回上层按普通文本处理)。
+      · text  —— 把**所有** text 事件的 part.text 按出现顺序拼起来(同一 part 取最新),即 assistant 正文。
+      · usage —— 取最后一个 step_finish 的 part.tokens 作为整轮真实 token 用量(取不到则 None,上层回退估算)。
 
-def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str, int]], bool]]:
-    """识别并解析 opencode `--format json` 的事件流(每行一个 JSON 事件),重建 assistant 的**完整最终文本**。
-
-    返回 (text, usage, complete);若 stdout 不像事件流则返回 None(交回上层按普通文本处理)。
-      · text     —— 把各 text 事件的 part.text 按出现顺序拼起来(同一 part 取最新),即 assistant 正文。
-      · usage    —— 从终止 step_finish 的 part.tokens 取真实 token 用量(取不到则 None,上层回退估算)。
-      · complete —— 是否见到**终止性 step_finish**(reason=stop/end_turn/… 而非 tool-calls)。
-
-    为什么要看 step_finish:opencode 的事件是按"步(step)"推进的,工具步会先 step_finish(reason=tool-calls)
-    再继续,真正的最终答复以 reason=stop 的 step_finish 收尾。若管道里抓到的流**没有**终止 step_finish,
-    说明 opencode 还没把最终结果写完(被提前截断/分步流式未结束),这时拿到的多半只是中途的思考/叙述——
-    必须判为不完整、交给上层重试,而不是把这段半截输出当最终结果去解析(对应你说的"必须等到 step-finish 块")。
+    设计取舍:`communicate()` 已经把子进程 stdout 读到 EOF(读全整条事件流,含末尾 step_finish),
+    所以这里不再按"是否见到终止 step_finish"去**硬性判完整/拒收**——实测在管道(非 TTY)里、用工具的任务
+    常常在最后一个 text 之后就 EOF、并不补一个 reason=stop 的 step_finish,硬判会把**完整答案误杀**(也会误杀健康探针)。
+    完整性改由下游真正关心的东西决定:结构化任务看 extract_json 能否解析出目标 JSON,健康探针看 expect 是否命中;
+    解析不出再走重试。step_finish 在这里只用于**取真实用量**和(自然地)作为最后一步的 tokens 来源。
 
     注:`--format json` 只约束 opencode 的**输出封装**为事件流,**不**约束模型正文为 JSON;
     正文(可能是"一段话 + ```json 块")原样在 text 事件里,之后仍由 extract_json 进一步解析。
@@ -334,8 +329,6 @@ def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str
     order: List[Any] = []
     usage: Optional[Dict[str, int]] = None
     saw_event = False
-    saw_step = False           # 是否是按步推进的事件流(有 step-start/step-finish)
-    saw_terminal = False       # 是否见到终止性 step_finish
     for ln in json_lines:
         try:
             ev = json.loads(ln)
@@ -347,16 +340,12 @@ def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str
         etype = ev.get("type")
         part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
         ptype = part.get("type")
-        if etype in ("step_start", "step_finish") or ptype in ("step-start", "step-finish"):
-            saw_step = True
+        # step_finish 带本步 tokens;最后一个(终止步)即整轮用量 → 让后写的覆盖先写的
         if etype == "step_finish" or ptype == "step-finish":
-            reason = str(part.get("reason") or ev.get("reason") or "").lower().replace("-", "_")
-            if reason not in _OC_NONTERMINAL_REASONS:   # stop/end_turn/length/空 → 终止性
-                saw_terminal = True
             u = _extract_usage(part) or _extract_usage(part.get("tokens") or {})
             if u:
-                usage = u                                # 终止步的 tokens 即整轮真实用量
-        # 只收 assistant 的正文 text 片段;reasoning/tool/step 等事件忽略
+                usage = u
+        # 收集**所有** assistant 正文 text 片段;reasoning/tool/step 等事件忽略
         if etype == "text" and isinstance(part.get("text"), str):
             pid = part.get("id") or f"_{len(order)}"
             if pid not in parts:
@@ -369,9 +358,7 @@ def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str
     if not saw_event:
         return None
     text = "".join(parts[pid] for pid in order)
-    # 按步推进的流必须见到终止 step_finish 才算完整;非按步的(无 step 事件)宽松放行
-    complete = saw_terminal or not saw_step
-    return text, usage, complete
+    return text, usage
 
 
 class AgentRunner:
@@ -531,15 +518,14 @@ class AgentRunner:
                     raise RuntimeError(f"claude error: {str(obj.get('result'))[:300]}")
                 return str(obj.get("result", "") or ""), usage
             return stdout, usage
-        # opencode `--format json` 事件流:确定性地重建出 assistant 的完整最终文本(自动识别,兼容旧配置)。
-        # 必须见到终止性 step_finish 才算拿全;否则视为被截断/提前结束,抛错交给上层重试(对应"必须等到 step-finish 块")。
+        # opencode `--format json` 事件流:把所有 text 块拼成 assistant 正文(自动识别,兼容旧配置)。
+        # 不再按"是否见到终止 step_finish"硬判完整(会误杀完整答案与健康探针);完整性交给下游:
+        # 结构化任务看 extract_json 能否解析,健康探针看 expect 是否命中,解析不出再重试。
         oc = _extract_opencode_text(stdout)
         if oc is not None:
-            text, oc_usage, complete = oc
-            if not complete:
-                raise RuntimeError("opencode 事件流未见终止 step_finish(reason=stop),输出疑似被截断/提前结束,将重试")
+            text, oc_usage = oc
             if not text.strip():
-                raise RuntimeError("opencode 完成了但未产出任何 assistant 文本(只有工具/步骤事件),将重试")
+                raise RuntimeError("opencode 未产出任何 assistant 文本(只有工具/步骤事件),将重试")
             return strip_ansi(text), oc_usage
         usage = None
         try:
