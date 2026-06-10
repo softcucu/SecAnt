@@ -300,18 +300,90 @@ def extract_json(text: str, schema: Optional[Dict[str, Any]] = None) -> Optional
     return candidates[-1][0]
 
 
-def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str, int]]]]:
+_OPENCODE_EVENT_TYPES = {
+    "step_start", "step_finish", "tool_use", "text", "reasoning", "error",
+    "message.part.updated", "message.part.delta", "message.updated", "session.updated",
+    "session.status",
+}
+_OPENCODE_TOOL_REASONS = {"tool-calls", "tool_calls", "tool-call", "tool_call", "tool-use", "tool_use", "tool"}
+
+
+def _maybe_json_obj(v: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str) and v.lstrip().startswith("{"):
+        try:
+            obj = json.loads(v)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def _event_part(ev: Dict[str, Any]) -> Dict[str, Any]:
+    """兼容 opencode 多个版本的事件外壳,取出真正的 message part。"""
+    part = _maybe_json_obj(ev.get("part"))
+    if part is not None:
+        return part
+    for key in ("data", "properties", "payload"):
+        inner = _maybe_json_obj(ev.get(key))
+        if not inner:
+            continue
+        part = _maybe_json_obj(inner.get("part"))
+        if part is not None:
+            return part
+        if isinstance(inner.get("type"), str) and (
+            "text" in inner or inner.get("type") in ("step-finish", "step-start", "tool", "reasoning")
+        ):
+            return inner
+    if isinstance(ev.get("type"), str) and (
+        "text" in ev or ev.get("type") in ("step-finish", "step-start", "tool", "reasoning")
+    ):
+        return ev
+    return {}
+
+
+def _event_message(ev: Dict[str, Any]) -> Dict[str, Any]:
+    msg = _maybe_json_obj(ev.get("message"))
+    if msg is not None:
+        return msg
+    for key in ("data", "properties", "payload"):
+        inner = _maybe_json_obj(ev.get(key))
+        if not inner:
+            continue
+        msg = _maybe_json_obj(inner.get("message"))
+        if msg is not None:
+            return msg
+        if "role" in inner and "id" in inner:
+            return inner
+    return {}
+
+
+def _text_delta(ev: Dict[str, Any], part: Dict[str, Any]) -> str:
+    for obj in (part, ev):
+        for key in ("delta", "textDelta", "text_delta"):
+            v = obj.get(key)
+            if isinstance(v, str):
+                return v
+            if isinstance(v, dict):
+                txt = v.get("text") or v.get("content")
+                if isinstance(txt, str):
+                    return txt
+    return ""
+
+
+def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str, int]], bool, str]]:
     """识别并解析 opencode `--format json` 的事件流(每行一个 JSON 事件),重建 assistant 的最终文本。
 
-    返回 (text, usage);若 stdout 不像事件流则返回 None(交回上层按普通文本处理)。
-      · text  —— 把**所有** text 事件的 part.text 按出现顺序拼起来(同一 part 取最新),即 assistant 正文。
-      · usage —— 取最后一个 step_finish 的 part.tokens 作为整轮真实 token 用量(取不到则 None,上层回退估算)。
+    返回 (text, usage, complete, reason);若 stdout 不像事件流则返回 None(交回上层按普通文本处理)。
+      · text     —— 最后一个有文本的 assistant message 正文(同一 part 取最新,delta 逐段累加)。
+      · usage    —— 取最后一个 step_finish 的 part.tokens 作为整轮真实 token 用量(取不到则 None,上层回退估算)。
+      · complete —— 若事件流以 tool-calls 结束,说明 opencode 还没给最终回答,必须重试/报错。
 
     设计取舍:`communicate()` 已经把子进程 stdout 读到 EOF(读全整条事件流,含末尾 step_finish),
-    所以这里不再按"是否见到终止 step_finish"去**硬性判完整/拒收**——实测在管道(非 TTY)里、用工具的任务
-    常常在最后一个 text 之后就 EOF、并不补一个 reason=stop 的 step_finish,硬判会把**完整答案误杀**(也会误杀健康探针)。
-    完整性改由下游真正关心的东西决定:结构化任务看 extract_json 能否解析出目标 JSON,健康探针看 expect 是否命中;
-    解析不出再走重试。step_finish 在这里只用于**取真实用量**和(自然地)作为最后一步的 tokens 来源。
+    所以这里不要求必须见到 reason=stop;但如果 EOF 前最后一个 step_finish 明确是 tool-calls,
+    就说明 opencode 在工具调用后停住了,此时返回早先的中间文本会造成"只拿到部分输出"。
+    这类输出必须判 incomplete,由上层重试或把健康检查标成失败。
 
     注:`--format json` 只约束 opencode 的**输出封装**为事件流,**不**约束模型正文为 JSON;
     正文(可能是"一段话 + ```json 块")原样在 text 事件里,之后仍由 extract_json 进一步解析。
@@ -321,44 +393,102 @@ def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str
     lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
     if not lines:
         return None
-    json_lines = [ln for ln in lines if ln.startswith("{")]
-    # 至少一半的非空行是 JSON 对象,才认定是事件流(避免把普通文本/单个 JSON 误判为事件流)
-    if len(json_lines) * 2 < len(lines):
-        return None
-    parts: Dict[Any, str] = {}
-    order: List[Any] = []
-    usage: Optional[Dict[str, int]] = None
-    saw_event = False
-    for ln in json_lines:
+    events: List[Dict[str, Any]] = []
+    for ln in lines:
+        if not ln.startswith("{"):
+            continue
         try:
             ev = json.loads(ln)
         except Exception:
             continue
         if not isinstance(ev, dict) or "type" not in ev:
             continue
-        saw_event = True
-        etype = ev.get("type")
-        part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
+        etype = str(ev.get("type") or "")
+        if etype in _OPENCODE_EVENT_TYPES or "part" in ev or "sessionID" in ev:
+            events.append(ev)
+    # 至少一半的非空行是 opencode JSON 事件,才认定是事件流(避免把普通最终 JSON 误判为事件流)。
+    if not events or len(events) * 2 < len(lines):
+        return None
+
+    part_text: Dict[Any, str] = {}
+    part_order: List[Any] = []
+    part_message: Dict[Any, str] = {}
+    message_order: List[str] = []
+    message_roles: Dict[str, str] = {}
+    usage: Optional[Dict[str, int]] = None
+    incomplete_after_tool = False
+    last_reason = ""
+
+    def note_message(mid: str) -> None:
+        if mid and mid not in message_order:
+            message_order.append(mid)
+
+    def note_part(pid: Any, mid: str) -> None:
+        if pid not in part_order:
+            part_order.append(pid)
+        if mid:
+            part_message[pid] = mid
+            note_message(mid)
+
+    for ev in events:
+        etype = str(ev.get("type") or "")
+        part = _event_part(ev)
+        msg = _event_message(ev)
+        if msg:
+            mid = str(msg.get("id") or msg.get("messageID") or "")
+            role = str(msg.get("role") or "")
+            if mid:
+                note_message(mid)
+                if role:
+                    message_roles[mid] = role
+        if not part:
+            if usage is None:
+                u = _extract_usage(ev)
+                if u:
+                    usage = u
+            continue
         ptype = part.get("type")
+        pid = part.get("id") or f"_{len(part_order)}"
+        mid = str(part.get("messageID") or part.get("message_id") or part.get("messageId") or "")
+        role = str(part.get("role") or "")
+        note_part(pid, mid)
+        if role and mid:
+            message_roles[mid] = role
+
         # step_finish 带本步 tokens;最后一个(终止步)即整轮用量 → 让后写的覆盖先写的
         if etype == "step_finish" or ptype == "step-finish":
             u = _extract_usage(part) or _extract_usage(part.get("tokens") or {})
             if u:
                 usage = u
-        # 收集**所有** assistant 正文 text 片段;reasoning/tool/step 等事件忽略
-        if etype == "text" and isinstance(part.get("text"), str):
-            pid = part.get("id") or f"_{len(order)}"
-            if pid not in parts:
-                order.append(pid)
-            parts[pid] = part["text"]      # 同一 part 多次出现(流式累积)取最新
+            last_reason = str(part.get("reason") or ev.get("reason") or "").strip()
+            incomplete_after_tool = last_reason in _OPENCODE_TOOL_REASONS
+        # 收集 assistant 正文 text 片段;reasoning/tool/step 等事件忽略。
+        # opencode 版本间可能给累计 part.text,也可能给 delta;两种都兼容。
+        if ptype == "text" or etype in ("text", "message.part.updated", "message.part.delta"):
+            if isinstance(part.get("text"), str):
+                part_text[pid] = part["text"]      # 同一 part 多次出现(流式累积)取最新
+                incomplete_after_tool = False
+            delta = _text_delta(ev, part)
+            if delta:
+                part_text[pid] = part_text.get(pid, "") + delta
+                incomplete_after_tool = False
         if usage is None:
             u = _extract_usage(ev) or _extract_usage(part)
             if u:
                 usage = u
-    if not saw_event:
-        return None
-    text = "".join(parts[pid] for pid in order)
-    return text, usage
+
+    def msg_text(mid: str) -> str:
+        return "".join(part_text.get(pid, "") for pid in part_order if part_message.get(pid) == mid)
+
+    groups: List[Tuple[str, str]] = []
+    for mid in message_order:
+        text = msg_text(mid)
+        if text.strip():
+            groups.append((mid, text))
+    assistant_groups = [(mid, text) for mid, text in groups if message_roles.get(mid, "assistant") == "assistant"]
+    chosen = (assistant_groups or groups)
+    text = chosen[-1][1] if chosen else ""
+    return text, usage, (not incomplete_after_tool), last_reason
 
 
 class AgentRunner:
@@ -523,7 +653,9 @@ class AgentRunner:
         # 结构化任务看 extract_json 能否解析,健康探针看 expect 是否命中,解析不出再重试。
         oc = _extract_opencode_text(stdout)
         if oc is not None:
-            text, oc_usage = oc
+            text, oc_usage, complete, reason = oc
+            if not complete:
+                raise RuntimeError(f"opencode 输出在工具调用后结束,未收到最终回答(reason={reason or 'unknown'}),将重试")
             if not text.strip():
                 raise RuntimeError("opencode 未产出任何 assistant 文本(只有工具/步骤事件),将重试")
             return strip_ansi(text), oc_usage
