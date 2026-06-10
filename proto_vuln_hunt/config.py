@@ -60,7 +60,6 @@ DEFAULT_BACKENDS: Dict[str, Dict[str, Any]] = {
         "command": [
             "opencode", "run",
             "--format", "json",
-            "--dangerously-skip-permissions",
             "--model", "{model}",
             "请读取并执行这个审计任务文件:{prompt_file}。",
         ],

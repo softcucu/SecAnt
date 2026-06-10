@@ -1,7 +1,9 @@
+import asyncio
 import json
+import sys
 import unittest
 
-from proto_vuln_hunt.backends import _extract_opencode_text
+from proto_vuln_hunt.backends import _drain_process, _extract_opencode_text
 
 
 def _jsonl(*events):
@@ -46,20 +48,21 @@ class OpencodeEventParsingTests(unittest.TestCase):
         parsed = _extract_opencode_text(stdout)
 
         self.assertIsNotNone(parsed)
-        text, usage, complete, reason = parsed
+        text, usage, session_id = parsed
         self.assertEqual(text, "```json\n{\"answer\":\"2\"}\n```")
-        self.assertTrue(complete)
-        self.assertEqual(reason, "stop")
+        self.assertEqual(session_id, "")
         self.assertEqual(usage, {"input_tokens": 10, "output_tokens": 3, "total_tokens": 13})
 
-    def test_marks_eof_after_tool_calls_as_incomplete(self):
+    def test_keeps_stdout_text_when_tool_calls_is_last_event(self):
         stdout = _jsonl(
             {
                 "type": "text",
+                "sessionID": "ses_123",
                 "part": {"id": "p1", "messageID": "m1", "type": "text", "text": "I will read the file first."},
             },
             {
                 "type": "step_finish",
+                "sessionID": "ses_123",
                 "part": {"id": "p2", "messageID": "m1", "type": "step-finish", "reason": "tool-calls"},
             },
         )
@@ -67,10 +70,9 @@ class OpencodeEventParsingTests(unittest.TestCase):
         parsed = _extract_opencode_text(stdout)
 
         self.assertIsNotNone(parsed)
-        text, _usage, complete, reason = parsed
+        text, _usage, session_id = parsed
         self.assertEqual(text, "I will read the file first.")
-        self.assertFalse(complete)
-        self.assertEqual(reason, "tool-calls")
+        self.assertEqual(session_id, "ses_123")
 
     def test_accepts_message_part_delta_events(self):
         stdout = _jsonl(
@@ -93,10 +95,33 @@ class OpencodeEventParsingTests(unittest.TestCase):
         parsed = _extract_opencode_text(stdout)
 
         self.assertIsNotNone(parsed)
-        text, _usage, complete, reason = parsed
+        text, _usage, session_id = parsed
         self.assertEqual(text, "hello")
-        self.assertTrue(complete)
-        self.assertEqual(reason, "stop")
+        self.assertEqual(session_id, "")
+
+
+class ProcessDrainTests(unittest.IsolatedAsyncioTestCase):
+    async def test_drain_process_waits_for_stdout_and_stderr_eof(self):
+        code = (
+            "import sys,time;"
+            "sys.stdout.write('first');sys.stdout.flush();"
+            "sys.stderr.write('err');sys.stderr.flush();"
+            "time.sleep(0.05);"
+            "sys.stdout.write('second');sys.stdout.flush()"
+        )
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            code,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        out_b, err_b = await _drain_process(proc, None, 5)
+
+        self.assertEqual(out_b, b"firstsecond")
+        self.assertEqual(err_b, b"err")
 
 
 if __name__ == "__main__":

@@ -34,10 +34,10 @@ pip install -r requirements.txt          # CLI(run)仅需 PyYAML;Web 控制台(s
 | 后端 | 非交互调用 | 模型名格式 |
 |---|---|---|
 | `claude`   | `claude -p --output-format json ...`(提示词走 stdin) | `claude-opus-4-8` / `claude-sonnet-4-6` |
-| `opencode` | `opencode run --format json --dangerously-skip-permissions --model provider/model <prompt_file 指令>` | `anthropic/claude-sonnet-4-6`、`openai/gpt-5` |
+| `opencode` | `opencode run --format json --model provider/model <prompt_file 指令>` | `anthropic/claude-sonnet-4-6`、`openai/gpt-5` |
 | `codex`    | `codex exec --model <m> <prompt>`                     | `gpt-5-codex` / `o3` |
 
-> 三种后端默认都以"绕过审批/全自动"模式运行(`--dangerously-skip-permissions` /
+> claude/codex 默认以"绕过审批/全自动"模式运行(`--dangerously-skip-permissions` /
 > `--dangerously-bypass-approvals-and-sandbox`),因为这是无人值守流水线。请在**你授权审计的代码**上运行。
 
 ---
@@ -114,7 +114,7 @@ backends:                             # (可选)自定义任意 CLI 的调用方
     prompt_mode: stdin                # stdin | arg | file
     parse: claude_json                # claude_json | text
   opencode:
-    command: ["opencode","run","--format","json","--dangerously-skip-permissions","--model","{model}","请读取并执行这个审计任务文件:{prompt_file}。不要输出思考过程,最终只输出一个合法 JSON 对象。"]
+    command: ["opencode","run","--format","json","--model","{model}","请读取并执行这个审计任务文件:{prompt_file}。不要输出思考过程,最终只输出一个合法 JSON 对象。"]
     prompt_mode: file
     parse: text
 ```

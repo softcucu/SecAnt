@@ -305,7 +305,6 @@ _OPENCODE_EVENT_TYPES = {
     "message.part.updated", "message.part.delta", "message.updated", "session.updated",
     "session.status",
 }
-_OPENCODE_TOOL_REASONS = {"tool-calls", "tool_calls", "tool-call", "tool_call", "tool-use", "tool_use", "tool"}
 
 
 def _maybe_json_obj(v: Any) -> Optional[Dict[str, Any]]:
@@ -372,18 +371,17 @@ def _text_delta(ev: Dict[str, Any], part: Dict[str, Any]) -> str:
     return ""
 
 
-def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str, int]], bool, str]]:
+def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str, int]], str]]:
     """识别并解析 opencode `--format json` 的事件流(每行一个 JSON 事件),重建 assistant 的最终文本。
 
-    返回 (text, usage, complete, reason);若 stdout 不像事件流则返回 None(交回上层按普通文本处理)。
-      · text     —— 最后一个有文本的 assistant message 正文(同一 part 取最新,delta 逐段累加)。
-      · usage    —— 取最后一个 step_finish 的 part.tokens 作为整轮真实 token 用量(取不到则 None,上层回退估算)。
-      · complete —— 若事件流以 tool-calls 结束,说明 opencode 还没给最终回答,必须重试/报错。
+    返回 (text, usage, session_id);若 stdout 不像事件流则返回 None(交回上层按普通文本处理)。
+      · text       —— stdout 事件流中最后一个有文本的 assistant message 正文(同一 part 取最新,delta 逐段累加)。
+      · usage      —— 取最后一个 step_finish 的 part.tokens 作为整轮真实 token 用量(取不到则 None,上层回退估算)。
+      · session_id —— opencode 会话 ID,仅用于诊断。
 
-    设计取舍:`communicate()` 已经把子进程 stdout 读到 EOF(读全整条事件流,含末尾 step_finish),
-    所以这里不要求必须见到 reason=stop;但如果 EOF 前最后一个 step_finish 明确是 tool-calls,
-    就说明 opencode 在工具调用后停住了,此时返回早先的中间文本会造成"只拿到部分输出"。
-    这类输出必须判 incomplete,由上层重试或把健康检查标成失败。
+    设计取舍:这里只解析子进程 stdout,不读 opencode 的数据库/日志。不同 opencode 版本在工具调用后
+    会继续输出多步事件,所以不能用 step_finish(reason=tool-calls) 做完整性硬判;完整性由上层
+    关心的结果判断:健康检查看 expect 是否命中,结构化任务看 JSON 能否解析。
 
     注:`--format json` 只约束 opencode 的**输出封装**为事件流,**不**约束模型正文为 JSON;
     正文(可能是"一段话 + ```json 块")原样在 text 事件里,之后仍由 extract_json 进一步解析。
@@ -416,8 +414,7 @@ def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str
     message_order: List[str] = []
     message_roles: Dict[str, str] = {}
     usage: Optional[Dict[str, int]] = None
-    incomplete_after_tool = False
-    last_reason = ""
+    session_id = ""
 
     def note_message(mid: str) -> None:
         if mid and mid not in message_order:
@@ -432,6 +429,8 @@ def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str
 
     for ev in events:
         etype = str(ev.get("type") or "")
+        if not session_id:
+            session_id = str(ev.get("sessionID") or ev.get("session_id") or "")
         part = _event_part(ev)
         msg = _event_message(ev)
         if msg:
@@ -441,6 +440,8 @@ def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str
                 note_message(mid)
                 if role:
                     message_roles[mid] = role
+            if not session_id:
+                session_id = str(msg.get("sessionID") or msg.get("session_id") or "")
         if not part:
             if usage is None:
                 u = _extract_usage(ev)
@@ -451,6 +452,8 @@ def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str
         pid = part.get("id") or f"_{len(part_order)}"
         mid = str(part.get("messageID") or part.get("message_id") or part.get("messageId") or "")
         role = str(part.get("role") or "")
+        if not session_id:
+            session_id = str(part.get("sessionID") or part.get("session_id") or "")
         note_part(pid, mid)
         if role and mid:
             message_roles[mid] = role
@@ -460,18 +463,14 @@ def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str
             u = _extract_usage(part) or _extract_usage(part.get("tokens") or {})
             if u:
                 usage = u
-            last_reason = str(part.get("reason") or ev.get("reason") or "").strip()
-            incomplete_after_tool = last_reason in _OPENCODE_TOOL_REASONS
         # 收集 assistant 正文 text 片段;reasoning/tool/step 等事件忽略。
         # opencode 版本间可能给累计 part.text,也可能给 delta;两种都兼容。
         if ptype == "text" or etype in ("text", "message.part.updated", "message.part.delta"):
             if isinstance(part.get("text"), str):
                 part_text[pid] = part["text"]      # 同一 part 多次出现(流式累积)取最新
-                incomplete_after_tool = False
             delta = _text_delta(ev, part)
             if delta:
                 part_text[pid] = part_text.get(pid, "") + delta
-                incomplete_after_tool = False
         if usage is None:
             u = _extract_usage(ev) or _extract_usage(part)
             if u:
@@ -488,7 +487,62 @@ def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str
     assistant_groups = [(mid, text) for mid, text in groups if message_roles.get(mid, "assistant") == "assistant"]
     chosen = (assistant_groups or groups)
     text = chosen[-1][1] if chosen else ""
-    return text, usage, (not incomplete_after_tool), last_reason
+    return text, usage, session_id
+
+
+async def _read_stream_all(stream: Optional[asyncio.StreamReader]) -> bytes:
+    """持续读取 pipe 到 EOF。只按 byte chunk 读,不按行,避免长 JSON 事件/无换行输出被截断。"""
+    if stream is None:
+        return b""
+    chunks: List[bytes] = []
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _drain_process(
+    proc: asyncio.subprocess.Process,
+    stdin_data: Optional[bytes],
+    timeout_s: float,
+) -> Tuple[bytes, bytes]:
+    """并发 drain stdout/stderr,等待进程退出且两个 pipe 都 EOF 后返回完整输出。"""
+    out_task = asyncio.create_task(_read_stream_all(proc.stdout))
+    err_task = asyncio.create_task(_read_stream_all(proc.stderr))
+
+    async def run() -> Tuple[bytes, bytes]:
+        if proc.stdin is not None:
+            try:
+                if stdin_data:
+                    proc.stdin.write(stdin_data)
+                    await proc.stdin.drain()
+                proc.stdin.close()
+                try:
+                    await proc.stdin.wait_closed()
+                except AttributeError:
+                    pass
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        await proc.wait()
+        return await asyncio.gather(out_task, err_task)
+
+    try:
+        return await asyncio.wait_for(run(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=3)
+        except Exception:
+            pass
+        for task in (out_task, err_task):
+            if not task.done():
+                task.cancel()
+        raise
 
 
 class AgentRunner:
@@ -590,20 +644,33 @@ class AgentRunner:
 
     # ── 单次子进程调用(不含重试) ──
     async def _invoke(self, prompt: str, model: str, cwd: str,
-                      timeout_s: Optional[float] = None) -> Tuple[str, Optional[Dict[str, int]]]:
+                      timeout_s: Optional[float] = None,
+                      direct_prompt: bool = False) -> Tuple[str, Optional[Dict[str, int]]]:
         prompt_file = ""
-        if self.spec.prompt_mode == "file" or any("{prompt_file}" in tok for tok in self.spec.command):
+        uses_prompt_file = (
+            self.spec.prompt_mode == "file"
+            or any("{prompt_file}" in tok for tok in self.spec.command)
+        )
+        if (not direct_prompt) and uses_prompt_file:
             prompt_file = self._write_prompt_file(prompt)
 
         cmd: List[str] = []
         prompt_in_args = False
-        for tok in self.spec.command:
-            t = tok.replace("{model}", model)
-            t = t.replace("{prompt_file}", prompt_file)
-            if "{prompt}" in t:
-                t = t.replace("{prompt}", prompt)
-                prompt_in_args = True
-            cmd.append(t)
+        if direct_prompt:
+            for tok in self.spec.command:
+                if "{prompt_file}" in tok or "{prompt}" in tok:
+                    continue
+                cmd.append(tok.replace("{model}", model))
+            cmd.append(prompt)
+            prompt_in_args = True
+        else:
+            for tok in self.spec.command:
+                t = tok.replace("{model}", model)
+                t = t.replace("{prompt_file}", prompt_file)
+                if "{prompt}" in t:
+                    t = t.replace("{prompt}", prompt)
+                    prompt_in_args = True
+                cmd.append(t)
         stdin_data = None
         if self.spec.prompt_mode == "stdin" and not prompt_in_args:
             stdin_data = prompt.encode("utf-8")
@@ -618,16 +685,13 @@ class AgentRunner:
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
             env=env,
+            limit=16 * 1024 * 1024,
         )
         if timeout_s is None:
             timeout_s = max(1, self.cfg.retry.timeout_ms / 1000.0)
         try:
-            out_b, err_b = await asyncio.wait_for(proc.communicate(input=stdin_data), timeout=timeout_s)
+            out_b, err_b = await _drain_process(proc, stdin_data, timeout_s)
         except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except Exception:
-                pass
             raise RuntimeError(f"timed out after {int(timeout_s)}s")
 
         stdout = (out_b or b"").decode("utf-8", "replace")
@@ -653,11 +717,10 @@ class AgentRunner:
         # 结构化任务看 extract_json 能否解析,健康探针看 expect 是否命中,解析不出再重试。
         oc = _extract_opencode_text(stdout)
         if oc is not None:
-            text, oc_usage, complete, reason = oc
-            if not complete:
-                raise RuntimeError(f"opencode 输出在工具调用后结束,未收到最终回答(reason={reason or 'unknown'}),将重试")
+            text, oc_usage, _session_id = oc
             if not text.strip():
-                raise RuntimeError("opencode 未产出任何 assistant 文本(只有工具/步骤事件),将重试")
+                # 返回完整原始 stdout,让健康检查/结构化解析基于真实完整输出判断,而不是在事件层提前截断。
+                return strip_ansi(stdout), oc_usage
             return strip_ansi(text), oc_usage
         usage = None
         try:
@@ -735,7 +798,15 @@ class AgentRunner:
         async with self._model_semaphore(model):
             async with self._semaphore():
                 try:
-                    text, _usage = await self._invoke(hc.prompt, model, cwd, timeout_s=timeout_s)
+                    # opencode 的正式任务用 prompt_file 指令避免长 argv;健康探针很短,直接作为 message
+                    # 发送,避免为了 1+1 再触发 read 工具循环,造成误判或只拿到中间输出。
+                    text, _usage = await self._invoke(
+                        hc.prompt,
+                        model,
+                        cwd,
+                        timeout_s=timeout_s,
+                        direct_prompt=(self.cfg.backend == "opencode"),
+                    )
                     latency = int((time.time() - t0) * 1000)
                     answer = (text or "").strip()
                     healthy = (hc.expect in answer) if hc.expect else bool(answer)
