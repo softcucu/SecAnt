@@ -5,8 +5,8 @@
 但**每个 agent 通过外部 CLI 执行**,且带一个 **Web 控制台**。你可以在**配置文件**里:
 
 - 选择后端:`claude` / `opencode` / `codex`(也能自定义任意 CLI 的调用方式);
-- 为不同阶段(role)配置**不同模型**;
-- 设置**并发数**与全部流水线参数;
+- 为不同阶段(role)配置**不同模型**,并限制**每个模型自己的并发数**;
+- 设置**全局并发数**与全部流水线参数;
 - **断点续跑**、CLI 任务失败重试。
 
 **两种用法**:
@@ -16,6 +16,9 @@
 **结构化为主的产物模型**:运行期只写**结构化态**(`state.json`)并发**结构化事件**(`events.jsonl` + SSE);
 Markdown / SARIF 由 `exporters.py` 从结构化态**按需渲染**(Web 导出端点 / CLI `--export`)。这样 Web 能严重度优先、
 实时增量地呈现漏洞与覆盖,而文件产物随时可一键导出。
+
+每次 agent 调用会记录 token 使用量到 `usage.jsonl` 并通过 Web 实时展示。若后端 CLI 没有返回真实 usage,
+本工具用轻量算法估算:ASCII 约 4 字符/token,非 ASCII 约 1 字符/token。
 
 ---
 
@@ -31,7 +34,7 @@ pip install -r requirements.txt          # CLI(run)仅需 PyYAML;Web 控制台(s
 | 后端 | 非交互调用 | 模型名格式 |
 |---|---|---|
 | `claude`   | `claude -p --output-format json ...`(提示词走 stdin) | `claude-opus-4-8` / `claude-sonnet-4-6` |
-| `opencode` | `opencode run --model provider/model <prompt>`        | `anthropic/claude-sonnet-4-6`、`openai/gpt-5` |
+| `opencode` | `opencode run --model provider/model <prompt_file 指令>` | `anthropic/claude-sonnet-4-6`、`openai/gpt-5` |
 | `codex`    | `codex exec --model <m> <prompt>`                     | `gpt-5-codex` / `o3` |
 
 > 三种后端默认都以"绕过审批/全自动"模式运行(`--dangerously-skip-permissions` /
@@ -62,7 +65,8 @@ python -m proto_vuln_hunt run --config my.yaml --target /path/to/repo
 python -m proto_vuln_hunt run --config my.yaml --target /repo --scope src/proto/parser.c
 
 # 换后端 / 统一模型 / 调并发(命令行覆盖配置)
-python -m proto_vuln_hunt run --config my.yaml --target /repo --backend codex --model gpt-5-codex --concurrency 6
+python -m proto_vuln_hunt run --config my.yaml --target /repo --backend codex \
+  --model gpt-5-codex,o3 --concurrency 6 --model-concurrency default=1,gpt-5-codex=2,o3=1
 
 # 冒烟:小范围、单 finder、单轮、单票、关 PoC
 python -m proto_vuln_hunt run --config my.yaml --target /repo --scope src/x.c \
@@ -80,12 +84,17 @@ python -m proto_vuln_hunt run --config my.yaml --target /repo --scope src/x.c \
 ```yaml
 backend: claude                       # claude | opencode | codex
 
-models:                               # 按 role 配模型,缺省回落到 default
+models:                               # 按 role 配模型,缺省回落到 default;列表会轮换使用
   default: claude-sonnet-4-6
   recon:   claude-opus-4-8            # role: recon/decompose/audit/verify/report/poc/synthesis/util
+  audit:   [claude-sonnet-4-6, claude-opus-4-8]
   verify:  claude-sonnet-4-6
 
-concurrency: 4                        # 同时运行的 agent 上限
+concurrency: 4                        # 全局同时运行的 agent 上限
+model_concurrency:                    # 单个模型自己的并发上限;未列出则默认等于全局 concurrency
+  default: 1
+  claude-sonnet-4-6: 2
+  claude-opus-4-8: 1
 
 params:
   finders_per_lens: 2
@@ -102,14 +111,28 @@ methods_dir: proto_vuln_hunt/methods  # 默认即项目自带方法库,无需配
 backends:                             # (可选)自定义任意 CLI 的调用方式
   claude:
     command: ["claude","-p","--output-format","json","--model","{model}","--dangerously-skip-permissions"]
-    prompt_mode: stdin                # stdin | arg
+    prompt_mode: stdin                # stdin | arg | file
     parse: claude_json                # claude_json | text
+  opencode:
+    command: ["opencode","run","--model","{model}","请读取并执行这个审计任务文件:{prompt_file}。不要输出思考过程,最终只输出一个合法 JSON 对象。"]
+    prompt_mode: file
+    parse: text
 ```
 
+**模型配置**:每个 role 可写字符串或列表。字符串里也可以用逗号分隔多个模型,例如
+`--model gpt-5-codex,o3` 或 `audit: "anthropic/a,openai/b"`。同一 role 下的 agent 调用会按
+`model_concurrency` 加权轮换模型,并由每个模型自己的 semaphore 强制限流。
+
 **自定义后端**:`command` 是 token 列表,运行时把 `{model}` 替换为当前角色模型、`{prompt}` 替换为提示词
-(仅 `prompt_mode: arg` 时需要;`stdin` 模式则把提示词从标准输入喂入)。`parse` 决定如何从 stdout 取回
-agent 文本(`claude_json` 取 JSON 的 `.result`,`text` 直接用 stdout)。需要结构化结果时,提示词会要求
-agent 输出单个 ```json 代码块,由本工具解析。这样你可以接入任意命令行 agent。
+(仅 `prompt_mode: arg` 时需要)、`{prompt_file}` 替换为提示词临时文件路径(仅 `prompt_mode: file` 时需要);
+`stdin` 模式则把提示词从标准输入喂入。`parse` 决定如何从 stdout 取回 agent 文本(`claude_json` 取 JSON
+的 `.result`,`text` 直接用 stdout)。opencode 默认使用 `file` 模式,避免长提示词作为命令行参数时被截断。
+
+可用下面的本地脚本验证 opencode 风格调用不会把多行长提示词塞进 argv,同时验证每个模型的并发上限:
+
+```bash
+python3 -B scripts/test_opencode_prompt_file.py
+```
 
 ---
 

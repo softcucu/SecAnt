@@ -2,7 +2,7 @@
 
 设计目标(对应用户需求):
   · 通过配置文件选择后端 CLI(claude / opencode / codex)并自定义其调用方式;
-  · 为不同阶段(role)配置不同模型;
+  · 为不同阶段(role)配置不同模型,并可限制每个模型自己的并发;
   · 配置并发数与全部流水线参数。
 """
 from __future__ import annotations
@@ -33,7 +33,8 @@ ROLES = ["recon", "decompose", "audit", "verify", "report", "poc", "synthesis", 
 # ──────────────────────────── 后端默认调用模板 ────────────────────────────
 # command 是一个 token 列表;运行时会把:
 #   {model}   → 当前角色解析出的模型名
-#   {prompt}  → 提示词(仅 prompt_mode == "arg" 时需要;stdin 模式则从标准输入喂入)
+#   {prompt}      → 提示词(仅 prompt_mode == "arg" 时需要;stdin/file 模式不建议使用)
+#   {prompt_file} → 提示词临时文件路径(仅 prompt_mode == "file" 时需要)
 # 替换为实际值。其余 token 原样保留。
 # parse:
 #   claude_json → 把 stdout 当作单个 JSON 解析,取其中的 result 字段作为 agent 文本;
@@ -51,9 +52,14 @@ DEFAULT_BACKENDS: Dict[str, Dict[str, Any]] = {
         "parse": "claude_json",
     },
     "opencode": {
-        # 模型格式需为 provider/model(如 anthropic/claude-sonnet-4-6)
-        "command": ["opencode", "run", "--model", "{model}", "{prompt}"],
-        "prompt_mode": "arg",
+        # 模型格式需为 provider/model(如 anthropic/claude-sonnet-4-6)。
+        # opencode 的完整提示词不要放在 argv 里:长 prompt 容易被 shell/系统参数长度截断。
+        "command": [
+            "opencode", "run",
+            "--model", "{model}",
+            "请读取并执行这个审计任务文件:{prompt_file}。不要输出思考过程,最终只输出一个合法 JSON 对象。",
+        ],
+        "prompt_mode": "file",
         "parse": "text",
     },
     "codex": {
@@ -74,7 +80,7 @@ DEFAULT_BACKENDS: Dict[str, Dict[str, Any]] = {
 class BackendSpec:
     name: str
     command: List[str]
-    prompt_mode: str = "stdin"   # stdin | arg
+    prompt_mode: str = "stdin"   # stdin | arg | file
     parse: str = "text"          # text | claude_json
     env: Dict[str, str] = field(default_factory=dict)
 
@@ -102,7 +108,8 @@ class Config:
     # 后端 / 模型 / 并发
     backend: str = "claude"
     backends: Dict[str, BackendSpec] = field(default_factory=dict)
-    models: Dict[str, str] = field(default_factory=dict)
+    models: Dict[str, List[str]] = field(default_factory=dict)
+    model_concurrency: Dict[str, int] = field(default_factory=dict)
     concurrency: int = 4
 
     # 流水线参数(对齐 proto-vuln-hunt)
@@ -154,6 +161,8 @@ class Config:
         if not self.runs_dir:
             self.runs_dir = os.path.join(os.getcwd(), "pvh-runs")
         self.runs_dir = os.path.abspath(os.path.expanduser(self.runs_dir))
+        self.models = normalize_models(self.models)
+        self.model_concurrency = normalize_model_concurrency(self.model_concurrency)
         # methods_dir 展开为绝对路径(~ → $HOME)
         self._methods_abs = os.path.abspath(os.path.expanduser(self.methods_dir))
 
@@ -179,7 +188,20 @@ class Config:
             return []
 
     def model_for(self, role: str) -> str:
-        return self.models.get(role) or self.models.get("default") or ""
+        models = self.models_for(role)
+        return models[0] if models else ""
+
+    def models_for(self, role: str) -> List[str]:
+        return list(self.models.get(role) or self.models.get("default") or [])
+
+    def model_concurrency_for(self, model: str) -> int:
+        return max(1, int(self.model_concurrency.get(model) or self.model_concurrency.get("default") or self.concurrency))
+
+    def model_slots_for(self, role: str) -> List[str]:
+        slots: List[str] = []
+        for model in self.models_for(role):
+            slots.extend([model] * self.model_concurrency_for(model))
+        return slots
 
     def backend_spec(self) -> BackendSpec:
         if self.backend in self.backends:
@@ -190,6 +212,61 @@ class Config:
             raise ValueError(f"未知后端 '{self.backend}',且配置文件未定义它。可选内置:{list(DEFAULT_BACKENDS)}")
         return BackendSpec(name=self.backend, **d)
 
+
+def normalize_models(raw: Any) -> Dict[str, List[str]]:
+    """兼容旧配置的字符串模型,并允许每个 role 配多个模型。
+
+    支持:
+      models.audit: "anthropic/a,openai/b"
+      models.audit: ["anthropic/a", "openai/b"]
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, List[str]] = {}
+    for role, value in raw.items():
+        vals: List[str] = []
+        if isinstance(value, str):
+            vals = [x.strip() for x in value.split(",")]
+        elif isinstance(value, (list, tuple)):
+            vals = [str(x).strip() for x in value]
+        elif value is not None:
+            vals = [str(value).strip()]
+        vals = [x for x in vals if x]
+        if vals:
+            out[str(role)] = vals
+    return out
+
+
+def normalize_model_concurrency(raw: Any) -> Dict[str, int]:
+    """标准化每个模型自己的并发限制;支持 dict 或 "model=2,other=1" 字符串。"""
+    if not raw:
+        return {}
+    if isinstance(raw, str):
+        parsed: Dict[str, int] = {}
+        for part in raw.split(","):
+            if "=" not in part:
+                continue
+            k, v = part.split("=", 1)
+            k = k.strip()
+            if not k:
+                continue
+            try:
+                parsed[k] = max(1, int(v.strip()))
+            except Exception:
+                continue
+        return parsed
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, int] = {}
+    for model, limit in raw.items():
+        key = str(model).strip()
+        if not key:
+            continue
+        try:
+            out[key] = max(1, int(limit))
+        except Exception:
+            continue
+    return out
 
 def _load_file(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:

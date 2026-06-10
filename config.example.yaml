@@ -9,6 +9,7 @@ backend: claude
 
 # ── 模型:按阶段(role)分别指定;缺省回落到 default ──
 # role 取值:recon / decompose / audit / verify / report / poc / synthesis / util
+# 每个 role 可写单个模型,也可写模型列表;列表会按 agent 调用轮换使用。
 # 注意:
 #   · claude   模型名形如  claude-opus-4-8 / claude-sonnet-4-6 / claude-haiku-4-5-20251001
 #   · opencode 模型名形如  provider/model,如 anthropic/claude-sonnet-4-6、openai/gpt-5
@@ -16,11 +17,20 @@ backend: claude
 models:
   default: claude-sonnet-4-6
   recon: claude-opus-4-8        # 侦察/威胁建模用更强的模型
+  audit:                         # 审计 finder 可用多模型轮换,分散容量/视角
+    - claude-sonnet-4-6
+    - claude-opus-4-8
   verify: claude-sonnet-4-6     # 对抗验证
   synthesis: claude-sonnet-4-6
 
-# ── 并发:任意时刻最多同时运行多少个 agent(其余排队) ──
+# ── 并发 ──
+# concurrency 是全局 agent 上限;model_concurrency 是单个模型自己的上限。
+# 未在 model_concurrency 里列出的模型,默认最多可用到全局 concurrency。
 concurrency: 4
+model_concurrency:
+  default: 1                    # 可选:所有未单独列出的模型默认同时只跑 1 个
+  claude-sonnet-4-6: 2
+  claude-opus-4-8: 1
 
 # ── 流水线参数(全部可选,下面是默认值) ──
 params:
@@ -61,8 +71,8 @@ retry:
   timeout_ms: 1800000           # 单次子进程墙钟超时(超时也算一次失败 → 计入重试)
 
 # ── 后端调用方式(可选;不写则用内置默认模板) ──
-# command 是 token 列表;运行时替换:{model}=当前角色模型,{prompt}=提示词(仅 arg 模式)。
-# prompt_mode: stdin(提示词从标准输入喂入) | arg(提示词作为命令行参数,用 {prompt} 占位)。
+# command 是 token 列表;运行时替换:{model}=当前角色模型,{prompt}=提示词(仅 arg 模式),{prompt_file}=提示词文件路径(仅 file 模式)。
+# prompt_mode: stdin(提示词从标准输入喂入) | arg(提示词作为命令行参数,用 {prompt} 占位) | file(提示词写文件,命令用 {prompt_file})。
 # parse: claude_json(把 stdout 当 JSON 取 .result) | text(stdout 即文本)。
 # env: 给该后端注入的环境变量(可选)。
 backends:
@@ -71,8 +81,8 @@ backends:
     prompt_mode: stdin
     parse: claude_json
   opencode:
-    command: ["opencode", "run", "--model", "{model}", "{prompt}"]
-    prompt_mode: arg
+    command: ["opencode", "run", "--model", "{model}", "请读取并执行这个审计任务文件:{prompt_file}。不要输出思考过程,最终只输出一个合法 JSON 对象。"]
+    prompt_mode: file
     parse: text
   codex:
     command: ["codex", "exec", "--model", "{model}", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "{prompt}"]

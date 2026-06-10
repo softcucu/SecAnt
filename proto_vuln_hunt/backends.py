@@ -6,10 +6,13 @@ agentic 循环,拿回最终文本;需要结构化结果时再从文本中解析�
 from __future__ import annotations
 
 import asyncio
+import math
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional
+import tempfile
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .config import Config
 
@@ -24,6 +27,55 @@ _RATE_RE = re.compile(
 
 def looks_rate_limited(msg: str) -> bool:
     return bool(_RATE_RE.search(msg or ""))
+
+
+def estimate_tokens(text: str) -> int:
+    """轻量估算:ASCII 约 4 字符/token,非 ASCII 约 1 字符/token。"""
+    if not text:
+        return 0
+    ascii_chars = 0
+    non_ascii = 0
+    for ch in text:
+        if ord(ch) < 128:
+            ascii_chars += 1
+        else:
+            non_ascii += 1
+    return int(math.ceil(ascii_chars / 4.0) + non_ascii)
+
+
+def _as_int(v: Any) -> Optional[int]:
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        return None
+
+
+def _extract_usage(obj: Any) -> Optional[Dict[str, int]]:
+    """从常见 CLI JSON 包装里提取真实 usage;拿不到则返回 None。"""
+    if not isinstance(obj, dict):
+        return None
+    candidates = [obj]
+    for key in ("usage", "token_usage", "tokens"):
+        if isinstance(obj.get(key), dict):
+            candidates.insert(0, obj[key])
+    for u in candidates:
+        inp = (_as_int(u.get("input_tokens")) or _as_int(u.get("prompt_tokens")) or
+               _as_int(u.get("input")) or _as_int(u.get("prompt")))
+        out = (_as_int(u.get("output_tokens")) or _as_int(u.get("completion_tokens")) or
+               _as_int(u.get("output")) or _as_int(u.get("completion")))
+        total = _as_int(u.get("total_tokens")) or _as_int(u.get("total"))
+        if inp is None and out is None and total is None:
+            continue
+        if total is None:
+            total = (inp or 0) + (out or 0)
+        return {
+            "input_tokens": inp or 0,
+            "output_tokens": out or 0,
+            "total_tokens": total,
+        }
+    return None
 
 
 # ──────────────────────────── JSON 提取 ────────────────────────────
@@ -98,25 +150,107 @@ def extract_json(text: str) -> Optional[Any]:
 class AgentRunner:
     """封装并发门 + 重试 + 子进程调用。一个实例对应一次运行。"""
 
-    def __init__(self, cfg: Config, logger=print):
+    def __init__(self, cfg: Config, logger=print,
+                 usage_sink: Optional[Callable[[Dict[str, Any]], None]] = None):
         self.cfg = cfg
         self._sem: Optional[asyncio.Semaphore] = None  # 惰性创建(避免在事件循环外构造时绑错 loop,兼容 py3.8)
         self.spec = cfg.backend_spec()
         self.log = logger
+        self.usage_sink = usage_sink
         self.agent_count = 0
+        self.usage_count = 0
+        self.usage_totals: Dict[str, int] = {
+            "calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "estimated_calls": 0,
+        }
         self._jitter = 0
+        self._model_cursor: Dict[str, int] = {}
+        self._model_sems: Dict[str, asyncio.Semaphore] = {}
 
     def _semaphore(self) -> asyncio.Semaphore:
         if self._sem is None:
             self._sem = asyncio.Semaphore(self.cfg.concurrency)
         return self._sem
 
+    def _model_semaphore(self, model: str) -> asyncio.Semaphore:
+        if model not in self._model_sems:
+            self._model_sems[model] = asyncio.Semaphore(self.cfg.model_concurrency_for(model))
+        return self._model_sems[model]
+
+    # ── 同一 role 下按模型并发加权轮换 ──
+    def _next_model(self, role: str) -> str:
+        models = self.cfg.model_slots_for(role)
+        if not models:
+            return ""
+        i = self._model_cursor.get(role, 0)
+        self._model_cursor[role] = i + 1
+        return models[i % len(models)]
+
+    def _write_prompt_file(self, prompt: str) -> str:
+        prompt_dir = os.path.join(self.cfg.out_dir, "prompts")
+        os.makedirs(prompt_dir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=".md",
+            prefix="agent_",
+            dir=prompt_dir,
+            delete=False,
+        ) as f:
+            f.write(prompt)
+            return f.name
+
+    def _record_usage(self, prompt: str, output: str, *, role: str, label: str,
+                      model: str, attempt: int, backend_usage: Optional[Dict[str, int]]) -> None:
+        est_in = estimate_tokens(prompt)
+        est_out = estimate_tokens(output)
+        usage = backend_usage or {}
+        input_tokens = int(usage.get("input_tokens") or est_in)
+        output_tokens = int(usage.get("output_tokens") or est_out)
+        total_tokens = int(usage.get("total_tokens") or (input_tokens + output_tokens))
+        estimated = backend_usage is None
+
+        self.usage_count += 1
+        rec: Dict[str, Any] = {
+            "id": self.usage_count,
+            "ts": time.time(),
+            "backend": self.cfg.backend,
+            "role": role,
+            "label": label or role,
+            "model": model,
+            "attempt": attempt,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "estimated": estimated,
+            "source": "estimated" if estimated else "backend",
+        }
+        self.usage_totals["calls"] += 1
+        self.usage_totals["input_tokens"] += input_tokens
+        self.usage_totals["output_tokens"] += output_tokens
+        self.usage_totals["total_tokens"] += total_tokens
+        if estimated:
+            self.usage_totals["estimated_calls"] += 1
+        if self.usage_sink:
+            try:
+                self.usage_sink(rec)
+            except Exception:
+                pass
+
     # ── 单次子进程调用(不含重试) ──
-    async def _invoke(self, prompt: str, model: str, cwd: str) -> str:
+    async def _invoke(self, prompt: str, model: str, cwd: str) -> Tuple[str, Optional[Dict[str, int]]]:
+        prompt_file = ""
+        if self.spec.prompt_mode == "file" or any("{prompt_file}" in tok for tok in self.spec.command):
+            prompt_file = self._write_prompt_file(prompt)
+
         cmd: List[str] = []
         prompt_in_args = False
         for tok in self.spec.command:
             t = tok.replace("{model}", model)
+            t = t.replace("{prompt_file}", prompt_file)
             if "{prompt}" in t:
                 t = t.replace("{prompt}", prompt)
                 prompt_in_args = True
@@ -157,13 +291,19 @@ class AgentRunner:
                 obj = json.loads(stdout)
             except Exception:
                 # 某些情况下 claude 直接输出文本而非 JSON,降级当文本用
-                return stdout
+                return stdout, None
+            usage = _extract_usage(obj)
             if isinstance(obj, dict):
                 if obj.get("is_error"):
                     raise RuntimeError(f"claude error: {str(obj.get('result'))[:300]}")
-                return str(obj.get("result", "") or "")
-            return stdout
-        return stdout
+                return str(obj.get("result", "") or ""), usage
+            return stdout, usage
+        usage = None
+        try:
+            usage = _extract_usage(json.loads(stdout))
+        except Exception:
+            usage = None
+        return stdout, usage
 
     def _backoff_ms(self, attempt: int, msg: str) -> int:
         """指数退避;若失败像"被限流/额度耗尽"则用更长基数等服务端恢复。带确定性抖动分散惊群。"""
@@ -189,24 +329,27 @@ class AgentRunner:
         失败重试上限取 `retries`(未传则用 cfg.retry.max_attempts);耗尽后返回 fallback(跳过,靠续跑挽回)。
         """
         tag = label or role
-        model = self.cfg.model_for(role)
         run_cwd = cwd or os.path.abspath(os.path.expanduser(self.cfg.target))
         self.agent_count += 1
         max_attempts = self.cfg.retry.max_attempts if retries is None else retries
 
         attempt = 0
         while True:
-            async with self._semaphore():
-                try:
-                    text = await self._invoke(prompt, model, run_cwd)
-                    if schema is None:
-                        return text
-                    parsed = extract_json(text)
-                    if parsed is None:
-                        raise RuntimeError("CLI 未产出可解析的结构化 JSON")
-                    return parsed
-                except Exception as e:  # noqa: BLE001
-                    msg = str(e)
+            model = self._next_model(role)
+            async with self._model_semaphore(model):
+                async with self._semaphore():
+                    try:
+                        text, usage = await self._invoke(prompt, model, run_cwd)
+                        self._record_usage(prompt, text, role=role, label=tag, model=model,
+                                           attempt=attempt + 1, backend_usage=usage)
+                        if schema is None:
+                            return text
+                        parsed = extract_json(text)
+                        if parsed is None:
+                            raise RuntimeError("CLI 未产出可解析的结构化 JSON")
+                        return parsed
+                    except Exception as e:  # noqa: BLE001
+                        msg = str(e)
             # 退避/重试在信号量之外等待(不占用并发额度)
             attempt += 1
             if attempt > max_attempts:

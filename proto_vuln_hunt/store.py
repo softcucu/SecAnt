@@ -6,6 +6,7 @@
   attack-surface.json  —— 攻击面(初始+动态)+ 覆盖台账 + progress,每轮整体快照(状态持续演变)
   findings/<id>.json   —— 每条确认漏洞一个文件,确认即写、写一次即终态
   risks/<id>.json      —— 每条风险一个文件,登记即写、写一次即终态
+  usage.jsonl          —— 每次 agent 调用的 token 使用记录(真实 usage 或轻量估算)
   events.jsonl         —— append-only 事件日志(SSE 重放 / 服务重启回看)
   exports/             —— 按需生成的 MD / SARIF(由 exporters.py 渲染)
 
@@ -74,6 +75,10 @@ class RunStore:
     @property
     def events_path(self) -> str:
         return os.path.join(self.dir, "events.jsonl")
+
+    @property
+    def usage_path(self) -> str:
+        return os.path.join(self.dir, "usage.jsonl")
 
     @property
     def export_dir(self) -> str:
@@ -232,8 +237,30 @@ class RunStore:
             "auditLedger": asf.get("ledger", []),
             "riskNotes": self.load_risks(),
             "confirmed": self.load_findings(),
+            "usage": self.load_usage(),
             "summary": m.get("summary", {}),
         }
+
+    # usage:每次 agent 调用一行 JSONL
+    def append_usage(self, rec: Dict[str, Any]) -> None:
+        os.makedirs(self.dir, exist_ok=True)
+        with open(self.usage_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def load_usage(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        if not os.path.isfile(self.usage_path):
+            return out
+        with open(self.usage_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue
+        return out
 
     # ── 事件 ──
     def append_event(self, ev: Dict[str, Any]) -> None:

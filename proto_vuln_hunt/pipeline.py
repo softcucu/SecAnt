@@ -2,7 +2,7 @@
 流式产出确认漏洞 →(高危)PoC → 汇总。断点续跑 + 并发门 + CLI 任务失败重试。
 
 结构化为主:运行期**只写结构化态**(经 RunStore 按关注点分文件落盘:checkpoint.json / recon.json /
-attack-surface.json / findings/<id>.json / risks/<id>.json)并发结构化事件(经 EventBus → SSE + events.jsonl);
+attack-surface.json / findings/<id>.json / risks/<id>.json / usage.jsonl)并发结构化事件(经 EventBus → SSE + events.jsonl);
 不再在运行期写 RECON/ATTACK-SURFACE/RISKS/findings/INDEX/SARIF 这些 Markdown——它们改由 exporters.py
 从结构化态**按需渲染**(Web 导出端点 / CLI `--export`)。漏洞/风险确认即各写一个文件(流式、写一次即终态)。
 """
@@ -35,11 +35,11 @@ class Pipeline:
                  emitter: Optional[Callable[[str, Optional[Dict[str, Any]]], Any]] = None,
                  stop_event: Optional[asyncio.Event] = None):
         self.cfg = cfg
-        self.runner = AgentRunner(cfg, logger=self.log)
         self.pb = PromptBuilder(cfg)
         self.store = store or RunStore(cfg.out_dir).ensure()
         self._emit_cb = emitter or _noop_emit
         self._stop = stop_event   # 可为 None,惰性创建(兼容 py3.8 在事件循环外构造)
+        self.runner = AgentRunner(cfg, logger=self.log, usage_sink=self.record_usage)
 
         # ── 运行状态(可被断点恢复) ──
         self.surface_data: Dict[str, Any] = {}
@@ -76,6 +76,13 @@ class Pipeline:
             self._emit_cb(etype, data or {})
         except Exception:
             pass
+
+    def record_usage(self, rec: Dict[str, Any]) -> None:
+        try:
+            self.store.append_usage(rec)
+        except Exception:
+            pass
+        self.emit(EV.USAGE, rec)
 
     def _stop_ev(self) -> asyncio.Event:
         if self._stop is None:
@@ -142,6 +149,7 @@ class Pipeline:
             "rounds": rnd, "confirmed": len(self.confirmed), "candidates": len(self.dedup_keys),
             "by_severity": by_sev, "risks": len(self.risk_notes), "surfaces": len(self.surface_log),
             "agents_spawned": self.runner.agent_count, "elapsed_s": round(time.time() - self._started, 1),
+            "token_usage": dict(self.runner.usage_totals),
         }
 
     def persist_recon(self) -> None:
@@ -568,6 +576,7 @@ class Pipeline:
             "subtasks_total": sum(1 for r in self.ledger_arr if r.get("kind") == "task"),
             "regions_decomposed": sum(1 for r in self.ledger_arr if r.get("status") == "decomposed"),
             "pending_findings": len(self.pending_findings), "agents_spawned": self.runner.agent_count,
+            "token_usage": dict(self.runner.usage_totals),
             "confirmed": len(final), "by_class": counts, "status": status,
             "top_findings": [{"id": c.get("id"), "severity": c.get("corrected_severity") or c.get("severity"),
                               "bug_class": c.get("bug_class"), "title": c.get("title"),
@@ -581,7 +590,8 @@ class Pipeline:
         sn = self.pb.scope_note
         self.store.init_manifest({
             "target": self.cfg.target, "scope": self.cfg.scope, "backend": self.cfg.backend,
-            "models": self.cfg.models, "concurrency": self.cfg.concurrency, "threat_model": self.cfg.threat_model,
+            "models": self.cfg.models, "model_concurrency": self.cfg.model_concurrency,
+            "concurrency": self.cfg.concurrency, "threat_model": self.cfg.threat_model,
             "lenses": self.cfg.lenses, "finders_per_lens": self.cfg.finders_per_lens,
             "max_rounds": self.cfg.max_rounds, "dry_rounds": self.cfg.dry_rounds,
             "verify_votes": self.cfg.verify_votes, "enable_poc": self.cfg.enable_poc, "decompose": self.cfg.decompose,

@@ -24,7 +24,7 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "st
 _RUN_FIELDS = {
     "target", "scope", "backend", "concurrency", "threat_model", "lenses",
     "finders_per_lens", "max_rounds", "dry_rounds", "verify_votes",
-    "enable_poc", "decompose", "methods_dir", "models", "resume", "fresh",
+    "enable_poc", "decompose", "methods_dir", "models", "model_concurrency", "resume", "fresh",
 }
 
 
@@ -41,6 +41,8 @@ def build_run_config(base: Config, payload: Dict[str, Any]) -> Config:
         overrides["lenses"] = [l for l in overrides["lenses"] if l in ALL_LENSES] or list(base.lenses)
     if "models" in overrides and not isinstance(overrides["models"], dict):
         overrides.pop("models")
+    if "model_concurrency" in overrides and not isinstance(overrides["model_concurrency"], dict):
+        overrides.pop("model_concurrency")
     overrides.setdefault("resume", False)   # 新建 run 默认从头(run 目录本来就是空的)
     return dataclasses.replace(base, **overrides)
 
@@ -137,6 +139,7 @@ def create_app(cfg: Config):
             "lenses": ALL_LENSES, "roles": ROLES,
             "defaults": {
                 "backend": cfg.backend, "concurrency": cfg.concurrency, "models": cfg.models,
+                "model_concurrency": cfg.model_concurrency,
                 "threat_model": cfg.threat_model, "lenses": cfg.lenses,
                 "finders_per_lens": cfg.finders_per_lens, "max_rounds": cfg.max_rounds,
                 "dry_rounds": cfg.dry_rounds, "verify_votes": cfg.verify_votes,

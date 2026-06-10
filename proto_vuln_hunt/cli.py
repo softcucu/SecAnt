@@ -12,7 +12,7 @@ import asyncio
 import json
 import sys
 
-from .config import ALL_LENSES, load_config
+from .config import ALL_LENSES, load_config, normalize_model_concurrency, normalize_models
 from .store import RunStore
 
 
@@ -23,7 +23,8 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--out-dir", dest="out_dir", help="run 目录(产物/断点);默认 <target>/.proto-vuln-hunt")
     p.add_argument("--backend", choices=["claude", "opencode", "codex"], help="后端 CLI(覆盖配置)")
     p.add_argument("--concurrency", type=int, help="同时运行的 agent 上限")
-    p.add_argument("--model", help="所有角色统一使用的默认模型(覆盖 models.default)")
+    p.add_argument("--model", help="所有角色统一使用的默认模型(覆盖 models.default;多个模型可用逗号分隔)")
+    p.add_argument("--model-concurrency", dest="model_concurrency", help="每个模型自己的并发上限,如 default=1,openai/gpt-5=2")
     p.add_argument("--threat-model", dest="threat_model", choices=["REMOTE", "LOCAL_UNPRIVILEGED", "BOTH"])
     p.add_argument("--lenses", help="逗号分隔的 lens 子集,如 memory,integer,dos")
     p.add_argument("--finders-per-lens", dest="finders_per_lens", type=int)
@@ -64,18 +65,21 @@ def _overrides_from_args(args) -> dict:
             overrides[k] = v
     if getattr(args, "lenses", None):
         overrides["lenses"] = [s.strip() for s in args.lenses.split(",") if s.strip() in ALL_LENSES]
+    if getattr(args, "model_concurrency", None):
+        overrides["model_concurrency"] = normalize_model_concurrency(args.model_concurrency)
     return overrides
 
 
 def cmd_run(args) -> int:
     cfg = load_config(getattr(args, "config", None), _overrides_from_args(args))
     if getattr(args, "model", None):
-        cfg.models = {**cfg.models, "default": args.model}
+        cfg.models = normalize_models({**cfg.models, "default": args.model})
 
     if getattr(args, "print_config", False):
         print(json.dumps({
             "target": cfg.target, "scope": cfg.scope, "out_dir": cfg.out_dir, "backend": cfg.backend,
-            "models": cfg.models, "concurrency": cfg.concurrency, "lenses": cfg.lenses,
+            "models": cfg.models, "model_concurrency": cfg.model_concurrency,
+            "concurrency": cfg.concurrency, "lenses": cfg.lenses,
             "threat_model": cfg.threat_model, "finders_per_lens": cfg.finders_per_lens,
             "max_rounds": cfg.max_rounds, "dry_rounds": cfg.dry_rounds, "verify_votes": cfg.verify_votes,
             "enable_poc": cfg.enable_poc, "decompose": cfg.decompose, "resume": cfg.resume,

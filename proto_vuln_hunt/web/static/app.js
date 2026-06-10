@@ -26,6 +26,36 @@ function flash(msg) { const f = el("div", { class: "flash" }, msg); document.bod
 function fmtTs(t) { if (!t) return "—"; const d = new Date(t * 1000); return d.toLocaleString(); }
 function sevPill(s) { return el("span", { class: "pill sev-" + (s || "none") }, s || "none"); }
 function stPill(s) { return el("span", { class: "pill st-" + (s || "queued") }, s || "queued"); }
+function fmtNum(n) { return Number(n || 0).toLocaleString(); }
+function modelText(v) { return Array.isArray(v) ? v.join(", ") : (v || ""); }
+function splitModels(v) { return String(v || "").split(",").map(s => s.trim()).filter(Boolean); }
+function kvText(obj) { return Object.entries(obj || {}).map(([k, v]) => `${k}=${v}`).join(", "); }
+function parseKvInts(v) {
+  const out = {};
+  for (const part of String(v || "").split(",")) {
+    const i = part.indexOf("=");
+    if (i < 1) continue;
+    const k = part.slice(0, i).trim();
+    const n = parseInt(part.slice(i + 1).trim(), 10);
+    if (k && Number.isFinite(n) && n > 0) out[k] = n;
+  }
+  return out;
+}
+function emptyUsage() { return { calls: 0, input_tokens: 0, output_tokens: 0, total_tokens: 0, estimated_calls: 0 }; }
+function addUsage(total, rec) {
+  total.calls += 1;
+  total.input_tokens += Number(rec.input_tokens || 0);
+  total.output_tokens += Number(rec.output_tokens || 0);
+  total.total_tokens += Number(rec.total_tokens || 0);
+  if (rec.estimated) total.estimated_calls += 1;
+}
+function setUsage(total, src) {
+  total.calls = Number(src?.calls || 0);
+  total.input_tokens = Number(src?.input_tokens || 0);
+  total.output_tokens = Number(src?.output_tokens || 0);
+  total.total_tokens = Number(src?.total_tokens || 0);
+  total.estimated_calls = Number(src?.estimated_calls || 0);
+}
 
 // ──────────────────────── mini markdown ────────────────────────
 function inlineMd(s) {
@@ -130,7 +160,7 @@ async function viewNew() {
   const lensChecks = el("div", { class: "checks" }, ...meta.lenses.map(l =>
     el("label", {}, el("input", { type: "checkbox", value: l, class: "lens", checked: (d.lenses || []).includes(l) ? "" : null }), l)));
   const modelRows = el("div", { class: "grid" }, ...["default", ...meta.roles].map(role =>
-    f("模型 · " + role, inp("model_" + role, (d.models || {})[role] || "", "text"))));
+    f("模型 · " + role, inp("model_" + role, modelText((d.models || {})[role]), "text"))));
 
   const left = el("div", {},
     f("目标源码根目录 *", inp("target", "")),
@@ -148,7 +178,10 @@ async function viewNew() {
     el("div", { class: "checks", style: "margin:8px 0 14px" },
       el("label", {}, el("input", { type: "checkbox", id: "enable_poc", checked: d.enable_poc ? "" : null }), "启用 PoC"),
       el("label", {}, el("input", { type: "checkbox", id: "decompose", checked: d.decompose ? "" : null }), "区域拆解")),
-    el("div", { class: "panel", style: "padding:10px" }, el("div", { class: "muted", style: "margin-bottom:6px" }, "每角色模型(留空=用 default)"), modelRows),
+    el("div", { class: "panel", style: "padding:10px" },
+      el("div", { class: "muted", style: "margin-bottom:6px" }, "每角色模型(留空=用 default)"),
+      modelRows,
+      f("模型并发 model=limit", inp("model_concurrency", kvText(d.model_concurrency), "text"))),
   );
 
   const submit = el("button", { class: "btn" }, "🚀 启动审计");
@@ -156,7 +189,10 @@ async function viewNew() {
     const target = document.getElementById("target").value.trim();
     if (!target) { flash("请填写目标目录"); return; }
     const models = {};
-    for (const role of ["default", ...meta.roles]) { const v = document.getElementById("model_" + role).value.trim(); if (v) models[role] = v; }
+    for (const role of ["default", ...meta.roles]) {
+      const vals = splitModels(document.getElementById("model_" + role).value);
+      if (vals.length) models[role] = vals;
+    }
     const lenses = [...document.querySelectorAll(".lens:checked")].map(c => c.value);
     const payload = {
       target, scope: document.getElementById("scope").value.trim(),
@@ -165,7 +201,7 @@ async function viewNew() {
       finders_per_lens: +document.getElementById("finders_per_lens").value, max_rounds: +document.getElementById("max_rounds").value,
       dry_rounds: +document.getElementById("dry_rounds").value, verify_votes: +document.getElementById("verify_votes").value,
       enable_poc: document.getElementById("enable_poc").checked, decompose: document.getElementById("decompose").checked,
-      models,
+      models, model_concurrency: parseKvInts(document.getElementById("model_concurrency").value),
     };
     submit.disabled = true;
     try { const r = await api("POST", "/api/runs", payload); location.hash = "#/run/" + encodeURIComponent(r.run_id); }
@@ -179,7 +215,7 @@ async function viewNew() {
 // ──────────────────────── view: dashboard ────────────────────────
 function viewDashboard(runId) {
   app.innerHTML = "";
-  const S = { findings: new Map(), risks: new Map(), coverage: null, recon: null, log: [], manifest: null, candidates: 0, status: "queued", round: 0, dry: 0, agents: 0, elapsed: 0 };
+  const S = { findings: new Map(), risks: new Map(), coverage: null, recon: null, log: [], usageRows: [], usage: emptyUsage(), manifest: null, candidates: 0, status: "queued", round: 0, dry: 0, agents: 0, elapsed: 0 };
   let activeTab = "findings";
 
   const header = el("div", { class: "panel" });
@@ -210,14 +246,17 @@ function viewDashboard(runId) {
       ...SEVS.map(s => el("div", { class: "stat" }, el("div", { class: "n sev-" + s, style: "color:var(--" + (s === "critical" ? "crit" : s === "high" ? "high" : s === "medium" ? "med" : s === "low" ? "low" : "info") + ")" }, String(bySev[s] || 0)), el("div", { class: "l" }, s))),
       el("div", { class: "stat" }, el("div", { class: "n" }, String(S.candidates)), el("div", { class: "l" }, "候选")),
       el("div", { class: "stat" }, el("div", { class: "n" }, String(S.risks.size)), el("div", { class: "l" }, "风险登记")),
-      el("div", { class: "stat" }, el("div", { class: "n" }, String(S.agents)), el("div", { class: "l" }, "agent 调用")));
+      el("div", { class: "stat" }, el("div", { class: "n" }, String(S.agents)), el("div", { class: "l" }, "agent 调用")),
+      el("div", { class: "stat" }, el("div", { class: "n" }, fmtNum(S.usage.input_tokens)), el("div", { class: "l" }, "输入 token")),
+      el("div", { class: "stat" }, el("div", { class: "n" }, fmtNum(S.usage.output_tokens)), el("div", { class: "l" }, "输出 token")),
+      el("div", { class: "stat" }, el("div", { class: "n" }, fmtNum(S.usage.total_tokens)), el("div", { class: "l" }, "总 token")));
     header.append(stats);
   }
 
-  const TABS = [["findings", "漏洞"], ["coverage", "覆盖"], ["risks", "风险"], ["recon", "侦察"], ["activity", "活动"], ["exports", "导出"]];
+  const TABS = [["findings", "漏洞"], ["coverage", "覆盖"], ["risks", "风险"], ["usage", "用量"], ["recon", "侦察"], ["activity", "活动"], ["exports", "导出"]];
   function renderTabs() {
     tabsBar.innerHTML = "";
-    const counts = { findings: S.findings.size, risks: S.risks.size };
+    const counts = { findings: S.findings.size, risks: S.risks.size, usage: S.usageRows.length };
     for (const [key, label] of TABS) {
       const t = el("div", { class: "tab" + (key === activeTab ? " active" : "") }, label);
       if (counts[key]) t.append(el("span", { class: "tabcount" }, String(counts[key])));
@@ -231,6 +270,7 @@ function viewDashboard(runId) {
     if (activeTab === "findings") return renderFindings();
     if (activeTab === "coverage") return renderCoverage();
     if (activeTab === "risks") return renderRisks();
+    if (activeTab === "usage") return renderUsage();
     if (activeTab === "recon") return renderRecon();
     if (activeTab === "activity") return renderActivity();
     if (activeTab === "exports") return renderExports();
@@ -319,6 +359,20 @@ function viewDashboard(runId) {
     }
   }
 
+  function renderUsage() {
+    const rows = [...S.usageRows].slice(-80).reverse();
+    if (!rows.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无 token 用量数据。")); return; }
+    const tbl = el("table", {}, el("thead", {}, el("tr", {},
+      el("th", {}, "#"), el("th", {}, "role"), el("th", {}, "模型"), el("th", {}, "输入"), el("th", {}, "输出"), el("th", {}, "总计"), el("th", {}, "来源"))));
+    const tb = el("tbody");
+    for (const u of rows) tb.append(el("tr", {},
+      el("td", {}, String(u.id || "")), el("td", {}, u.label || u.role || ""), el("td", {}, u.model || ""),
+      el("td", {}, fmtNum(u.input_tokens)), el("td", {}, fmtNum(u.output_tokens)), el("td", {}, fmtNum(u.total_tokens)),
+      el("td", {}, u.estimated ? "估算" : "后端")));
+    tbl.append(tb);
+    tabBody.append(el("div", { class: "panel" }, el("h3", {}, "Token 使用(最近 80 次 agent 调用)"), tbl));
+  }
+
   function renderActivity() {
     tabBody.append(el("div", { class: "panel" }, el("div", { class: "log" }, S.log.join("\n") || "(暂无日志)")));
   }
@@ -341,7 +395,8 @@ function viewDashboard(runId) {
     const d = ev.data || {};
     switch (ev.type) {
       case "run_status": S.status = d.status; renderHeader(); break;
-      case "metrics": S.agents = d.agents_spawned ?? S.agents; S.elapsed = d.elapsed_s ?? S.elapsed; S.candidates = d.candidates ?? S.candidates; renderHeader(); break;
+      case "metrics": S.agents = d.agents_spawned ?? S.agents; S.elapsed = d.elapsed_s ?? S.elapsed; S.candidates = d.candidates ?? S.candidates; if (d.token_usage) setUsage(S.usage, d.token_usage); renderHeader(); break;
+      case "usage": S.usageRows.push(d); addUsage(S.usage, d); renderHeader(); renderTabs(); if (activeTab === "usage") renderTab(); break;
       case "candidate_found": S.candidates++; renderHeader(); break;
       case "finding_confirmed":
         if (d.id && !S.findings.has(d.id)) { S.findings.set(d.id, d); flash("✔ 确认漏洞 " + d.id + " [" + d.corrected_severity + "]"); }
@@ -367,7 +422,7 @@ function viewDashboard(runId) {
     // SSE:从 seq 0 重放历史事件(重建 findings/coverage/risks/log)再接实时;EventSource 断线自动带 Last-Event-ID 续传
     const es = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events`);
     window._es = es;
-    const TYPES = ["run_status", "metrics", "candidate_found", "finding_confirmed", "risk_added", "surface_added", "coverage_update", "round_start", "round_done", "recon_done", "run_done", "log", "decompose_done", "poc_done", "error"];
+    const TYPES = ["run_status", "metrics", "usage", "candidate_found", "finding_confirmed", "risk_added", "surface_added", "coverage_update", "round_start", "round_done", "recon_done", "run_done", "log", "decompose_done", "poc_done", "error"];
     for (const t of TYPES) es.addEventListener(t, (e) => { try { applyEvent(JSON.parse(e.data)); } catch (_) {} });
     es.onerror = () => { /* EventSource 自动重连 */ };
   }

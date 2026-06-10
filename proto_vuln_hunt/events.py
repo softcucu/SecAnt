@@ -24,6 +24,7 @@ RISK_ADDED = "risk_added"          # {area, note, file, severity_hint, lens, rou
 POC_DONE = "poc_done"              # {id, compiled, triggered}
 COVERAGE_UPDATE = "coverage_update"  # {ledger, surfaces, progress}
 METRICS = "metrics"                # {agents_spawned, in_flight, confirmed, candidates}
+USAGE = "usage"                    # {role, label, model, input_tokens, output_tokens, total_tokens, estimated}
 RUN_DONE = "run_done"              # {summary}
 ERROR = "error"                    # {message}
 
