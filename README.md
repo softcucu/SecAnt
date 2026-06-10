@@ -18,7 +18,8 @@ Markdown / SARIF 由 `exporters.py` 从结构化态**按需渲染**(Web 导出�
 实时增量地呈现漏洞与覆盖,而文件产物随时可一键导出。
 
 每次 agent 调用会记录 token 使用量到 `usage.jsonl` 并通过 Web 实时展示。Web「Agent」页签会按 agent
-分开展示正在运行子进程的 stdout/stderr 实时输出,用于像终端里看 opencode 一样观察当前执行。若后端 CLI 没有返回真实 usage,
+分角色分类展示正在运行子进程的 stdout/stderr 实时输出,分类与单个 agent 输出窗口都可折叠,并可在 opencode JSON 事件流的可读视图与原始流之间切换,
+用于像终端里看 opencode 一样观察当前执行。若后端 CLI 没有返回真实 usage,
 本工具用轻量算法估算:ASCII 约 4 字符/token,非 ASCII 约 1 字符/token。
 
 ---

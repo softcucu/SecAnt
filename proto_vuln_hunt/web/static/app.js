@@ -39,6 +39,14 @@ function cssKey(s) { return String(s || "unknown").replace(/[^a-z0-9-]+/gi, "-")
 function modelText(v) { return Array.isArray(v) ? v.join(", ") : (v || ""); }
 function splitModels(v) { return String(v || "").split(",").map(s => s.trim()).filter(Boolean); }
 function kvText(obj) { return Object.entries(obj || {}).map(([k, v]) => `${k}=${v}`).join(", "); }
+function shortJson(v, max = 420) {
+  let s;
+  try { s = typeof v === "string" ? v : JSON.stringify(v, null, 2); }
+  catch (_) { s = String(v); }
+  if (s == null) return "";
+  s = String(s);
+  return s.length > max ? s.slice(0, max - 1) + "…" : s;
+}
 function parseKvInts(v) {
   const out = {};
   for (const part of String(v || "").split(",")) {
@@ -226,6 +234,11 @@ function viewDashboard(runId) {
   app.innerHTML = "";
   const S = { findings: new Map(), risks: new Map(), health: new Map(), agentMap: new Map(), coverage: null, recon: null, log: [], usageRows: [], usage: emptyUsage(), manifest: null, candidates: 0, status: "queued", round: 0, dry: 0, agents: 0, elapsed: 0 };
   let activeTab = "findings";
+  let agentOutputMode = localStorage.getItem("pvh.agentOutputMode") === "raw" ? "raw" : "pretty";
+  const agentGroupStoreKey = `pvh.agentGroupsCollapsed:${runId}`;
+  const agentOutputStoreKey = `pvh.agentOutputsCollapsed:${runId}`;
+  let collapsedAgentGroups = loadLocalSet(agentGroupStoreKey);
+  let collapsedAgentOutputs = loadLocalSet(agentOutputStoreKey);
 
   const header = el("div", { class: "panel" });
   const tabsBar = el("div", { class: "tabs" });
@@ -365,12 +378,345 @@ function viewDashboard(runId) {
     done: "完成",
     failed: "失败",
   };
+  const AGENT_ROLE_TXT = {
+    recon: "侦察",
+    history: "历史",
+    decompose: "拆解",
+    audit: "审计",
+    verify: "验证",
+    report: "报告",
+    poc: "PoC",
+    synthesis: "汇总",
+    recheck: "复查",
+    util: "工具",
+    agent: "Agent",
+  };
+  const AGENT_ROLE_ORDER = ["recheck", "recon", "history", "decompose", "audit", "verify", "report", "poc", "synthesis", "util", "agent"];
   function isAgentActive(a) { return ["queued", "running", "retrying", "failed_attempt"].includes(a.status); }
   function agentPill(s) { return el("span", { class: "pill agent-" + cssKey(s) }, AGENT_TXT[s] || s || "unknown"); }
   function agentSort(a, b) {
     const live = Number(isAgentActive(b)) - Number(isAgentActive(a));
     if (live) return live;
     return Number(b.updated_ts || b.ts || b.id || 0) - Number(a.updated_ts || a.ts || a.id || 0);
+  }
+  function loadLocalSet(key) {
+    try {
+      const v = JSON.parse(localStorage.getItem(key) || "[]");
+      return new Set(Array.isArray(v) ? v.map(String) : []);
+    } catch (_) {
+      return new Set();
+    }
+  }
+  function saveLocalSet(key, set) {
+    try { localStorage.setItem(key, JSON.stringify([...set])); } catch (_) {}
+  }
+  function toggleLocalSet(set, key, storeKey) {
+    key = String(key);
+    if (set.has(key)) set.delete(key);
+    else set.add(key);
+    saveLocalSet(storeKey, set);
+    renderTab();
+  }
+  function agentCategory(a) { return String(a.role || "agent"); }
+  function agentCategoryLabel(key) { return AGENT_ROLE_TXT[key] || key || "Agent"; }
+  function agentGroupOrder(key) {
+    const i = AGENT_ROLE_ORDER.indexOf(key);
+    return i >= 0 ? i : AGENT_ROLE_ORDER.length;
+  }
+  function agentGroups(agents) {
+    const map = new Map();
+    for (const a of agents) {
+      const key = agentCategory(a);
+      if (!map.has(key)) map.set(key, { key, agents: [] });
+      map.get(key).agents.push(a);
+    }
+    return [...map.values()].sort((a, b) => {
+      const live = b.agents.filter(isAgentActive).length - a.agents.filter(isAgentActive).length;
+      if (live) return live;
+      return agentGroupOrder(a.key) - agentGroupOrder(b.key) || a.key.localeCompare(b.key);
+    });
+  }
+  function agentRawOutput(a) {
+    return (a.chunks || []).length ? a.chunks.map(c => c.chunk).join("") : (a.output || "");
+  }
+  function agentStreamOutput(a, stream) {
+    return (a.chunks || []).filter(c => c.stream === stream).map(c => c.chunk).join("");
+  }
+  function modeButton(mode, label) {
+    const b = el("button", { type: "button", class: "seg-btn" + (agentOutputMode === mode ? " active" : "") }, label);
+    b.addEventListener("click", () => {
+      agentOutputMode = mode;
+      localStorage.setItem("pvh.agentOutputMode", mode);
+      renderTab();
+    });
+    return b;
+  }
+  function agentModeSwitch() {
+    return el("div", { class: "segmented", role: "group", "aria-label": "Agent 输出显示模式" },
+      modeButton("pretty", "可读"),
+      modeButton("raw", "原始"));
+  }
+  function maybeJsonObj(v) {
+    if (v && typeof v === "object" && !Array.isArray(v)) return v;
+    if (typeof v === "string" && v.trim().startsWith("{")) {
+      try {
+        const obj = JSON.parse(v);
+        return obj && typeof obj === "object" && !Array.isArray(obj) ? obj : null;
+      } catch (_) {}
+    }
+    return null;
+  }
+  function eventPart(ev) {
+    const direct = maybeJsonObj(ev.part);
+    if (direct) return direct;
+    for (const key of ["data", "properties", "payload"]) {
+      const inner = maybeJsonObj(ev[key]);
+      if (!inner) continue;
+      const p = maybeJsonObj(inner.part);
+      if (p) return p;
+      const t = String(inner.type || "");
+      if ("text" in inner || ["step-finish", "step-start", "tool", "reasoning"].includes(t)) return inner;
+    }
+    const t = String(ev.type || "");
+    if ("text" in ev || ["step-finish", "step-start", "tool", "reasoning"].includes(t)) return ev;
+    return {};
+  }
+  function eventMessage(ev) {
+    const direct = maybeJsonObj(ev.message);
+    if (direct) return direct;
+    for (const key of ["data", "properties", "payload"]) {
+      const inner = maybeJsonObj(ev[key]);
+      if (!inner) continue;
+      const msg = maybeJsonObj(inner.message);
+      if (msg) return msg;
+      if ("role" in inner && "id" in inner) return inner;
+    }
+    return {};
+  }
+  function textDelta(ev, part) {
+    for (const obj of [part || {}, ev || {}]) {
+      for (const key of ["delta", "textDelta", "text_delta"]) {
+        const v = obj[key];
+        if (typeof v === "string") return v;
+        if (v && typeof v === "object") {
+          const txt = v.text || v.content;
+          if (typeof txt === "string") return txt;
+        }
+      }
+    }
+    return "";
+  }
+  function parseOpencodeEvents(stdout) {
+    if (!stdout || !stdout.includes("{")) return null;
+    const lines = stdout.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    if (!lines.length) return null;
+    const events = [];
+    for (const ln of lines) {
+      if (!ln.startsWith("{")) continue;
+      try {
+        const ev = JSON.parse(ln);
+        if (ev && typeof ev === "object" && !Array.isArray(ev) &&
+            (ev.type || ev.part || ev.sessionID || ev.session_id || ev.data || ev.payload || ev.properties)) {
+          events.push(ev);
+        }
+      } catch (_) {}
+    }
+    return events.length && events.length * 2 >= Math.max(1, lines.length - 1) ? events : null;
+  }
+  function opencodeEventTitle(ev, part) {
+    const et = String(ev.type || "");
+    const pt = String(part.type || "");
+    const norm = (pt || et).replace(/_/g, "-");
+    if (norm.includes("step-start")) return "step start";
+    if (norm.includes("step-finish")) {
+      const reason = part.reason || ev.reason;
+      const tokens = part.tokens || ev.tokens;
+      const usage = tokens ? ` · ${shortJson(tokens, 120).replace(/\s+/g, " ")}` : "";
+      return "step finish" + (reason ? ` · ${reason}` : "") + usage;
+    }
+    if (et.includes("session")) return ev.status ? `session · ${ev.status}` : et;
+    return et || pt || "event";
+  }
+  function toolSummary(ev, part) {
+    const name = part.tool || part.name || part.command || ev.tool || ev.name || ev.command ||
+      part.function?.name || part.call?.name || part.input?.tool || "tool";
+    const state = part.state?.status || part.state || part.status || ev.status || "";
+    const input = part.input || part.args || part.arguments || ev.input || ev.args || ev.arguments || "";
+    const output = part.output || part.result || ev.output || ev.result || "";
+    const bits = [name, state].filter(Boolean).join(" · ");
+    const detail = [input ? shortJson(input) : "", output ? shortJson(output) : ""].filter(Boolean).join("\n");
+    return { title: bits, detail };
+  }
+  function appendOpencodeItem(items, itemByPart, pid, item) {
+    if (pid && itemByPart.has(pid)) return itemByPart.get(pid);
+    items.push(item);
+    if (pid) itemByPart.set(pid, item);
+    return item;
+  }
+  function buildOpencodeItems(events) {
+    const items = [];
+    const itemByPart = new Map();
+    const messageRoles = new Map();
+    let sessionId = "";
+    for (const ev of events) {
+      const etype = String(ev.type || "");
+      const part = eventPart(ev);
+      const msg = eventMessage(ev);
+      const ptype = String(part.type || "");
+      if (!sessionId) sessionId = String(ev.sessionID || ev.session_id || part.sessionID || part.session_id || msg.sessionID || msg.session_id || "");
+      const mid = String(part.messageID || part.message_id || part.messageId || msg.id || msg.messageID || "");
+      const role = String(part.role || msg.role || "");
+      if (mid && role) messageRoles.set(mid, role);
+      const fallbackPid = mid && (ptype || etype) ? `${mid}:${ptype || etype}` : "";
+      const pid = String(part.id || fallbackPid);
+      const norm = (ptype || etype).replace(/_/g, "-");
+      const isText = ptype === "text" || etype === "text" || etype === "message.part.updated" || etype === "message.part.delta";
+      const isReasoning = ptype === "reasoning" || etype === "reasoning";
+      const isTool = ptype === "tool" || ptype === "tool-use" || etype === "tool_use" || etype === "tool" || part.tool || part.call;
+      const isStep = norm.includes("step-start") || norm.includes("step-finish");
+      if (isText || isReasoning) {
+        const item = appendOpencodeItem(items, itemByPart, pid || `${items.length}`, {
+          kind: isReasoning ? "reasoning" : "text",
+          role: role || messageRoles.get(mid) || "assistant",
+          text: "",
+        });
+        if (typeof part.text === "string") item.text = part.text;
+        else if (typeof part.content === "string") item.text = part.content;
+        const delta = textDelta(ev, part);
+        if (delta) item.text += delta;
+        continue;
+      }
+      if (isTool) {
+        const s = toolSummary(ev, part);
+        const item = appendOpencodeItem(items, itemByPart, pid || `${items.length}`, {
+          kind: "tool",
+          title: s.title,
+          detail: "",
+        });
+        item.title = s.title || item.title;
+        if (s.detail) item.detail = s.detail;
+        continue;
+      }
+      if (etype === "error" || ev.error || part.error) {
+        items.push({ kind: "error", title: "error", text: shortJson(ev.error || part.error || ev.message || ev) });
+        continue;
+      }
+      if (isStep) {
+        items.push({ kind: "step", title: opencodeEventTitle(ev, part), text: "" });
+      }
+    }
+    return { items: items.filter(x => x.kind !== "step" || /finish/.test(x.title)), sessionId };
+  }
+  function renderAgentReadable(a) {
+    const stdout = agentStreamOutput(a, "stdout") || agentRawOutput(a);
+    const stderr = agentStreamOutput(a, "stderr");
+    const events = parseOpencodeEvents(stdout);
+    if (!events) {
+      return el("pre", { class: "agent-output agent-raw" }, agentRawOutput(a) || "(暂未收到 stdout/stderr)");
+    }
+    const parsed = buildOpencodeItems(events);
+    const out = el("div", { class: "agent-output agent-pretty" });
+    if (parsed.sessionId) out.append(el("div", { class: "agent-session" }, "session ", el("code", {}, parsed.sessionId)));
+    let hasContent = false;
+    for (const item of parsed.items) {
+      if (item.kind === "text") {
+        if (!String(item.text || "").trim()) continue;
+        hasContent = true;
+        out.append(el("div", { class: "agent-event agent-event-text" },
+          el("div", { class: "agent-event-label" }, item.role || "assistant"),
+          el("div", { class: "agent-event-body agent-text md", html: mdToHtml(item.text) })));
+      } else if (item.kind === "reasoning") {
+        if (!String(item.text || "").trim()) continue;
+        hasContent = true;
+        out.append(el("div", { class: "agent-event agent-event-reasoning" },
+          el("div", { class: "agent-event-label" }, "reasoning"),
+          el("pre", { class: "agent-event-body" }, item.text)));
+      } else if (item.kind === "tool") {
+        hasContent = true;
+        out.append(el("div", { class: "agent-event agent-event-tool" },
+          el("div", { class: "agent-event-label" }, "tool"),
+          el("div", { class: "agent-event-body" },
+            el("div", { class: "agent-tool-title" }, item.title || "tool"),
+            item.detail ? el("pre", {}, item.detail) : null)));
+      } else if (item.kind === "error") {
+        hasContent = true;
+        out.append(el("div", { class: "agent-event agent-event-error" },
+          el("div", { class: "agent-event-label" }, item.title || "error"),
+          el("pre", { class: "agent-event-body" }, item.text || "")));
+      } else if (item.kind === "step") {
+        out.append(el("div", { class: "agent-event agent-event-step" },
+          el("div", { class: "agent-event-label" }, "step"),
+          el("div", { class: "agent-event-body" }, item.title || "")));
+      }
+    }
+    if (!hasContent) out.append(el("div", { class: "agent-empty" }, "(已识别 opencode JSON 流，暂无 assistant 文本或工具输出)"));
+    if (stderr.trim()) {
+      out.append(el("div", { class: "agent-event agent-event-stderr" },
+        el("div", { class: "agent-event-label" }, "stderr"),
+        el("pre", { class: "agent-event-body" }, stderr)));
+    }
+    return out;
+  }
+  function renderAgentOutput(a) {
+    if (agentOutputMode === "raw") return el("pre", { class: "agent-output agent-raw" }, agentRawOutput(a) || "(暂未收到 stdout/stderr)");
+    return renderAgentReadable(a);
+  }
+  function renderAgentCard(a) {
+    const id = String(a.id || "");
+    const title = `${a.role || "agent"} · ${a.label || ""}`.replace(/\s+$/, "");
+    const meta = [
+      `#${a.id}`,
+      a.model ? `model ${a.model}` : "",
+      a.attempt ? `attempt ${a.attempt}` : "",
+      a.duration_ms ? `耗时 ${fmtMs(a.duration_ms)}` : "",
+      a.retry_in_ms ? `重试等待 ${fmtMs(a.retry_in_ms)}` : "",
+      a.updated_ts || a.ts ? `更新 ${fmtClock(a.updated_ts || a.ts)}` : "",
+    ].filter(Boolean).join(" · ");
+    const outputCollapsed = collapsedAgentOutputs.has(id);
+    const toggle = el("button", {
+      type: "button",
+      class: "agent-toggle",
+      "aria-expanded": outputCollapsed ? "false" : "true",
+    }, outputCollapsed ? "显示输出" : "隐藏输出");
+    toggle.addEventListener("click", () => toggleLocalSet(collapsedAgentOutputs, id, agentOutputStoreKey));
+    const out = outputCollapsed ? null : renderAgentOutput(a);
+    const card = el("div", { class: "agent-card " + (isAgentActive(a) ? "active " : "") + (outputCollapsed ? "output-collapsed" : "") },
+      el("div", { class: "agent-head" },
+        agentPill(a.status),
+        el("span", { class: "agent-title" }, title),
+        el("span", { class: "muted agent-head-meta" }, meta),
+        toggle),
+      el("div", { class: "agent-meta" },
+        el("span", {}, a.cwd || ""),
+        a.error ? el("span", { class: "agent-error" }, a.error) : null),
+      out);
+    if (isAgentActive(a) && out) setTimeout(() => { out.scrollTop = out.scrollHeight; }, 0);
+    return card;
+  }
+  function renderAgentGroup(group) {
+    const active = group.agents.filter(isAgentActive).length;
+    const failed = group.agents.filter(a => a.status === "failed" || a.status === "failed_attempt").length;
+    const done = group.agents.length - active;
+    const collapsed = collapsedAgentGroups.has(group.key);
+    const summary = [
+      `共 ${group.agents.length}`,
+      active ? `运行中 ${active}` : "",
+      done ? `已结束 ${done}` : "",
+      failed ? `异常 ${failed}` : "",
+    ].filter(Boolean).join(" · ");
+    const head = el("button", {
+      type: "button",
+      class: "agent-group-head",
+      "aria-expanded": collapsed ? "false" : "true",
+    },
+      el("span", { class: "agent-group-caret" }, collapsed ? ">" : "v"),
+      el("span", { class: "agent-group-title" }, agentCategoryLabel(group.key)),
+      el("span", { class: "agent-group-key" }, group.key),
+      el("span", { class: "agent-group-summary" }, summary));
+    head.addEventListener("click", () => toggleLocalSet(collapsedAgentGroups, group.key, agentGroupStoreKey));
+    return el("section", { class: "agent-group " + (collapsed ? "collapsed" : "open") },
+      head,
+      collapsed ? null : el("div", { class: "agent-group-body" }, ...group.agents.map(renderAgentCard)));
   }
   function renderAgents() {
     const all = [...S.agentMap.values()].sort(agentSort);
@@ -379,34 +725,12 @@ function viewDashboard(runId) {
     tabBody.append(el("div", { class: "panel agent-summary" },
       el("div", { class: "row", style: "justify-content:space-between" },
         el("strong", {}, "Agent 实时输出"),
-        el("span", { class: "muted" }, `运行中 ${running.length} · 已结束 ${done}`)),
-      el("p", { class: "muted", style: "margin:6px 0 0" },
-        "这里显示每个 agent 子进程的 stdout/stderr，按 agent 分开，输出会随 opencode/后端 CLI 实时追加。")));
+        el("div", { class: "row" },
+          el("span", { class: "muted" }, `运行中 ${running.length} · 已结束 ${done}`),
+          agentModeSwitch()))));
     if (!all.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无 agent 输出。运行开始后这里会出现每个 agent 的实时 stdout/stderr。")); return; }
     const shown = all.slice(0, 80);
-    for (const a of shown) {
-      const title = `${a.role || "agent"} · ${a.label || ""}`.replace(/\s+$/, "");
-      const meta = [
-        `#${a.id}`,
-        a.model ? `model ${a.model}` : "",
-        a.attempt ? `attempt ${a.attempt}` : "",
-        a.duration_ms ? `耗时 ${fmtMs(a.duration_ms)}` : "",
-        a.retry_in_ms ? `重试等待 ${fmtMs(a.retry_in_ms)}` : "",
-        a.updated_ts || a.ts ? `更新 ${fmtClock(a.updated_ts || a.ts)}` : "",
-      ].filter(Boolean).join(" · ");
-      const out = el("pre", { class: "agent-output" }, a.output || "(暂未收到 stdout/stderr)");
-      const card = el("div", { class: "agent-card " + (isAgentActive(a) ? "active" : "") },
-        el("div", { class: "agent-head" },
-          agentPill(a.status),
-          el("span", { class: "agent-title" }, title),
-          el("span", { class: "muted" }, meta)),
-        el("div", { class: "agent-meta" },
-          el("span", {}, a.cwd || ""),
-          a.error ? el("span", { class: "agent-error" }, a.error) : null),
-        out);
-      tabBody.append(card);
-      if (isAgentActive(a)) setTimeout(() => { out.scrollTop = out.scrollHeight; }, 0);
-    }
+    for (const group of agentGroups(shown)) tabBody.append(renderAgentGroup(group));
   }
 
   function subtaskRow(t) {
@@ -614,10 +938,12 @@ function viewDashboard(runId) {
     const id = String(d.id || "");
     if (!id) return;
     const now = Date.now() / 1000;
-    const a = S.agentMap.get(id) || { id, status: "queued", output: "", stdout_chars: 0, stderr_chars: 0, created_ts: d.ts || now };
+    const a = S.agentMap.get(id) || { id, status: "queued", output: "", chunks: [], stdout_chars: 0, stderr_chars: 0, created_ts: d.ts || now };
+    if (!Array.isArray(a.chunks)) a.chunks = [];
     if (d.status === "output") {
       const chunk = String(d.chunk == null ? "" : d.chunk);
       a.output += chunk;
+      a.chunks.push({ stream: d.stream === "stderr" ? "stderr" : "stdout", chunk });
       if (d.stream === "stderr") a.stderr_chars += chunk.length;
       else a.stdout_chars += chunk.length;
       a.model = d.model || a.model;
