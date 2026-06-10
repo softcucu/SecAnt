@@ -40,7 +40,7 @@ class Pipeline:
         self._emit_cb = emitter or _noop_emit
         self._stop = stop_event   # 可为 None,惰性创建(兼容 py3.8 在事件循环外构造)
         self.runner = AgentRunner(cfg, logger=self.log, usage_sink=self.record_usage,
-                                  health_sink=self.record_health)
+                                  health_sink=self.record_health, agent_sink=self.record_agent)
         self.health_state: Dict[str, Dict[str, Any]] = {}   # model -> 最新健康记录
 
         # ── 运行状态(可被断点恢复) ──
@@ -96,6 +96,10 @@ class Pipeline:
         except Exception:
             pass
         self.emit(EV.MODEL_HEALTH, rec)
+
+    def record_agent(self, rec: Dict[str, Any]) -> None:
+        """agent 子进程状态与 stdout/stderr chunk:经 SSE 推给 Web「Agent」页。"""
+        self.emit(EV.AGENT_UPDATE, rec)
 
     async def health_check_all(self) -> Dict[str, Any]:
         """运行前(或按需)对所有配置的模型各发一个 1+1 探针,实时反映健康度。"""

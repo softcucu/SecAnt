@@ -6,6 +6,7 @@ agentic 循环,拿回最终文本;需要结构化结果时再从文本中解析�
 from __future__ import annotations
 
 import asyncio
+import codecs
 import math
 import json
 import os
@@ -498,16 +499,37 @@ def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str
     return text, usage, session_id
 
 
-async def _read_stream_all(stream: Optional[asyncio.StreamReader]) -> bytes:
-    """持续读取 pipe 到 EOF。只按 byte chunk 读,不按行,避免长 JSON 事件/无换行输出被截断。"""
+async def _read_stream_all_live(
+    stream: Optional[asyncio.StreamReader],
+    name: str,
+    on_chunk: Optional[Callable[[str, str], None]],
+) -> bytes:
+    """持续读取 pipe 到 EOF,并把解码后的 chunk 旁路发给实时 UI。"""
     if stream is None:
         return b""
     chunks: List[bytes] = []
+    decoder = None
+    if on_chunk:
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
     while True:
         chunk = await stream.read(65536)
         if not chunk:
             break
         chunks.append(chunk)
+        if decoder is not None and on_chunk is not None:
+            text = decoder.decode(chunk, final=False)
+            if text:
+                try:
+                    on_chunk(name, text)
+                except Exception:
+                    pass
+    if decoder is not None and on_chunk is not None:
+        text = decoder.decode(b"", final=True)
+        if text:
+            try:
+                on_chunk(name, text)
+            except Exception:
+                pass
     return b"".join(chunks)
 
 
@@ -515,10 +537,11 @@ async def _drain_process(
     proc: asyncio.subprocess.Process,
     stdin_data: Optional[bytes],
     timeout_s: float,
+    on_chunk: Optional[Callable[[str, str], None]] = None,
 ) -> Tuple[bytes, bytes]:
     """并发 drain stdout/stderr,等待进程退出且两个 pipe 都 EOF 后返回完整输出。"""
-    out_task = asyncio.create_task(_read_stream_all(proc.stdout))
-    err_task = asyncio.create_task(_read_stream_all(proc.stderr))
+    out_task = asyncio.create_task(_read_stream_all_live(proc.stdout, "stdout", on_chunk))
+    err_task = asyncio.create_task(_read_stream_all_live(proc.stderr, "stderr", on_chunk))
 
     async def run() -> Tuple[bytes, bytes]:
         if proc.stdin is not None:
@@ -558,13 +581,15 @@ class AgentRunner:
 
     def __init__(self, cfg: Config, logger=print,
                  usage_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
-                 health_sink: Optional[Callable[[Dict[str, Any]], None]] = None):
+                 health_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
+                 agent_sink: Optional[Callable[[Dict[str, Any]], None]] = None):
         self.cfg = cfg
         self._sem: Optional[asyncio.Semaphore] = None  # 惰性创建(避免在事件循环外构造时绑错 loop,兼容 py3.8)
         self.spec = cfg.backend_spec()
         self.log = logger
         self.usage_sink = usage_sink
         self.health_sink = health_sink
+        self.agent_sink = agent_sink
         self.health: Dict[str, Dict[str, Any]] = {}      # model -> 健康记录
         self._health_locks: Dict[str, asyncio.Lock] = {}  # 每模型一把锁,避免并发重复探针
         self.agent_count = 0
@@ -579,6 +604,15 @@ class AgentRunner:
         self._jitter = 0
         self._model_cursor: Dict[str, int] = {}
         self._model_sems: Dict[str, asyncio.Semaphore] = {}
+
+    def _emit_agent(self, rec: Dict[str, Any]) -> None:
+        if not self.agent_sink:
+            return
+        rec.setdefault("ts", time.time())
+        try:
+            self.agent_sink(dict(rec))
+        except Exception:
+            pass
 
     def _semaphore(self) -> asyncio.Semaphore:
         if self._sem is None:
@@ -653,7 +687,8 @@ class AgentRunner:
     # ── 单次子进程调用(不含重试) ──
     async def _invoke(self, prompt: str, model: str, cwd: str,
                       timeout_s: Optional[float] = None,
-                      direct_prompt: bool = False) -> Tuple[str, Optional[Dict[str, int]]]:
+                      direct_prompt: bool = False,
+                      on_output: Optional[Callable[[str, str], None]] = None) -> Tuple[str, Optional[Dict[str, int]]]:
         prompt_file = ""
         uses_prompt = any("{prompt}" in tok for tok in self.spec.command)
         uses_prompt_file = self.spec.prompt_mode == "file" or any(
@@ -702,7 +737,7 @@ class AgentRunner:
         if timeout_s is None:
             timeout_s = max(1, self.cfg.retry.timeout_ms / 1000.0)
         try:
-            out_b, err_b = await _drain_process(proc, stdin_data, timeout_s)
+            out_b, err_b = await _drain_process(proc, stdin_data, timeout_s, on_output)
         except asyncio.TimeoutError:
             raise RuntimeError(f"timed out after {int(timeout_s)}s")
 
@@ -776,7 +811,9 @@ class AgentRunner:
                 "model": model, "status": "unknown", "backend": self.cfg.backend,
                 "last_check_ts": 0.0, "last_ok_ts": 0.0, "last_latency_ms": 0,
                 "checks": 0, "ok_checks": 0, "answer": "", "error": "",
-                "calls": 0, "call_fails": 0, "reason": "", "ts": time.time(),
+                "calls": 0, "call_fails": 0, "last_call_error": "",
+                "last_call_fail_ts": 0.0, "last_call_ok_ts": 0.0,
+                "reason": "", "ts": time.time(),
             }
             self.health[model] = rec
         return rec
@@ -812,8 +849,8 @@ class AgentRunner:
         async with self._model_semaphore(model):
             async with self._semaphore():
                 try:
-                    # opencode 的正式任务用 prompt_file 指令避免长 argv;健康探针很短,直接作为 message
-                    # 发送,避免为了 1+1 再触发 read 工具循环,造成误判或只拿到中间输出。
+                    # opencode 探针也按单个 positional message argv 发送,避免为了 1+1 触发
+                    # "先读任务文件"的工具循环,造成健康状态误判。
                     text, _usage = await self._invoke(
                         hc.prompt,
                         model,
@@ -863,23 +900,31 @@ class AgentRunner:
             await self.probe_model(model, reason="gate")
 
     def _note_call(self, model: str, ok: bool, err: str = "") -> None:
-        """用真实 agent 调用的成败顺带更新模型健康(仅在状态发生跃迁时发事件,避免刷屏)。"""
+        """用真实 agent 调用的成败顺带更新模型健康。
+
+        健康探针的 answer/error 与真实任务的 last_call_error 分开存,避免 Web 把
+        "CLI 未产出结构化 JSON"这类任务失败误显示成"最近探针答复"。
+        """
         rec = self._health_rec(model)
         changed = False
+        now = time.time()
         if ok:
             rec["calls"] += 1
-            rec["last_ok_ts"] = time.time()
+            rec["last_ok_ts"] = now
+            rec["last_call_ok_ts"] = now
+            changed = True
+            if rec.get("last_call_error"):
+                rec["last_call_error"] = ""
             if rec["status"] in ("unknown", "down", "degraded", "checking"):
                 rec["status"] = "ok"
-                rec["last_check_ts"] = time.time()
-                rec["error"] = ""
-                changed = True
+                rec["last_check_ts"] = now
         else:
             rec["call_fails"] += 1
-            rec["error"] = (err or "")[:200]
+            rec["last_call_error"] = (err or "")[:300]
+            rec["last_call_fail_ts"] = now
+            changed = True
             if rec["status"] in ("ok", "unknown"):
                 rec["status"] = "degraded"
-                changed = True
         if changed:
             self._emit_health(rec)
 
@@ -901,7 +946,23 @@ class AgentRunner:
         tag = label or role
         run_cwd = cwd or os.path.abspath(os.path.expanduser(self.cfg.target))
         self.agent_count += 1
+        agent_id = self.agent_count
+        agent_started = time.time()
         max_attempts = self.cfg.retry.max_attempts if retries is None else retries
+
+        def emit_agent(status: str, **extra: Any) -> None:
+            rec: Dict[str, Any] = {
+                "id": agent_id,
+                "role": role,
+                "label": tag,
+                "status": status,
+                "backend": self.cfg.backend,
+                "cwd": run_cwd,
+            }
+            rec.update(extra)
+            self._emit_agent(rec)
+
+        emit_agent("queued", prompt_chars=len(prompt or ""), schema=bool(schema))
 
         attempt = 0
         while True:
@@ -909,34 +970,79 @@ class AgentRunner:
             await self.ensure_healthy(model)   # gate:调用前按需补一次健康探针(ttl 去重,不阻断)
             async with self._model_semaphore(model):
                 async with self._semaphore():
+                    attempt_no = attempt + 1
+                    attempt_started = time.time()
+                    emit_agent("running", model=model, attempt=attempt_no)
+
+                    def on_output(stream: str, chunk: str) -> None:
+                        emit_agent("output", model=model, attempt=attempt_no, stream=stream, chunk=chunk)
+
                     try:
-                        text, usage = await self._invoke(prompt, model, run_cwd)
+                        text, usage = await self._invoke(prompt, model, run_cwd, on_output=on_output)
                         self._record_usage(prompt, text, role=role, label=tag, model=model,
-                                           attempt=attempt + 1, backend_usage=usage)
+                                           attempt=attempt_no, backend_usage=usage)
                         self._note_call(model, True)
                         if schema is None:
+                            emit_agent(
+                                "done",
+                                model=model,
+                                attempt=attempt_no,
+                                duration_ms=int((time.time() - agent_started) * 1000),
+                                attempt_ms=int((time.time() - attempt_started) * 1000),
+                                output_chars=len(text or ""),
+                            )
                             return text
                         parsed = extract_json(text, schema)
                         if parsed is None:
-                            path = self._dump_failed_output(role, tag, model, attempt + 1, text)
+                            path = self._dump_failed_output(role, tag, model, attempt_no, text)
                             snippet = " ".join((text or "").split())[:240]
                             self.log(f"⚠ {tag} 后端输出无可解析 JSON(共 {len(text or '')} 字符)"
                                      f"{(';原始输出已存 ' + path) if path else ''};前 240 字符:{snippet}")
                             raise RuntimeError("CLI 未产出可解析的结构化 JSON(原始输出已存到 run 目录 debug/)")
+                        emit_agent(
+                            "done",
+                            model=model,
+                            attempt=attempt_no,
+                            duration_ms=int((time.time() - agent_started) * 1000),
+                            attempt_ms=int((time.time() - attempt_started) * 1000),
+                            output_chars=len(text or ""),
+                        )
                         return parsed
                     except Exception as e:  # noqa: BLE001
                         msg = str(e)
                         if isinstance(e, BackendOutputError) and e.output:
-                            path = self._dump_failed_output(role, tag, model, attempt + 1, e.output)
+                            path = self._dump_failed_output(role, tag, model, attempt_no, e.output)
                             if path:
                                 msg = f"{msg}(完整 stdout 已存 {path})"
                         self._note_call(model, False, msg)
+                        emit_agent(
+                            "failed_attempt",
+                            model=model,
+                            attempt=attempt_no,
+                            attempt_ms=int((time.time() - attempt_started) * 1000),
+                            error=msg[:500],
+                        )
             # 退避/重试在信号量之外等待(不占用并发额度)
             attempt += 1
             if attempt > max_attempts:
                 self.log(f"⚠ {tag} CLI 任务连续失败 {attempt} 次,放弃跳过(留待续跑): {msg[:120]}")
+                emit_agent(
+                    "failed",
+                    model=model,
+                    attempt=attempt,
+                    duration_ms=int((time.time() - agent_started) * 1000),
+                    error=msg[:500],
+                )
                 return fallback
             wait_ms = self._backoff_ms(attempt, msg)
             limited = "(疑似限流,延长退避)" if looks_rate_limited(msg) else ""
             self.log(f"⚠ {tag} CLI 任务失败(第 {attempt}/{max_attempts} 次重试{limited}),{wait_ms // 1000}s 后重试: {msg[:100]}")
+            emit_agent(
+                "retrying",
+                model=model,
+                attempt=attempt,
+                retry_in_ms=wait_ms,
+                next_attempt=attempt + 1,
+                error=msg[:500],
+            )
             await asyncio.sleep(wait_ms / 1000.0)

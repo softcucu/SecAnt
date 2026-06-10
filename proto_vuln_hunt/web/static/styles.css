@@ -37,6 +37,8 @@ tr:hover td{background:var(--panel2)}
 .st-error{background:var(--crit)} .st-queued{background:var(--info)} .st-interrupted{background:var(--warn)}
 .health-ok{background:var(--ok)} .health-down{background:var(--crit)} .health-degraded{background:var(--warn)}
 .health-checking{background:var(--run)} .health-unknown{background:var(--info)}
+.agent-running{background:var(--run)} .agent-queued{background:var(--info)} .agent-retrying{background:var(--warn)}
+.agent-failed-attempt{background:var(--warn)} .agent-done{background:var(--ok)} .agent-failed{background:var(--crit)}
 
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px}
 .stat{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
@@ -64,6 +66,14 @@ tr:hover td{background:var(--panel2)}
 .md blockquote{border-left:3px solid var(--border);margin:.4em 0;padding-left:12px;color:var(--muted)}
 
 .log{font-family:ui-monospace,Menlo,monospace;font-size:12px;background:#0a0d12;border:1px solid var(--border);border-radius:6px;padding:10px;max-height:480px;overflow:auto;white-space:pre-wrap}
+.agent-card{background:var(--panel);border:1px solid var(--border);border-radius:8px;margin-bottom:12px;overflow:hidden}
+.agent-card.active{border-color:rgba(59,130,246,.65)}
+.agent-head{display:flex;gap:10px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--border);background:var(--panel)}
+.agent-title{font-weight:600;min-width:120px;flex:1}
+.agent-meta{display:flex;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:12px;padding:8px 12px;border-bottom:1px solid var(--border);background:var(--panel2)}
+.agent-error{color:#fca5a5}
+.agent-output{margin:0;max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#0a0d12;color:#d1d5db;padding:12px;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.agent-summary p{max-width:760px}
 .bar{height:8px;background:var(--panel2);border-radius:999px;overflow:hidden;margin-top:6px}
 .bar > span{display:block;height:100%}
 

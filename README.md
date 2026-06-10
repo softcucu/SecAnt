@@ -17,7 +17,8 @@
 Markdown / SARIF 由 `exporters.py` 从结构化态**按需渲染**(Web 导出端点 / CLI `--export`)。这样 Web 能严重度优先、
 实时增量地呈现漏洞与覆盖,而文件产物随时可一键导出。
 
-每次 agent 调用会记录 token 使用量到 `usage.jsonl` 并通过 Web 实时展示。若后端 CLI 没有返回真实 usage,
+每次 agent 调用会记录 token 使用量到 `usage.jsonl` 并通过 Web 实时展示。Web「Agent」页签会按 agent
+分开展示正在运行子进程的 stdout/stderr 实时输出,用于像终端里看 opencode 一样观察当前执行。若后端 CLI 没有返回真实 usage,
 本工具用轻量算法估算:ASCII 约 4 字符/token,非 ASCII 约 1 字符/token。
 
 ---
@@ -156,7 +157,8 @@ Web 端可逐条下载或一键导出全部;CLI `run` 默认导出到 out_dir(`-
 
 REST/SSE 接口(`serve` 时):`/api/runs`(GET/POST)、`/api/runs/{id}`、`/stop`、`/resume`、
 `/findings`、`/findings/{fid}`、`/coverage`、`/risks`、`/recon`、`/health`(GET 各模型健康)、
-`/health/check`(POST 触发复检)、`/events`(SSE)、`/export/{sarif,index.md,finding/{fid}.md,all}`。
+`/health/check`(POST 触发复检)、`/events`(SSE,含 `agent_update` 实时 stdout/stderr 事件)、
+`/export/{sarif,index.md,finding/{fid}.md,all}`。
 
 ---
 

@@ -152,6 +152,70 @@ class ProcessDrainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out_b, b"firstsecond")
         self.assertEqual(err_b, b"err")
 
+    async def test_drain_process_emits_live_stdout_and_stderr_chunks(self):
+        code = (
+            "import sys,time;"
+            "sys.stdout.write('first');sys.stdout.flush();"
+            "sys.stderr.write('err');sys.stderr.flush();"
+            "time.sleep(0.05);"
+            "sys.stdout.write('second');sys.stdout.flush()"
+        )
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            code,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        chunks = []
+
+        out_b, err_b = await _drain_process(proc, None, 5, lambda stream, chunk: chunks.append((stream, chunk)))
+
+        self.assertEqual(out_b, b"firstsecond")
+        self.assertEqual(err_b, b"err")
+        self.assertEqual("".join(c for s, c in chunks if s == "stdout"), "firstsecond")
+        self.assertEqual("".join(c for s, c in chunks if s == "stderr"), "err")
+
+    async def test_runner_emits_agent_lifecycle_and_output_events(self):
+        script = (
+            "import sys,time;"
+            "sys.stdout.write('alpha');sys.stdout.flush();"
+            "sys.stderr.write('warn');sys.stderr.flush();"
+            "time.sleep(0.02);"
+            "sys.stdout.write('beta');sys.stdout.flush()"
+        )
+        events = []
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Config(
+                target=d,
+                out_dir=os.path.join(d, "out"),
+                backend="dummy",
+                models={"default": ["unit-model"]},
+                backends={
+                    "dummy": BackendSpec(
+                        name="dummy",
+                        command=[sys.executable, "-c", script],
+                        prompt_mode="stdin",
+                        parse="text",
+                    )
+                },
+            )
+            cfg.health.enabled = False
+            runner = AgentRunner(cfg, logger=lambda *_args, **_kwargs: None, agent_sink=events.append)
+
+            text = await runner.run("prompt", role="audit", label="unit", schema=None)
+
+        self.assertEqual(text, "alphabeta")
+        statuses = [e.get("status") for e in events]
+        self.assertIn("queued", statuses)
+        self.assertIn("running", statuses)
+        self.assertIn("done", statuses)
+        stdout = "".join(e.get("chunk", "") for e in events if e.get("status") == "output" and e.get("stream") == "stdout")
+        stderr = "".join(e.get("chunk", "") for e in events if e.get("status") == "output" and e.get("stream") == "stderr")
+        self.assertEqual(stdout, "alphabeta")
+        self.assertEqual(stderr, "warn")
+
     async def test_legacy_opencode_prompt_file_config_sends_prompt_as_message(self):
         script = (
             "import json,sys;"
@@ -216,6 +280,41 @@ class ProcessDrainTests(unittest.IsolatedAsyncioTestCase):
             text, _usage = await runner._invoke(prompt, "unused-model", d, timeout_s=5)
 
         self.assertEqual(json.loads(text), {"argv": ["--model", "unused-model", prompt]})
+
+
+class HealthStateTests(unittest.TestCase):
+    def test_real_call_error_does_not_replace_probe_answer(self):
+        cfg = Config(
+            backend="dummy",
+            backends={
+                "dummy": BackendSpec(
+                    name="dummy",
+                    command=[sys.executable, "-c", "print('ok')"],
+                    prompt_mode="stdin",
+                    parse="text",
+                )
+            },
+        )
+        events = []
+        runner = AgentRunner(cfg, logger=lambda *_args, **_kwargs: None, health_sink=events.append)
+        rec = runner._health_rec("unit-model")
+        rec.update({"status": "ok", "checks": 1, "ok_checks": 1, "answer": "2", "error": ""})
+
+        runner._note_call("unit-model", False, "CLI 未产出可解析的结构化 JSON")
+
+        rec = runner.health["unit-model"]
+        self.assertEqual(rec["answer"], "2")
+        self.assertEqual(rec["error"], "")
+        self.assertEqual(rec["status"], "degraded")
+        self.assertEqual(rec["last_call_error"], "CLI 未产出可解析的结构化 JSON")
+
+        runner._note_call("unit-model", True)
+
+        rec = runner.health["unit-model"]
+        self.assertEqual(rec["answer"], "2")
+        self.assertEqual(rec["last_call_error"], "")
+        self.assertEqual(rec["status"], "ok")
+        self.assertGreaterEqual(len(events), 2)
 
 
 if __name__ == "__main__":

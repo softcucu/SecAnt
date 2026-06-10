@@ -24,9 +24,12 @@ async function api(method, path, body) {
 }
 function flash(msg) { const f = el("div", { class: "flash" }, msg); document.body.append(f); setTimeout(() => f.remove(), 4200); }
 function fmtTs(t) { if (!t) return "—"; const d = new Date(t * 1000); return d.toLocaleString(); }
+function fmtClock(t) { if (!t) return "—"; const d = new Date(t * 1000); return d.toLocaleTimeString(); }
+function fmtMs(ms) { ms = Number(ms || 0); if (!ms) return "—"; return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`; }
 function sevPill(s) { return el("span", { class: "pill sev-" + (s || "none") }, s || "none"); }
 function stPill(s) { return el("span", { class: "pill st-" + (s || "queued") }, s || "queued"); }
 function fmtNum(n) { return Number(n || 0).toLocaleString(); }
+function cssKey(s) { return String(s || "unknown").replace(/[^a-z0-9-]+/gi, "-").toLowerCase(); }
 function modelText(v) { return Array.isArray(v) ? v.join(", ") : (v || ""); }
 function splitModels(v) { return String(v || "").split(",").map(s => s.trim()).filter(Boolean); }
 function kvText(obj) { return Object.entries(obj || {}).map(([k, v]) => `${k}=${v}`).join(", "); }
@@ -215,7 +218,7 @@ async function viewNew() {
 // ──────────────────────── view: dashboard ────────────────────────
 function viewDashboard(runId) {
   app.innerHTML = "";
-  const S = { findings: new Map(), risks: new Map(), health: new Map(), coverage: null, recon: null, log: [], usageRows: [], usage: emptyUsage(), manifest: null, candidates: 0, status: "queued", round: 0, dry: 0, agents: 0, elapsed: 0 };
+  const S = { findings: new Map(), risks: new Map(), health: new Map(), agentMap: new Map(), coverage: null, recon: null, log: [], usageRows: [], usage: emptyUsage(), manifest: null, candidates: 0, status: "queued", round: 0, dry: 0, agents: 0, elapsed: 0 };
   let activeTab = "findings";
 
   const header = el("div", { class: "panel" });
@@ -253,10 +256,11 @@ function viewDashboard(runId) {
     header.append(stats);
   }
 
-  const TABS = [["findings", "漏洞"], ["health", "模型"], ["coverage", "覆盖"], ["risks", "风险"], ["usage", "用量"], ["recon", "侦察"], ["activity", "活动"], ["exports", "导出"]];
+  const TABS = [["findings", "漏洞"], ["agents", "Agent"], ["health", "模型"], ["coverage", "覆盖"], ["risks", "风险"], ["usage", "用量"], ["recon", "侦察"], ["activity", "活动"], ["exports", "导出"]];
   function renderTabs() {
     tabsBar.innerHTML = "";
-    const counts = { findings: S.findings.size, risks: S.risks.size, usage: S.usageRows.length, health: S.health.size };
+    const activeAgents = [...S.agentMap.values()].filter(isAgentActive).length;
+    const counts = { findings: S.findings.size, risks: S.risks.size, usage: S.usageRows.length, health: S.health.size, agents: activeAgents || S.agentMap.size };
     for (const [key, label] of TABS) {
       const t = el("div", { class: "tab" + (key === activeTab ? " active" : "") }, label);
       if (counts[key]) t.append(el("span", { class: "tabcount" }, String(counts[key])));
@@ -268,6 +272,7 @@ function viewDashboard(runId) {
   function renderTab() {
     tabBody.innerHTML = "";
     if (activeTab === "findings") return renderFindings();
+    if (activeTab === "agents") return renderAgents();
     if (activeTab === "health") return renderModels();
     if (activeTab === "coverage") return renderCoverage();
     if (activeTab === "risks") return renderRisks();
@@ -305,6 +310,7 @@ function viewDashboard(runId) {
 
   const HEALTH_TXT = { ok: "✅ 正常", down: "⛔ 不可达", degraded: "⚠️ 异常", checking: "⏳ 检查中", unknown: "· 未检查" };
   function healthPill(s) { return el("span", { class: "pill health-" + (s || "unknown") }, HEALTH_TXT[s] || s || "未检查"); }
+  function isCallErrorText(s) { return /CLI 未产出|后端输出无可解析 JSON|结构化 JSON|parsefail|stdout 已存/.test(String(s || "")); }
   function renderModels() {
     const list = [...S.health.values()];
     const bar = el("div", { class: "row", style: "justify-content:space-between;margin-bottom:6px" },
@@ -318,10 +324,14 @@ function viewDashboard(runId) {
     list.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9) || String(a.model).localeCompare(String(b.model)));
     const tbl = el("table", {}, el("thead", {}, el("tr", {},
       el("th", {}, "状态"), el("th", {}, "模型"), el("th", {}, "延迟"), el("th", {}, "探针(正常/总)"),
-      el("th", {}, "成功调用"), el("th", {}, "失败"), el("th", {}, "最近探针答复"), el("th", {}, "最近检查"))));
+      el("th", {}, "成功调用"), el("th", {}, "失败"), el("th", {}, "最近探针答复"), el("th", {}, "最近调用异常"), el("th", {}, "最近检查"))));
     const tb = el("tbody");
     for (const h of list) {
-      const ans = h.error ? el("span", { class: "muted", title: h.error }, "⚠ " + h.error) : (h.answer || "—");
+      const legacyCallErr = (!h.last_call_error && isCallErrorText(h.error)) ? h.error : "";
+      const probeErr = h.error && !legacyCallErr ? h.error : "";
+      const ans = h.answer ? h.answer : (probeErr ? el("span", { class: "muted", title: probeErr }, "⚠ " + probeErr) : "—");
+      const callErrText = h.last_call_error || legacyCallErr;
+      const callErr = callErrText ? el("span", { class: "muted", title: callErrText }, "⚠ " + callErrText) : "—";
       tb.append(el("tr", {},
         el("td", {}, healthPill(h.status)),
         el("td", { class: "loc" }, h.model || "—"),
@@ -330,6 +340,7 @@ function viewDashboard(runId) {
         el("td", {}, String(h.calls || 0)),
         el("td", {}, String(h.call_fails || 0)),
         el("td", {}, ans),
+        el("td", {}, callErr),
         el("td", {}, h.last_check_ts ? fmtTs(h.last_check_ts) : "—")));
     }
     tbl.append(tb);
@@ -338,6 +349,58 @@ function viewDashboard(runId) {
   async function recheckHealth() {
     try { const r = await api("POST", `/api/runs/${encodeURIComponent(runId)}/health/check`); flash(r.ok ? "已触发健康复检" : "无法复检(run 未在运行)"); }
     catch (e) { flash(e.message); }
+  }
+
+  const AGENT_TXT = {
+    queued: "排队中",
+    running: "运行中",
+    retrying: "等待重试",
+    failed_attempt: "本次失败",
+    done: "完成",
+    failed: "失败",
+  };
+  function isAgentActive(a) { return ["queued", "running", "retrying", "failed_attempt"].includes(a.status); }
+  function agentPill(s) { return el("span", { class: "pill agent-" + cssKey(s) }, AGENT_TXT[s] || s || "unknown"); }
+  function agentSort(a, b) {
+    const live = Number(isAgentActive(b)) - Number(isAgentActive(a));
+    if (live) return live;
+    return Number(b.updated_ts || b.ts || b.id || 0) - Number(a.updated_ts || a.ts || a.id || 0);
+  }
+  function renderAgents() {
+    const all = [...S.agentMap.values()].sort(agentSort);
+    const running = all.filter(isAgentActive);
+    const done = all.length - running.length;
+    tabBody.append(el("div", { class: "panel agent-summary" },
+      el("div", { class: "row", style: "justify-content:space-between" },
+        el("strong", {}, "Agent 实时输出"),
+        el("span", { class: "muted" }, `运行中 ${running.length} · 已结束 ${done}`)),
+      el("p", { class: "muted", style: "margin:6px 0 0" },
+        "这里显示每个 agent 子进程的 stdout/stderr，按 agent 分开，输出会随 opencode/后端 CLI 实时追加。")));
+    if (!all.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无 agent 输出。运行开始后这里会出现每个 agent 的实时 stdout/stderr。")); return; }
+    const shown = all.slice(0, 80);
+    for (const a of shown) {
+      const title = `${a.role || "agent"} · ${a.label || ""}`.replace(/\s+$/, "");
+      const meta = [
+        `#${a.id}`,
+        a.model ? `model ${a.model}` : "",
+        a.attempt ? `attempt ${a.attempt}` : "",
+        a.duration_ms ? `耗时 ${fmtMs(a.duration_ms)}` : "",
+        a.retry_in_ms ? `重试等待 ${fmtMs(a.retry_in_ms)}` : "",
+        a.updated_ts || a.ts ? `更新 ${fmtClock(a.updated_ts || a.ts)}` : "",
+      ].filter(Boolean).join(" · ");
+      const out = el("pre", { class: "agent-output" }, a.output || "(暂未收到 stdout/stderr)");
+      const card = el("div", { class: "agent-card " + (isAgentActive(a) ? "active" : "") },
+        el("div", { class: "agent-head" },
+          agentPill(a.status),
+          el("span", { class: "agent-title" }, title),
+          el("span", { class: "muted" }, meta)),
+        el("div", { class: "agent-meta" },
+          el("span", {}, a.cwd || ""),
+          a.error ? el("span", { class: "agent-error" }, a.error) : null),
+        out);
+      tabBody.append(card);
+      if (isAgentActive(a)) setTimeout(() => { out.scrollTop = out.scrollHeight; }, 0);
+    }
   }
 
   function renderCoverage() {
@@ -429,12 +492,35 @@ function viewDashboard(runId) {
   }
 
   // ── SSE 驱动 ──
+  function applyAgentUpdate(d) {
+    const id = String(d.id || "");
+    if (!id) return;
+    const now = Date.now() / 1000;
+    const a = S.agentMap.get(id) || { id, status: "queued", output: "", stdout_chars: 0, stderr_chars: 0, created_ts: d.ts || now };
+    if (d.status === "output") {
+      const chunk = String(d.chunk == null ? "" : d.chunk);
+      a.output += chunk;
+      if (d.stream === "stderr") a.stderr_chars += chunk.length;
+      else a.stdout_chars += chunk.length;
+      a.model = d.model || a.model;
+      a.attempt = d.attempt || a.attempt;
+      a.updated_ts = d.ts || now;
+      if (!a.status || a.status === "queued") a.status = "running";
+    } else {
+      for (const [k, v] of Object.entries(d)) {
+        if (k !== "chunk") a[k] = v;
+      }
+      a.updated_ts = d.ts || now;
+    }
+    S.agentMap.set(id, a);
+  }
   function applyEvent(ev) {
     const d = ev.data || {};
     switch (ev.type) {
       case "run_status": S.status = d.status; renderHeader(); break;
       case "metrics": S.agents = d.agents_spawned ?? S.agents; S.elapsed = d.elapsed_s ?? S.elapsed; S.candidates = d.candidates ?? S.candidates; if (d.token_usage) setUsage(S.usage, d.token_usage); renderHeader(); break;
       case "usage": S.usageRows.push(d); addUsage(S.usage, d); renderHeader(); renderTabs(); if (activeTab === "usage") renderTab(); break;
+      case "agent_update": applyAgentUpdate(d); renderTabs(); if (activeTab === "agents") renderTab(); break;
       case "candidate_found": S.candidates++; renderHeader(); break;
       case "finding_confirmed":
         if (d.id && !S.findings.has(d.id)) { S.findings.set(d.id, d); flash("✔ 确认漏洞 " + d.id + " [" + d.corrected_severity + "]"); }
@@ -464,7 +550,7 @@ function viewDashboard(runId) {
     // SSE:从 seq 0 重放历史事件(重建 findings/coverage/risks/log)再接实时;EventSource 断线自动带 Last-Event-ID 续传
     const es = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events`);
     window._es = es;
-    const TYPES = ["run_status", "metrics", "usage", "candidate_found", "finding_confirmed", "risk_added", "surface_added", "coverage_update", "round_start", "round_done", "recon_done", "run_done", "log", "decompose_done", "poc_done", "error", "model_health", "health_check_start", "health_check_done"];
+    const TYPES = ["run_status", "metrics", "usage", "agent_update", "candidate_found", "finding_confirmed", "risk_added", "surface_added", "coverage_update", "round_start", "round_done", "recon_done", "run_done", "log", "decompose_done", "poc_done", "error", "model_health", "health_check_start", "health_check_done"];
     for (const t of TYPES) es.addEventListener(t, (e) => { try { applyEvent(JSON.parse(e.data)); } catch (_) {} });
     es.onerror = () => { /* EventSource 自动重连 */ };
   }

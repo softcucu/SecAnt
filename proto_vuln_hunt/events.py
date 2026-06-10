@@ -25,6 +25,7 @@ POC_DONE = "poc_done"              # {id, compiled, triggered}
 COVERAGE_UPDATE = "coverage_update"  # {ledger, surfaces, progress}
 METRICS = "metrics"                # {agents_spawned, in_flight, confirmed, candidates}
 USAGE = "usage"                    # {role, label, model, input_tokens, output_tokens, total_tokens, estimated}
+AGENT_UPDATE = "agent_update"      # {id, role, label, status, model, attempt, stream, chunk, ...}
 HEALTH_START = "health_check_start"  # {models}
 HEALTH_DONE = "health_check_done"    # {total, ok, unhealthy}
 MODEL_HEALTH = "model_health"        # {model, status, last_latency_ms, answer, error, checks, calls, ...}
