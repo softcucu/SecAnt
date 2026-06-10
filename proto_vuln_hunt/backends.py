@@ -255,6 +255,20 @@ def _schema_keys(schema: Optional[Dict[str, Any]]) -> Optional[set]:
     return keys or None
 
 
+# 推理模型常把思维链用 <think>…</think> 直接夹在正文里带出来,思维段里往往含花括号、示例 JSON、
+# schema 片段,会污染候选(被 _balanced_json_spans 扫成假候选,甚至盖过真正的最终 JSON)。
+# 思维链固定以 </think> 收尾,所以解析 JSON 前:见到 </think> 就丢弃它(及之前)的全部内容,只留最终答案。
+def strip_reasoning(text: str) -> str:
+    """剥掉正文里内联的思维链:思考固定以 </think> 结束,丢弃最后一个 </think> 及其之前的全部内容。
+
+    覆盖两种情形:成对 <think>…</think>,以及只剩闭合标签(opencode 把 <think> 起始吃进 reasoning
+    事件、只把 </think> 漏到 text 里)。无 </think> 则原样返回。"""
+    if not text:
+        return text
+    idx = text.rfind("</think>")
+    return text[idx + len("</think>"):] if idx != -1 else text
+
+
 def extract_json(text: str, schema: Optional[Dict[str, Any]] = None) -> Optional[Any]:
     """从 agent 的自由文本(可能是"一段话 + JSON")里稳健地解析出目标 JSON。
 
@@ -262,7 +276,7 @@ def extract_json(text: str, schema: Optional[Dict[str, Any]] = None) -> Optional
     """
     if not text:
         return None
-    text = strip_ansi(text)
+    text = strip_reasoning(strip_ansi(text))
     want = _schema_keys(schema)
     want_array = isinstance(schema, dict) and schema.get("type") == "array"
 
