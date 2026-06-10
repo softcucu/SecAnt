@@ -904,7 +904,9 @@ class Pipeline:
         if kind == "risk" and rid in self.risk_by_id:
             self.risk_by_id[rid]["recheck_status"] = "done"
             self.store.save_risk(self.risk_by_id[rid])
-        self.emit(EV.RECHECK_DONE, {"kind": kind, "id": rid, "label": label,
+        self.checkpoint(self.round)
+        self.emit_coverage()
+        self.emit(EV.RECHECK_DONE, {"kind": kind, "id": rid, "pattern": item.get("pattern"), "label": label,
                                     "new_candidates": item.get("newThisRound", 0)})
 
     # ──────────────────────── 阶段 ③ 汇总(结构化,无文件写盘) ────────────────────────

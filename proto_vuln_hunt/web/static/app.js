@@ -275,11 +275,11 @@ function viewDashboard(runId) {
     header.append(stats);
   }
 
-  const TABS = [["findings", "漏洞"], ["agents", "Agent"], ["health", "模型"], ["coverage", "攻击面覆盖"], ["risks", "潜在风险点"], ["usage", "历史任务"], ["recon", "侦察"], ["activity", "活动"], ["exports", "导出"]];
+  const TABS = [["findings", "漏洞"], ["agents", "Agent"], ["health", "模型"], ["coverage", "攻击面覆盖"], ["history", "历史问题"], ["risks", "潜在风险点"], ["usage", "历史任务"], ["recon", "侦察"], ["activity", "活动"], ["exports", "导出"]];
   function renderTabs() {
     tabsBar.innerHTML = "";
     const activeAgents = [...S.agentMap.values()].filter(isAgentActive).length;
-    const counts = { findings: S.findings.size, risks: S.risks.size, usage: S.usageRows.length, health: S.health.size, agents: activeAgents || S.agentMap.size };
+    const counts = { findings: S.findings.size, risks: S.risks.size, usage: S.usageRows.length, health: S.health.size, agents: activeAgents || S.agentMap.size, history: (S.recon?.history || []).length };
     for (const [key, label] of TABS) {
       const t = el("div", { class: "tab" + (key === activeTab ? " active" : "") }, label);
       if (counts[key]) t.append(el("span", { class: "tabcount" }, String(counts[key])));
@@ -294,6 +294,7 @@ function viewDashboard(runId) {
     if (activeTab === "agents") return renderAgents();
     if (activeTab === "health") return renderModels();
     if (activeTab === "coverage") return renderCoverage();
+    if (activeTab === "history") return renderHistory();
     if (activeTab === "risks") return renderRisks();
     if (activeTab === "usage") return renderUsage();
     if (activeTab === "recon") return renderRecon();
@@ -856,7 +857,7 @@ function viewDashboard(runId) {
   const PRI_PILL = { high: "high", medium: "medium", low: "low" };
   function renderRecon() {
     const r = S.recon;
-    if (!r) { tabBody.append(el("div", { class: "panel empty" }, "侦察数据加载中…(侦察 agent 产出项目用途、威胁分析与攻击面地图;历史问题模式由并行的 git 历史挖掘随挖随补)")); return; }
+    if (!r) { tabBody.append(el("div", { class: "panel empty" }, "侦察数据加载中…")); return; }
     const sec = (t, b) => el("div", { class: "panel" }, el("h3", {}, t), el("div", { class: "md", html: mdToHtml(b || "(无)") }));
     const toMd = (v) => Array.isArray(v) ? v.map(x => "- " + x).join("\n") : v;   // threat_summary/repo_knowledge 现为列表
     tabBody.append(sec("项目用途", r.purpose), sec("威胁分析", toMd(r.threat_summary)), sec("仓库知识", toMd(r.repo_knowledge)));
@@ -883,23 +884,51 @@ function viewDashboard(runId) {
       tabBody.append(el("div", { class: "panel empty" }, "尚无攻击面区域(侦察未完成或失败)。"));
     }
 
-    // 历史问题模式(同类变体排查种子)
-    const hist = r.history || [];
-    tabBody.append(el("h3", { class: "section-title" }, `历史问题模式 · ${hist.length} 条`));
-    if (hist.length) {
-      const tbl = el("table", {}, el("thead", {}, el("tr", {}, el("th", {}, "lens"), el("th", {}, "问题模式"), el("th", {}, "出处"), el("th", {}, "相关文件"))));
-      const tb = el("tbody");
-      for (const h of hist) tb.append(el("tr", {},
+  }
+
+  function variantStatusByPattern() {
+    const out = new Map();
+    for (const v of ((S.coverage || {}).ledger || [])) {
+      if (v.kind !== "variant") continue;
+      for (const key of [v.name, v.pattern, String(v.key || "").replace(/^variant:/, "")]) {
+        const k = String(key || "").trim().toLowerCase();
+        if (k) out.set(k, v);
+      }
+    }
+    return out;
+  }
+  function historyCheckText(status) {
+    if (status === "completed-clean" || status === "completed-findings") return "是";
+    if (status === "in-progress") return "否(排查中)";
+    if (status === "incomplete") return "否(未审完)";
+    if (status === "pending") return "否(待排查)";
+    return "否";
+  }
+  function renderHistory() {
+    const hist = (S.recon || {}).history || [];
+    if (!hist.length) {
+      tabBody.append(el("div", { class: "panel empty" }, "暂无历史问题模式。"));
+      return;
+    }
+    const variants = variantStatusByPattern();
+    const tbl = el("table", {}, el("thead", {}, el("tr", {},
+      el("th", {}, "lens"), el("th", {}, "问题模式"), el("th", {}, "是否排查完"),
+      el("th", {}, "排查状态"), el("th", {}, "出处"), el("th", {}, "相关文件"))));
+    const tb = el("tbody");
+    for (const h of hist) {
+      const key = String(h.pattern || "").trim().toLowerCase();
+      const v = variants.get(key);
+      const status = v?.status || "";
+      tb.append(el("tr", {},
         el("td", {}, el("span", { class: "tag" }, h.lens_hint || "—")),
         el("td", {}, h.pattern || ""),
+        el("td", {}, historyCheckText(status)),
+        el("td", {}, statusBadge(status || "pending")),
         el("td", {}, h.source || "—"),
         el("td", { class: "loc" }, (h.files || []).join(", ") || "—")));
-      tbl.append(tb);
-      tabBody.append(el("div", { class: "panel" }, tbl,
-        el("p", { class: "muted", style: "margin:8px 0 0" }, "由并行的 git 历史挖掘逐条提交分析得到;每条作为「同类变体排查」种子,派 agent 在全仓搜索同类代码模式。")));
-    } else {
-      tabBody.append(el("div", { class: "panel empty" }, "暂无历史问题模式(git 历史挖掘与主流程并行进行,会随挖随补;非 git 仓或已禁用则为空)。"));
     }
+    tbl.append(tb);
+    tabBody.append(el("div", { class: "panel" }, tbl));
   }
 
   function renderUsage() {
@@ -972,14 +1001,14 @@ function viewDashboard(runId) {
         renderHeader(); renderTabs(); if (activeTab === "findings") renderTab(); break;
       case "risk_added": { const k = (d.area || "") + "::" + (d.file || ""); S.risks.set(k, d); renderHeader(); renderTabs(); if (activeTab === "risks") renderTab(); break; }
       case "recheck_enqueued": case "recheck_done": case "risk_severity_changed":
-        fetchRisks(); break;
+        fetchRisks(); fetchCoverage(); break;
       case "surface_added": case "coverage_update":
         if (ev.type === "coverage_update") S.coverage = Object.assign({}, S.coverage, d);
-        if (activeTab === "coverage") renderTab(); break;
+        if (activeTab === "coverage" || activeTab === "history") renderTab(); break;
       case "round_start": S.round = d.round; renderHeader(); break;
       case "round_done": S.round = d.round; S.dry = d.dry_streak; renderHeader(); break;
       case "recon_done": if (d.purpose != null || d.threat_summary != null) { S.recon = Object.assign({}, S.recon, d); } fetchRecon(); break;
-      case "history_added": flash(`🕮 历史问题模式 +1(共 ${d.total || "?"} 条):${(d.pattern || "").slice(0, 50)}`); fetchRecon(); break;
+      case "history_added": flash(`🕮 历史问题模式 +1(共 ${d.total || "?"} 条):${(d.pattern || "").slice(0, 50)}`); fetchRecon(); fetchCoverage(); break;
       case "run_done": S.status = "done"; renderHeader(); break;
       case "model_health": if (d.model) { S.health.set(d.model, d); renderTabs(); if (activeTab === "health") renderTab(); } break;
       case "health_check_start": if (Array.isArray(d.models)) for (const m of d.models) if (!S.health.has(m)) S.health.set(m, { model: m, status: "checking" }); renderTabs(); if (activeTab === "health") renderTab(); break;
@@ -987,8 +1016,8 @@ function viewDashboard(runId) {
       case "log": S.log.push(d.message); if (S.log.length > 600) S.log.shift(); if (activeTab === "activity") renderTab(); break;
     }
   }
-  async function fetchRecon() { try { S.recon = await api("GET", `/api/runs/${encodeURIComponent(runId)}/recon`); if (activeTab === "recon") renderTab(); } catch (e) {} }
-  async function fetchCoverage() { try { const c = await api("GET", `/api/runs/${encodeURIComponent(runId)}/coverage`); if (c) { S.coverage = Object.assign({}, S.coverage, c); if (activeTab === "coverage") renderTab(); } } catch (e) {} }
+  async function fetchRecon() { try { S.recon = await api("GET", `/api/runs/${encodeURIComponent(runId)}/recon`); renderTabs(); if (activeTab === "recon" || activeTab === "history") renderTab(); } catch (e) {} }
+  async function fetchCoverage() { try { const c = await api("GET", `/api/runs/${encodeURIComponent(runId)}/coverage`); if (c) { S.coverage = Object.assign({}, S.coverage, c); if (activeTab === "coverage" || activeTab === "history") renderTab(); } } catch (e) {} }
   async function fetchRisks() { try { const list = await api("GET", `/api/runs/${encodeURIComponent(runId)}/risks`); for (const r of (list || [])) { const k = (r.area || "") + "::" + (r.file || ""); S.risks.set(k, r); } renderHeader(); renderTabs(); if (activeTab === "risks") renderTab(); } catch (e) {} }
   async function fetchHealth() { try { const h = await api("GET", `/api/runs/${encodeURIComponent(runId)}/health`); for (const r of (h.models || [])) if (r.model) S.health.set(r.model, r); renderTabs(); if (activeTab === "health") renderTab(); } catch (e) {} }
 
