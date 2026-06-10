@@ -57,6 +57,7 @@ class Pipeline:
         self._recheck_inflight = 0                   # 正在排查 + 已 pop 待起的项数(收敛判据)
         self._recheck_stop: Optional[asyncio.Event] = None
         self._audit_done = False                     # 主审计循环是否已收敛(供 recheck_loop 收尾)
+        self._restored_checkpoint = False
         self.build_hint: str = ""
         self.seq = 0
         self.start_round = 0
@@ -437,7 +438,10 @@ class Pipeline:
                 shutil.rmtree(wt, ignore_errors=True)
 
     # ──────────────────────── 阶段 ① 侦察 / 断点恢复 ────────────────────────
-    async def recon(self) -> None:
+    def restore_checkpoint(self) -> bool:
+        """恢复断点机制态。成功后 history 挖掘可立即跳过已分析提交。"""
+        if self._restored_checkpoint:
+            return True
         ckpt = self.store.load_checkpoint() if self.cfg.resume else None
         recon_doc = self.store.load_recon() if self.cfg.resume else {}
         if ckpt and recon_doc and isinstance(ckpt.get("pendingQueue"), list):
@@ -491,8 +495,13 @@ class Pipeline:
                                       "purpose": self.surface_data.get("purpose"),
                                       "threat_summary": self.surface_data.get("threat_summary")})
             self.emit_coverage()
-            return
+            self._restored_checkpoint = True
+            return True
+        return False
 
+    async def recon(self, *, try_restore: bool = True) -> None:
+        if try_restore and self.restore_checkpoint():
+            return
         if self.cfg.resume:
             self.log("未找到可用断点,从头开始侦察")
         surface = await self.runner.run(self.pb.recon(S.SURFACE_SCHEMA), role="recon", label="recon",
@@ -508,7 +517,7 @@ class Pipeline:
             }
         self.surface_data = surface
         self.regions = sorted(surface.get("regions") or [], key=lambda r: ({"high": 0, "medium": 1, "low": 2}).get(r.get("priority"), 3))
-        # 历史问题模式不再由侦察 agent 产出,改由并行的 git 历史挖掘随挖随补;此处仅占位以便落盘/前端读取。
+        # 历史问题模式不再由侦察 agent 产出,改由独立 git 历史挖掘从 run 一开始并行产出。
         self.surface_data["history"] = self.history
         self.build_hint = surface.get("build_hint") or ""
         for r in self.regions:
@@ -970,10 +979,12 @@ class Pipeline:
         self.log(f"启用 lens: {', '.join(self.cfg.lenses)} | run 目录: {self.store.dir} | "
                  f"方法库: {self.cfg.methods_abs} ({'就绪' if self.cfg.methods_ok() else '不可用→内联兜底'})")
         try:
+            resumed = self.restore_checkpoint()
+            self._start_history_mining()   # 从 run 开始即并行分析 git log;不等待健康检查/侦察完成
             if self.cfg.health.enabled and self.cfg.health.on_start and not self.stop_requested():
                 await self.health_check_all()
-            await self.recon()
-            self._start_history_mining()   # 与拆解/审计并行;不阻塞后续阶段开展
+            if not resumed:
+                await self.recon(try_restore=False)
             self._start_recheck()          # 专用优先排查通道:历史变体 + 风险点复查,与审计并行
             stop_reason = await self.audit()
             result = self.synthesis(stop_reason)
