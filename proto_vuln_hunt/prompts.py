@@ -150,18 +150,40 @@ class PromptBuilder:
         return (
             f"你在对一份 C/C++ 源码树做白盒漏洞挖掘的**侦察(威胁建模)**阶段。目标目录:{self.target}{self.scope_note}(威胁模型:{self.threat})\n"
             "这通常是网络协议栈/解析器为主、混合认证登录/密钥管理/证书管理等管理面的项目。\n\n"
-            "请用 rg / Read / ctags / git log 等工具,**先理解系统、再据此推攻击面**,按以下顺序产出:\n\n"
+            "请用 rg / Read / ctags 等工具,**先理解系统、再据此推攻击面**,按以下顺序产出:\n\n"
             "(0) **先搞清这个仓是做什么的**(purpose):读 README、docs/、设计文档、主程序入口与目录结构,"
             "归纳:它是什么系统、解决什么问题、核心功能、典型部署形态。攻击面必须从\"用途\"推导。\n\n"
-            "(1) **威胁分析**(threat_summary):基于用途,判断谁是攻击者、从哪些入口能影响系统、最该担心的影响、整体攻击面有多大。\n\n"
-            "(2) **读仓库知识与历史问题**:SECURITY.md/CHANGELOG/NEWS/issue 描述、代码内 FIXME/TODO/XXX/HACK/CVE 注释,"
-            "以及 git log(含 fix/security/overflow/CVE/vuln 的提交)。提炼 history[](每条=一个已知问题模式),后续据此做同类变体排查;"
-            "安全相关背景写进 repo_knowledge。\n\n"
+            "(1) **威胁分析**(threat_summary,**列表**:每个攻击者/入口/担心的影响各写一条):基于用途,"
+            "判断谁是攻击者、从哪些入口能影响系统、最该担心的影响、整体攻击面有多大。\n\n"
+            "(2) **读仓库知识**(repo_knowledge,**列表**:每条一个关键事实):SECURITY.md/CHANGELOG/NEWS/issue 描述、"
+            "代码内 FIXME/TODO/XXX/HACK/CVE 注释里读到的**安全相关背景**逐条记下。\n"
+            "(注意:从 git 提交历史挖掘已知问题模式由**独立的并行阶段**负责,本阶段**不需要**看 git log,也不产出 history。)\n\n"
             "(3) **建攻击面地图 regions[]**:把代码划分为攻击面区域,每个标注涉及文件、入口函数、不可信输入怎么进来、"
             "跨越的信任边界、调用到的 crypto/认证原语、优先级。重点覆盖:协议收包/解析/反序列化入口、认证状态机、"
             "密钥/证书生命周期、加密调用点、IPC、序列化边界。\n\n"
             "(4) 若能看出如何编译,给出 build_hint(供后续 PoC 最小 harness 编译)。\n\n"
             "只输出威胁建模与地图,**不要现在就找具体 bug**。优先级按\"不可信输入可达性 + 是否跨信任边界\"排序。"
+            + must_struct(schema)
+        )
+
+    # ── git 历史:单条提交的「是否安全修复 + 问题模式」判定(每条提交一个 agent) ──
+    def history_commit(self, commit: Dict[str, Any], schema) -> str:
+        h = commit.get("hash") or ""
+        subj = commit.get("subject") or "(无标题)"
+        return (
+            f"你在对一份 C/C++ 源码树做白盒漏洞挖掘的**历史问题模式挖掘**子任务——只分析**一条 git 提交**。"
+            f"目标目录:{self.target}{self.scope_note}(威胁模型:{self.threat})\n"
+            f"待分析提交:`{h}`　标题:{subj}\n\n"
+            "步骤:\n"
+            f"(1) 用 `git show --stat {h}` 与 `git show {h}`(必要时 `git log -1 {h}`)读这条提交的**完整改动(diff)与说明**。\n"
+            "(2) 判断它是否是一次**安全修复**——即修复了内存破坏/整型溢出/越界读写/UAF/double-free/竞态/TOCTOU/注入/"
+            "反序列化/认证绕过或降级/加密误用/DoS/信息泄露等**安全缺陷**;而非纯功能、重构、格式化、文档、构建/CI 改动。"
+            "提交信息里的 fix/security/overflow/CVE/vuln/oob/leak/use-after-free 等是线索,但判定以**改动代码本身**为准。\n"
+            "(3) 若相关(security_related=true):精读改动前后的代码,提炼一条**可复用于同类变体排查的问题模式**"
+            "(pattern:根因 + 缺陷类型 + 触发条件的抽象描述,**不要只抄提交标题**),标注最相关的 lens_hint、涉及文件,"
+            "并在 rationale 里简述改动要点与判定理由。后续会据此在全仓搜索同类代码模式。\n"
+            "(4) 若不相关:security_related=false 即可,其它字段可留空。\n"
+            "只输出这一条提交的判定结果。"
             + must_struct(schema)
         )
 

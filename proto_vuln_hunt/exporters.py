@@ -20,6 +20,14 @@ def _nl(s: Optional[str]) -> str:
     return (s or "").replace("\n", " ")
 
 
+def _as_md(v: Any, empty: str = "(无)") -> str:
+    """把"字符串或字符串列表"渲染为 Markdown:列表 → 逐条 bullet;字符串 → 原样。"""
+    if isinstance(v, (list, tuple)):
+        items = [f"- {_nl(str(x))}" for x in v if str(x).strip()]
+        return "\n".join(items) if items else empty
+    return str(v) if v else empty
+
+
 # ──────────────────────── RECON.md ────────────────────────
 def render_recon_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
     sd = state.get("recon") or {}
@@ -45,10 +53,10 @@ def render_recon_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
         f"# 侦察 / 威胁建模报告 — {meta.get('target')}{sn}\n\n"
         f"**威胁模型**: {meta.get('threat_model')}　|　**生成阶段**: Recon\n\n"
         f"## 1. 项目用途与目标(它是做什么的)\n{sd.get('purpose') or '(侦察未归纳)'}\n\n"
-        f"## 2. 威胁分析\n{sd.get('threat_summary') or '(侦察未给出)'}\n\n"
-        f"## 3. 仓库知识与安全背景\n{sd.get('repo_knowledge') or '(无)'}\n\n"
+        f"## 2. 威胁分析\n{_as_md(sd.get('threat_summary'), '(侦察未给出)')}\n\n"
+        f"## 3. 仓库知识与安全背景\n{_as_md(sd.get('repo_knowledge'))}\n\n"
         f"## 4. 攻击面地图(按优先级)\n{reg_table}\n\n"
-        f"## 5. 历史问题模式(同类变体排查种子)\n{hist_table}\n\n"
+        f"## 5. 历史问题模式(由并行 git 历史挖掘提炼,同类变体排查种子)\n{hist_table}\n\n"
         f"## 6. 编译提示(供 PoC)\n{sd.get('build_hint') or '(未识别)'}\n\n"
         "---\n*由 proto-vuln-hunt(python) 从结构化态导出。*\n"
     )

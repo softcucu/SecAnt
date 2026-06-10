@@ -46,7 +46,10 @@ class Pipeline:
         # ── 运行状态(可被断点恢复) ──
         self.surface_data: Dict[str, Any] = {}
         self.regions: List[Dict[str, Any]] = []
-        self.history: List[Dict[str, Any]] = []
+        self.history: List[Dict[str, Any]] = []      # 由 git 历史挖掘并行回灌的「历史问题模式」
+        self.history_keys = set()                    # 历史模式去重(按 pattern 文本)
+        self.history_done = set()                    # 已分析过的 git 提交 hash(续跑跳过)
+        self._history_task: Optional[asyncio.Task] = None
         self.build_hint: str = ""
         self.seq = 0
         self.start_round = 0
@@ -168,6 +171,7 @@ class Pipeline:
             "processedKeys": list(self.processed_keys),
             "seenSurface": list(self.seen_surface),
             "completedItems": list(self.completed_items),
+            "historyDone": list(self.history_done),
             "pendingQueue": self.queue,
             "pendingFindings": list(self.pending_findings.values()),
         }
@@ -403,6 +407,9 @@ class Pipeline:
                 self.dedup_keys.add(fk)
             self.regions = self.surface_data.get("regions") or []
             self.history = self.surface_data.get("history") or []
+            for h in self.history:
+                self.history_keys.add((h.get("pattern") or "").strip().lower())
+            self.history_done.update(ckpt.get("historyDone") or [])
             self.build_hint = self.surface_data.get("build_hint") or ""
             self.log(f"♻ 从断点恢复:已完成 {self.start_round} 轮,确认 {len(self.confirmed)} 条,待审队列 {len(self.queue)} 项,"
                      f"在途候选 {len(self.pending_findings)} 条,已处理 {len(self.processed_keys)} 个,已完成攻击面 {len(self.completed_items)} 个")
@@ -427,21 +434,132 @@ class Pipeline:
             }
         self.surface_data = surface
         self.regions = sorted(surface.get("regions") or [], key=lambda r: ({"high": 0, "medium": 1, "low": 2}).get(r.get("priority"), 3))
-        self.history = surface.get("history") or []
+        # 历史问题模式不再由侦察 agent 产出,改由并行的 git 历史挖掘随挖随补;此处仅占位以便落盘/前端读取。
+        self.surface_data["history"] = self.history
         self.build_hint = surface.get("build_hint") or ""
         for r in self.regions:
             self.queue.append({"kind": "region", **r})
-        for h in self.history:
-            self.queue.append({"kind": "variant", "pattern": h.get("pattern"), "source": h.get("source"),
-                               "files": h.get("files"), "lens_hint": h.get("lens_hint")})
-        self.log(f"侦察完成:攻击面区域 {len(self.regions)} 个,历史问题模式 {len(self.history)} 条,build_hint {'有' if self.build_hint else '无'}")
+        self.log(f"侦察完成:攻击面区域 {len(self.regions)} 个,build_hint {'有' if self.build_hint else '无'}"
+                 f"(历史问题模式由并行的 git 历史挖掘阶段产出)")
         if surface.get("purpose"):
             self.log(f"项目用途: {str(surface['purpose'])[:120]}")
-        self.emit(EV.RECON_DONE, {"resumed": False, "regions": len(self.regions), "history": len(self.history),
+        self.emit(EV.RECON_DONE, {"resumed": False, "regions": len(self.regions),
                                   "purpose": surface.get("purpose"), "threat_summary": surface.get("threat_summary"),
                                   "build_hint": self.build_hint})
         self.persist_recon()
         self.checkpoint(0)
+
+    # ──────── 并行阶段:git 历史问题模式挖掘(每条提交一个 agent,独立于侦察、不阻塞主流程)────────
+    def _collect_commits(self) -> List[Dict[str, str]]:
+        """读取 git log 提交清单(hash + 标题)。非 git 仓 / 出错 → 空列表。"""
+        target = self._abs_target()
+        if subprocess.run(["git", "-C", target, "rev-parse", "--is-inside-work-tree"],
+                          capture_output=True, text=True).returncode != 0:
+            return []
+        cmd = ["git", "-C", target, "log", "--no-merges", "--format=%H%x1f%s"]
+        if self.cfg.history.max_commits > 0:
+            cmd.append(f"-n{self.cfg.history.max_commits}")
+        if self.cfg.history.since:
+            cmd.append(f"--since={self.cfg.history.since}")
+        paths = self.cfg.history.paths or self.cfg.scope
+        if paths:
+            cmd.append("--")
+            cmd.extend(paths.split())
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except Exception:  # noqa: BLE001
+            return []
+        if r.returncode != 0:
+            return []
+        out: List[Dict[str, str]] = []
+        for line in r.stdout.splitlines():
+            h, sep, subj = line.partition("\x1f")
+            h = h.strip()
+            if h:
+                out.append({"hash": h, "subject": subj.strip()})
+        return out
+
+    def _history_active(self) -> bool:
+        return self._history_task is not None and not self._history_task.done()
+
+    def _start_history_mining(self) -> None:
+        """与主流程并行启动 git 历史挖掘(留出专用 agent 额度,不占主并发池)。"""
+        if not self.cfg.history.enabled:
+            return
+        if self._history_task is not None:
+            return
+        self._history_task = asyncio.create_task(self.mine_git_history())
+
+    async def mine_git_history(self) -> None:
+        commits = self._collect_commits()
+        if not commits:
+            self.log("🕮 git 历史挖掘:非 git 仓或无匹配提交,跳过该阶段")
+            return
+        todo = [c for c in commits if c["hash"] not in self.history_done]
+        if not todo:
+            self.log("🕮 git 历史挖掘:所有提交均已分析过(断点),跳过")
+            return
+        # 从全局并发池预占额度并一直持有:计入总并发(主流程因此只剩 总-预占 可用);
+        # 留至少 1 个名额给主流程,挖掘全部结束后归还,主流程回满。
+        want = min(self.cfg.history.concurrency, max(0, self.cfg.concurrency - 1))
+        acquired = await self.runner.reserve_slots(want)
+        bypass = acquired > 0                     # 占到名额 → agent 直接复用、不再抢全局门
+        limit = acquired if bypass else self.cfg.history.concurrency
+        if acquired:
+            self.log(f"🕮 git 历史挖掘启动:{len(todo)}/{len(commits)} 条提交待分析"
+                     f"(已从总并发预占 {acquired} 个名额、计入总并发,主流程暂用 {self.cfg.concurrency - acquired};"
+                     f"与侦察/拆解/审计并行;挖掘结束后归还)")
+        else:
+            self.log(f"🕮 git 历史挖掘启动:{len(todo)}/{len(commits)} 条提交待分析"
+                     f"(总并发为 {self.cfg.concurrency},无法预留专属名额,暂与主流程共享全局并发池)")
+        sem = asyncio.Semaphore(max(1, limit))
+        try:
+            async def one(c: Dict[str, str]) -> None:
+                if self.stop_requested():
+                    return
+                async with sem:
+                    if self.stop_requested():
+                        return
+                    await self._mine_one_commit(c, bypass)
+
+            await asyncio.gather(*[one(c) for c in todo], return_exceptions=True)
+            self.log(f"🕮 git 历史挖掘完成:共提炼历史问题模式 {len(self.history)} 条"
+                     f"{';归还预占的 ' + str(acquired) + ' 个并发名额,主流程回满' if acquired else ''}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            self.log(f"⚠ git 历史挖掘异常(忽略继续): {str(e)[:160]}")
+        finally:
+            self.runner.release_slots(acquired)
+
+    async def _mine_one_commit(self, c: Dict[str, str], bypass: bool = True) -> None:
+        res = await self.runner.run(
+            self.pb.history_commit(c, S.HISTORY_COMMIT_SCHEMA),
+            role="history", label=f"history:{c['hash'][:8]}",
+            schema=S.HISTORY_COMMIT_SCHEMA, retries=1, fallback=None,
+            use_global_gate=not bypass)          # 已预占名额则复用,不重复申请全局门
+        self.history_done.add(c["hash"])
+        if not res or not res.get("security_related"):
+            return
+        pattern = (res.get("pattern") or "").strip()
+        if not pattern:
+            return
+        pk = pattern.lower()
+        if pk in self.history_keys:
+            return
+        self.history_keys.add(pk)
+        lens = res.get("lens_hint") if res.get("lens_hint") in self.cfg.lenses else None
+        source = (f"{c['hash'][:10]} {c['subject']}").strip()[:120]
+        entry = {"pattern": pattern, "source": source, "lens_hint": lens or "memory",
+                 "files": res.get("files") or [], "rationale": res.get("rationale") or ""}
+        self.history.append(entry)
+        self.surface_data["history"] = self.history
+        # 回灌为「同类变体排查」队列项,供后续审计轮次处理(不阻塞当前流程)
+        self.queue.append({"kind": "variant", "pattern": entry["pattern"], "source": entry["source"],
+                           "files": entry["files"], "lens_hint": entry["lens_hint"]})
+        self.emit(EV.HISTORY_ADDED, {**entry, "total": len(self.history)})
+        self.persist_recon()
+        self.log(f"🕮 历史模式 +1[{entry['lens_hint']}]:{pattern[:60]} ← {source[:40]}")
 
     # ──────────────────────── 阶段 ② 审计循环 ────────────────────────
     async def audit(self) -> str:
@@ -466,11 +584,16 @@ class Pipeline:
                 self.checkpoint(self.round)
                 self.emit_coverage()
 
-        while (self.queue or dry_streak < self.cfg.dry_rounds) and self.round < self.cfg.max_rounds and not self.stop_requested():
-            self.round += 1
+        while (self.queue or dry_streak < self.cfg.dry_rounds or self._history_active()) \
+                and self.round < self.cfg.max_rounds and not self.stop_requested():
             if not self.queue:
+                if self._history_active():
+                    # 队列暂空但 git 历史挖掘仍在跑:等它把变体灌进来,不空烧回合数
+                    await asyncio.sleep(self.cfg.history.poll_interval_s)
+                    continue
                 self.log(f"轮 {self.round}: 队列已空且无新攻击面回灌,提前收敛")
                 break
+            self.round += 1
             self.emit(EV.ROUND_START, {"round": self.round, "queue_len": len(self.queue)})
             batch = self.queue
             self.queue = []
@@ -538,6 +661,14 @@ class Pipeline:
             stop_reason = f"达到 maxRounds({self.cfg.max_rounds})"
         else:
             stop_reason = f"收敛(连续 {self.cfg.dry_rounds} 轮无新增)"
+        # git 历史挖掘收尾:正常退出时它一般已结束;若因停止/达上限而仍在跑,则取消并回收
+        if self._history_task is not None:
+            if not self._history_task.done() and self.stop_requested():
+                self._history_task.cancel()
+            try:
+                await self._history_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         self.log(f"审计循环结束:{stop_reason}。等待 {len(self.in_flight)} 条流水线(验证/PoC/报告)排空…")
         await asyncio.gather(*self.in_flight, return_exceptions=True)
         self.checkpoint(self.round)
@@ -650,6 +781,7 @@ class Pipeline:
             if self.cfg.health.enabled and self.cfg.health.on_start and not self.stop_requested():
                 await self.health_check_all()
             await self.recon()
+            self._start_history_mining()   # 与拆解/审计并行;不阻塞后续阶段开展
             stop_reason = await self.audit()
             result = self.synthesis(stop_reason)
             self.emit(EV.RUN_STATUS, {"status": result["status"]})

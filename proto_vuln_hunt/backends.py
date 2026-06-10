@@ -615,6 +615,19 @@ async def _drain_process(
         raise
 
 
+class _NullAsyncCtx:
+    """空的 async 上下文(无并发门);用于 use_global_gate=False 时跳过全局信号量。
+    无状态、可复用单例,兼容 py3.8(不依赖 contextlib.nullcontext 的 async 支持)。"""
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+_NULL_ASYNC_CTX = _NullAsyncCtx()
+
+
 class AgentRunner:
     """封装并发门 + 重试 + 子进程调用。一个实例对应一次运行。"""
 
@@ -662,6 +675,32 @@ class AgentRunner:
         if model not in self._model_sems:
             self._model_sems[model] = asyncio.Semaphore(self.cfg.model_concurrency_for(model))
         return self._model_sems[model]
+
+    async def reserve_slots(self, n: int) -> int:
+        """从**全局并发池**预占 n 个名额并一直持有(用于给独立阶段如 git 历史挖掘留出专属额度:
+        被持有的名额计入总并发,主流程因此只剩 总-n 可用;该阶段结束后用 release_slots 归还,主流程回满)。
+        取消安全:获取途中被取消会先归还已拿到的,再抛出。返回实际占到的名额数。"""
+        if n <= 0:
+            return 0
+        sem = self._semaphore()
+        got = 0
+        try:
+            for _ in range(n):
+                await sem.acquire()
+                got += 1
+            return got
+        except asyncio.CancelledError:
+            for _ in range(got):
+                sem.release()
+            raise
+
+    def release_slots(self, n: int) -> None:
+        """归还此前 reserve_slots 预占的 n 个全局并发名额。"""
+        if n <= 0:
+            return
+        sem = self._semaphore()
+        for _ in range(n):
+            sem.release()
 
     # ── 同一 role 下按模型并发加权轮换 ──
     def _next_model(self, role: str) -> str:
@@ -989,9 +1028,13 @@ class AgentRunner:
         cwd: Optional[str] = None,
         retries: Optional[int] = None,
         fallback: Any = None,
+        use_global_gate: bool = True,
     ) -> Any:
         """schema 非空 → 返回解析后的 dict/list;schema 为空 → 返回 agent 最终文本。
         失败重试上限取 `retries`(未传则用 cfg.retry.max_attempts);耗尽后返回 fallback(跳过,靠续跑挽回)。
+        use_global_gate=False:本次调用不再去抢全局 concurrency 名额(仅受 per-model 信号量约束)。
+        仅供已通过 reserve_slots 预占好全局名额的独立阶段(如 git 历史挖掘)使用——名额已被预占持有、
+        计入总并发,故这里直接复用、不重复申请;该阶段结束 release_slots 后名额归还,主流程回满。
         """
         tag = label or role
         run_cwd = cwd or os.path.abspath(os.path.expanduser(self.cfg.target))
@@ -1018,8 +1061,9 @@ class AgentRunner:
         while True:
             model = self._next_model(role)
             await self.ensure_healthy(model)   # gate:调用前按需补一次健康探针(ttl 去重,不阻断)
+            global_gate = self._semaphore() if use_global_gate else _NULL_ASYNC_CTX
             async with self._model_semaphore(model):
-                async with self._semaphore():
+                async with global_gate:
                     attempt_no = attempt + 1
                     attempt_started = time.time()
                     emit_agent("running", model=model, attempt=attempt_no)

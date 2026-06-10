@@ -87,7 +87,8 @@ backend: claude                       # claude | opencode | codex
 
 models:                               # 按 role 配模型,缺省回落到 default;列表会轮换使用
   default: claude-sonnet-4-6
-  recon:   claude-opus-4-8            # role: recon/decompose/audit/verify/report/poc/synthesis/util
+  recon:   claude-opus-4-8            # role: recon/history/decompose/audit/verify/report/poc/synthesis/util
+  history: claude-sonnet-4-6          # git 历史问题模式挖掘(每条提交一个 agent,与主流程并行)
   audit:   [claude-sonnet-4-6, claude-opus-4-8]
   verify:  claude-sonnet-4-6
 
@@ -164,7 +165,8 @@ REST/SSE 接口(`serve` 时):`/api/runs`(GET/POST)、`/api/runs/{id}`、`/stop`�
 
 ## 工作流程(对齐原 workflow)
 
-1. **Recon** — 读仓库知识/历史问题 → 攻击面地图 + 历史模式(变体排查种子)+ build_hint(或从断点恢复)。
+1. **Recon** — 读仓库知识 → 项目用途 + 威胁分析(列表)+ 攻击面地图 + build_hint(或从断点恢复)。**不再**在此读 git 历史。
+   - **History(并行)** — 与侦察/拆解/审计**并行**的独立阶段:遍历 `git log`,**每条提交派 1 个 agent**(role=`history`)判定是否安全修复;相关者提炼成「历史问题模式」随挖随补,回灌侦察页与审计队列(同类变体排查种子)。**不阻塞**后续阶段——侦察完即开审,模式随后陆续补入。并发上:从**总并发池**预占 `history.concurrency` 个名额(计入总并发,主流程暂用 `总-预占`,至少给主流程留 1),挖掘**全部结束后归还**,主流程回满;配置见 `config.example.yaml` 的 `history:` 块。
 2. **Decompose** — 把每个大 region 拆成有界子任务(每个 agent 代码量可控)。
 3. **Audit** — 工作队列 loop-until-dry:每攻击面 × lens × N finder;动态回灌新攻击面;每轮存断点。
 4. **Verify** — 逐发现 `verify_votes` 票多视角对抗反驳,多数否决即杀。

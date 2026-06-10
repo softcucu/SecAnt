@@ -12,7 +12,8 @@ from typing import Any, Callable, Dict, List, Optional
 # ── 事件类型常量(与 pipeline.emit 一一对应) ──
 RUN_STATUS = "run_status"          # {status}
 LOG = "log"                        # {level, message}
-RECON_DONE = "recon_done"          # {purpose, threat_summary, regions, history, build_hint}
+RECON_DONE = "recon_done"          # {purpose, threat_summary, regions, build_hint}
+HISTORY_ADDED = "history_added"    # {pattern, source, lens_hint, files, total}(git 历史挖掘随挖随补)
 DECOMPOSE_DONE = "decompose_done"  # {tasks, regions}
 ROUND_START = "round_start"        # {round}
 ROUND_DONE = "round_done"          # {round, new_findings, new_surfaces, queue_len, dry_streak, risks}

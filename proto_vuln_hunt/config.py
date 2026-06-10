@@ -27,7 +27,8 @@ BUNDLED_METHODS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 ALL_LENSES = ["memory", "integer", "race", "injection", "authn", "crypto", "dos", "infoleak"]
 
 # 流水线里会用到的 agent 角色;每个角色都可在 models 里单独指定模型,缺省回落到 default。
-ROLES = ["recon", "decompose", "audit", "verify", "report", "poc", "synthesis", "util"]
+# history:独立于侦察、与主流程并行的「git 历史问题模式挖掘」(每条提交一个 agent)。
+ROLES = ["recon", "history", "decompose", "audit", "verify", "report", "poc", "synthesis", "util"]
 
 
 # ──────────────────────────── 后端默认调用模板 ────────────────────────────
@@ -120,6 +121,22 @@ class RetrySpec:
 
 
 @dataclass
+class HistorySpec:
+    """git 历史问题模式挖掘:从侦察中**抽离**出来、与主流程(侦察/拆解/审计)**并行**运行的独立阶段。
+
+    遍历 `git log` 的提交,**每条提交派 1 个 agent**(role=history)读其改动并判定是否安全修复;
+    相关者提炼成「历史问题模式」回灌到 history[](作为同类变体排查种子)与审计队列。
+    这一块不阻塞后续阶段开展——侦察完即开审,历史模式随挖随补。
+    """
+    enabled: bool = True
+    max_commits: int = 200          # 最多分析多少条最近的提交
+    concurrency: int = 1            # 专用 agent 额度(默认 1:始终留 1 个 agent 逐条处理提交)
+    since: str = ""                 # 可选:git log --since=<...> 只看某时间段
+    paths: str = ""                 # 可选:限定 git log 的路径(留空则用 scope;空格分隔多个)
+    poll_interval_s: int = 3        # 审计循环等待历史变体灌入的轮询间隔(秒)
+
+
+@dataclass
 class Config:
     # 目标
     target: str = "."
@@ -154,6 +171,7 @@ class Config:
 
     retry: RetrySpec = field(default_factory=RetrySpec)
     health: HealthCheckSpec = field(default_factory=HealthCheckSpec)
+    history: HistorySpec = field(default_factory=HistorySpec)
 
     # ── Web / serve(仅 `serve` 子命令使用) ──
     host: str = "127.0.0.1"
@@ -366,10 +384,22 @@ def load_config(path: Optional[str], overrides: Optional[Dict[str, Any]] = None)
         expect=str(hc_data.get("expect", _hc_default.expect)),
     )
 
+    # git 历史问题模式挖掘配置(独立、与主流程并行的阶段)。
+    hist_data = data.pop("history", {}) or {}
+    _h_default = HistorySpec()
+    history = HistorySpec(
+        enabled=bool(hist_data.get("enabled", True)),
+        max_commits=max(0, int(hist_data.get("max_commits", _h_default.max_commits))),
+        concurrency=max(1, int(hist_data.get("concurrency", _h_default.concurrency))),
+        since=str(hist_data.get("since", "") or ""),
+        paths=str(hist_data.get("paths", "") or ""),
+        poll_interval_s=max(1, int(hist_data.get("poll_interval_s", _h_default.poll_interval_s))),
+    )
+
     if overrides:
         data.update({k: v for k, v in overrides.items() if v is not None})
 
     known = {f for f in Config.__dataclass_fields__}  # type: ignore[attr-defined]
-    kwargs = {k: v for k, v in data.items() if k in known and k not in ("retry", "health", "backends")}
-    cfg = Config(backends=backends, retry=retry, health=health, **kwargs)
+    kwargs = {k: v for k, v in data.items() if k in known and k not in ("retry", "health", "history", "backends")}
+    cfg = Config(backends=backends, retry=retry, health=health, history=history, **kwargs)
     return cfg

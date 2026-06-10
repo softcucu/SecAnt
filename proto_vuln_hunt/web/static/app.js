@@ -508,9 +508,10 @@ function viewDashboard(runId) {
   const PRI_PILL = { high: "high", medium: "medium", low: "low" };
   function renderRecon() {
     const r = S.recon;
-    if (!r) { tabBody.append(el("div", { class: "panel empty" }, "侦察数据加载中…(运行开始后侦察 agent 会产出项目用途、攻击面地图与历史问题模式)")); return; }
+    if (!r) { tabBody.append(el("div", { class: "panel empty" }, "侦察数据加载中…(侦察 agent 产出项目用途、威胁分析与攻击面地图;历史问题模式由并行的 git 历史挖掘随挖随补)")); return; }
     const sec = (t, b) => el("div", { class: "panel" }, el("h3", {}, t), el("div", { class: "md", html: mdToHtml(b || "(无)") }));
-    tabBody.append(sec("项目用途", r.purpose), sec("威胁分析", r.threat_summary), sec("仓库知识", r.repo_knowledge));
+    const toMd = (v) => Array.isArray(v) ? v.map(x => "- " + x).join("\n") : v;   // threat_summary/repo_knowledge 现为列表
+    tabBody.append(sec("项目用途", r.purpose), sec("威胁分析", toMd(r.threat_summary)), sec("仓库知识", toMd(r.repo_knowledge)));
     if (r.build_hint) tabBody.append(sec("编译提示 build_hint", r.build_hint));
 
     // 攻击面地图(recon 识别的初始攻击面区域)
@@ -547,9 +548,9 @@ function viewDashboard(runId) {
         el("td", { class: "loc" }, (h.files || []).join(", ") || "—")));
       tbl.append(tb);
       tabBody.append(el("div", { class: "panel" }, tbl,
-        el("p", { class: "muted", style: "margin:8px 0 0" }, "每条历史模式会作为「同类变体排查」种子,派 agent 在全仓搜索同类代码模式。")));
+        el("p", { class: "muted", style: "margin:8px 0 0" }, "由并行的 git 历史挖掘逐条提交分析得到;每条作为「同类变体排查」种子,派 agent 在全仓搜索同类代码模式。")));
     } else {
-      tabBody.append(el("div", { class: "panel empty" }, "未提取到历史问题模式。"));
+      tabBody.append(el("div", { class: "panel empty" }, "暂无历史问题模式(git 历史挖掘与主流程并行进行,会随挖随补;非 git 仓或已禁用则为空)。"));
     }
   }
 
@@ -626,6 +627,7 @@ function viewDashboard(runId) {
       case "round_start": S.round = d.round; renderHeader(); break;
       case "round_done": S.round = d.round; S.dry = d.dry_streak; renderHeader(); break;
       case "recon_done": if (d.purpose != null || d.threat_summary != null) { S.recon = Object.assign({}, S.recon, d); } fetchRecon(); break;
+      case "history_added": flash(`🕮 历史问题模式 +1(共 ${d.total || "?"} 条):${(d.pattern || "").slice(0, 50)}`); fetchRecon(); break;
       case "run_done": S.status = "done"; renderHeader(); break;
       case "model_health": if (d.model) { S.health.set(d.model, d); renderTabs(); if (activeTab === "health") renderTab(); } break;
       case "health_check_start": if (Array.isArray(d.models)) for (const m of d.models) if (!S.health.has(m)) S.health.set(m, { model: m, status: "checking" }); renderTabs(); if (activeTab === "health") renderTab(); break;
@@ -645,7 +647,7 @@ function viewDashboard(runId) {
     // SSE:从 seq 0 重放历史事件(重建 findings/coverage/risks/log)再接实时;EventSource 断线自动带 Last-Event-ID 续传
     const es = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events`);
     window._es = es;
-    const TYPES = ["run_status", "metrics", "usage", "agent_update", "candidate_found", "finding_confirmed", "risk_added", "surface_added", "coverage_update", "round_start", "round_done", "recon_done", "run_done", "log", "decompose_done", "poc_done", "error", "model_health", "health_check_start", "health_check_done"];
+    const TYPES = ["run_status", "metrics", "usage", "agent_update", "candidate_found", "finding_confirmed", "risk_added", "surface_added", "coverage_update", "round_start", "round_done", "recon_done", "history_added", "run_done", "log", "decompose_done", "poc_done", "error", "model_health", "health_check_start", "health_check_done"];
     for (const t of TYPES) es.addEventListener(t, (e) => { try { applyEvent(JSON.parse(e.data)); } catch (_) {} });
     es.onerror = () => { /* EventSource 自动重连 */ };
   }

@@ -10,22 +10,16 @@ SURFACE_SCHEMA = {
     "required": ["regions"],
     "properties": {
         "purpose": {"type": "string", "description": "这个代码仓是做什么的/要实现什么目标"},
-        "threat_summary": {"type": "string", "description": "基于用途的威胁分析:谁是攻击者、从哪进、最该担心什么影响"},
-        "build_hint": {"type": "string", "description": "如何编译此目标(用于后续 PoC harness),没有就留空"},
-        "repo_knowledge": {"type": "string", "description": "从 README/docs/SECURITY/CHANGELOG/git 历史读到的安全相关背景"},
-        "history": {
+        "threat_summary": {
             "type": "array",
-            "description": "已知问题模式(同类变体排查种子)",
-            "items": {
-                "type": "object",
-                "required": ["pattern", "lens_hint"],
-                "properties": {
-                    "pattern": {"type": "string"},
-                    "source": {"type": "string"},
-                    "lens_hint": {"type": "string", "enum": ["memory", "integer", "race", "injection", "authn", "crypto", "dos", "infoleak"]},
-                    "files": {"type": "array", "items": {"type": "string"}},
-                },
-            },
+            "description": "基于用途的威胁分析(逐条列出:谁是攻击者、从哪些入口能影响系统、最该担心什么影响、攻击面有多大)",
+            "items": {"type": "string"},
+        },
+        "build_hint": {"type": "string", "description": "如何编译此目标(用于后续 PoC harness),没有就留空"},
+        "repo_knowledge": {
+            "type": "array",
+            "description": "从 README/docs/SECURITY/CHANGELOG 读到的安全相关背景(逐条列出关键事实)",
+            "items": {"type": "string"},
         },
         "regions": {
             "type": "array",
@@ -125,6 +119,19 @@ POC_SCHEMA = {
         "triggered": {"type": "boolean"},
         "exploitability": {"type": "string"},
         "notes": {"type": "string"},
+    },
+}
+
+# 单条 git 提交的「是否安全修复 + 问题模式」判定(每条提交一个 agent)
+HISTORY_COMMIT_SCHEMA = {
+    "type": "object",
+    "required": ["security_related"],
+    "properties": {
+        "security_related": {"type": "boolean", "description": "该提交是否是一次安全修复(修复了某类安全缺陷)"},
+        "pattern": {"type": "string", "description": "若相关:可复用于同类变体排查的问题模式(根因+缺陷类型+触发条件的抽象描述,不要只抄提交标题)"},
+        "lens_hint": {"type": "string", "enum": ["memory", "integer", "race", "injection", "authn", "crypto", "dos", "infoleak"]},
+        "files": {"type": "array", "items": {"type": "string"}, "description": "该问题模式涉及/出现的文件"},
+        "rationale": {"type": "string", "description": "判定理由 + 改动要点摘要"},
     },
 }
 

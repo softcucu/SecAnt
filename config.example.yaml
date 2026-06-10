@@ -17,6 +17,7 @@ backend: claude
 models:
   default: claude-sonnet-4-6
   recon: claude-opus-4-8        # 侦察/威胁建模用更强的模型
+  history: claude-sonnet-4-6    # git 历史问题模式挖掘(每条提交一个 agent;独立于侦察、与主流程并行)
   audit:                         # 审计 finder 可用多模型轮换,分散容量/视角
     - claude-sonnet-4-6
     - claude-opus-4-8
@@ -45,6 +46,20 @@ params:
   unit_line_budget: 1500
   max_subtasks_per_region: 16
   max_files_per_unit: 4
+
+# ── git 历史问题模式挖掘(独立阶段,与侦察/拆解/审计并行) ──
+# 从侦察中抽离:遍历 git log 的提交,**每条提交派 1 个 agent**(role=history)读其改动,
+# 判定是否安全修复;相关者提炼成「历史问题模式」,随挖随补回灌到侦察页与审计队列(同类变体排查种子)。
+# 这一块不阻塞后续阶段——侦察完即开审,模式随后陆续补入。
+# 并发模型:从**总并发池**预占 concurrency 个名额(计入总并发,主流程因此暂用 总-预占),
+# 始终给历史挖掘留出能用的额度;待全部提交分析完毕,预占的名额**归还**,主流程回满。
+history:
+  enabled: true                 # 总开关(非 git 仓自动跳过)
+  max_commits: 200              # 最多分析多少条最近提交(0 = 不限)
+  concurrency: 1                # 预占的并发名额(默认 1:留 1 个名额逐条处理提交;计入总并发,至少给主流程留 1)
+  # since: "1 year ago"         # 可选:只看某时间段的提交(git log --since)
+  # paths: "src lib"            # 可选:限定 git log 路径(留空则用 scope;空格分隔多个)
+  poll_interval_s: 3            # 审计循环等待历史变体灌入的轮询间隔(秒)
 
 # ── 方法库目录(.md 审计方法,agent 运行时会 Read) ──
 # 默认使用项目自带的 proto_vuln_hunt/methods/(随项目分发,无需任何外部依赖)。
