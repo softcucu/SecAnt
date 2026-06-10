@@ -151,12 +151,16 @@ class AgentRunner:
     """封装并发门 + 重试 + 子进程调用。一个实例对应一次运行。"""
 
     def __init__(self, cfg: Config, logger=print,
-                 usage_sink: Optional[Callable[[Dict[str, Any]], None]] = None):
+                 usage_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
+                 health_sink: Optional[Callable[[Dict[str, Any]], None]] = None):
         self.cfg = cfg
         self._sem: Optional[asyncio.Semaphore] = None  # 惰性创建(避免在事件循环外构造时绑错 loop,兼容 py3.8)
         self.spec = cfg.backend_spec()
         self.log = logger
         self.usage_sink = usage_sink
+        self.health_sink = health_sink
+        self.health: Dict[str, Dict[str, Any]] = {}      # model -> 健康记录
+        self._health_locks: Dict[str, asyncio.Lock] = {}  # 每模型一把锁,避免并发重复探针
         self.agent_count = 0
         self.usage_count = 0
         self.usage_totals: Dict[str, int] = {
@@ -241,7 +245,8 @@ class AgentRunner:
                 pass
 
     # ── 单次子进程调用(不含重试) ──
-    async def _invoke(self, prompt: str, model: str, cwd: str) -> Tuple[str, Optional[Dict[str, int]]]:
+    async def _invoke(self, prompt: str, model: str, cwd: str,
+                      timeout_s: Optional[float] = None) -> Tuple[str, Optional[Dict[str, int]]]:
         prompt_file = ""
         if self.spec.prompt_mode == "file" or any("{prompt_file}" in tok for tok in self.spec.command):
             prompt_file = self._write_prompt_file(prompt)
@@ -270,7 +275,8 @@ class AgentRunner:
             cwd=cwd,
             env=env,
         )
-        timeout_s = max(1, self.cfg.retry.timeout_ms / 1000.0)
+        if timeout_s is None:
+            timeout_s = max(1, self.cfg.retry.timeout_ms / 1000.0)
         try:
             out_b, err_b = await asyncio.wait_for(proc.communicate(input=stdin_data), timeout=timeout_s)
         except asyncio.TimeoutError:
@@ -313,6 +319,113 @@ class AgentRunner:
         grown = base * (1.7 ** min(attempt, 8))
         return int(min(r.backoff_cap_ms, grown)) + (self._jitter % 8) * 250
 
+    # ──────────────────────────── 模型健康检查 ────────────────────────────
+    def _health_rec(self, model: str) -> Dict[str, Any]:
+        rec = self.health.get(model)
+        if rec is None:
+            rec = {
+                "model": model, "status": "unknown", "backend": self.cfg.backend,
+                "last_check_ts": 0.0, "last_ok_ts": 0.0, "last_latency_ms": 0,
+                "checks": 0, "ok_checks": 0, "answer": "", "error": "",
+                "calls": 0, "call_fails": 0, "reason": "", "ts": time.time(),
+            }
+            self.health[model] = rec
+        return rec
+
+    def _emit_health(self, rec: Dict[str, Any]) -> None:
+        rec["ts"] = time.time()
+        if self.health_sink:
+            try:
+                self.health_sink(dict(rec))
+            except Exception:
+                pass
+
+    def _health_lock(self, model: str) -> asyncio.Lock:
+        lk = self._health_locks.get(model)
+        if lk is None:
+            lk = asyncio.Lock()
+            self._health_locks[model] = lk
+        return lk
+
+    async def probe_model(self, model: str, *, reason: str = "startup") -> Optional[Dict[str, Any]]:
+        """对单个模型发一个极小探针任务(默认 1+1=?),据响应判定 ok/degraded/down。
+        探针不计入 token 用量统计,且用独立的较短超时,避免拖慢启动。"""
+        if not model:
+            return None
+        hc = self.cfg.health
+        rec = self._health_rec(model)
+        rec["status"] = "checking"
+        rec["reason"] = reason
+        self._emit_health(rec)
+        cwd = os.path.abspath(os.path.expanduser(self.cfg.target))
+        timeout_s = max(1, (hc.timeout_ms or self.cfg.retry.timeout_ms) / 1000.0)
+        t0 = time.time()
+        async with self._model_semaphore(model):
+            async with self._semaphore():
+                try:
+                    text, _usage = await self._invoke(hc.prompt, model, cwd, timeout_s=timeout_s)
+                    latency = int((time.time() - t0) * 1000)
+                    answer = (text or "").strip()
+                    healthy = (hc.expect in answer) if hc.expect else bool(answer)
+                    rec["checks"] += 1
+                    rec["last_check_ts"] = time.time()
+                    rec["last_latency_ms"] = latency
+                    rec["answer"] = answer[:160]
+                    if healthy:
+                        rec["ok_checks"] += 1
+                        rec["last_ok_ts"] = time.time()
+                        rec["status"] = "ok"
+                        rec["error"] = ""
+                    else:
+                        rec["status"] = "degraded"
+                        rec["error"] = "模型可达但回答未命中预期(疑似越权/拒答/输出异常)"
+                except Exception as e:  # noqa: BLE001
+                    rec["checks"] += 1
+                    rec["last_check_ts"] = time.time()
+                    rec["last_latency_ms"] = int((time.time() - t0) * 1000)
+                    rec["status"] = "down"
+                    rec["error"] = str(e)[:200]
+        self._emit_health(rec)
+        return rec
+
+    async def ensure_healthy(self, model: str) -> None:
+        """gate:真正调用某模型前,若其健康状态未知/异常/陈旧,则先补一次探针(按 ttl 去重)。
+        无论探针结果如何都不阻断真正的调用——只更新状态,失败仍交由 run() 的重试兜底。"""
+        hc = self.cfg.health
+        if not model or not hc.enabled or not hc.gate or hc.ttl_s <= 0:
+            return
+        rec = self._health_rec(model)
+        now = time.time()
+        if rec.get("status") == "ok" and (now - (rec.get("last_check_ts") or 0)) < hc.ttl_s:
+            return
+        async with self._health_lock(model):
+            rec = self._health_rec(model)
+            now = time.time()
+            if rec.get("status") == "ok" and (now - (rec.get("last_check_ts") or 0)) < hc.ttl_s:
+                return
+            await self.probe_model(model, reason="gate")
+
+    def _note_call(self, model: str, ok: bool, err: str = "") -> None:
+        """用真实 agent 调用的成败顺带更新模型健康(仅在状态发生跃迁时发事件,避免刷屏)。"""
+        rec = self._health_rec(model)
+        changed = False
+        if ok:
+            rec["calls"] += 1
+            rec["last_ok_ts"] = time.time()
+            if rec["status"] in ("unknown", "down", "degraded", "checking"):
+                rec["status"] = "ok"
+                rec["last_check_ts"] = time.time()
+                rec["error"] = ""
+                changed = True
+        else:
+            rec["call_fails"] += 1
+            rec["error"] = (err or "")[:200]
+            if rec["status"] in ("ok", "unknown"):
+                rec["status"] = "degraded"
+                changed = True
+        if changed:
+            self._emit_health(rec)
+
     # ── 带重试的 agent 调用:一次 CLI 任务执行失败(非零退出/超时/输出不可解析)即重试 ──
     async def run(
         self,
@@ -336,12 +449,14 @@ class AgentRunner:
         attempt = 0
         while True:
             model = self._next_model(role)
+            await self.ensure_healthy(model)   # gate:调用前按需补一次健康探针(ttl 去重,不阻断)
             async with self._model_semaphore(model):
                 async with self._semaphore():
                     try:
                         text, usage = await self._invoke(prompt, model, run_cwd)
                         self._record_usage(prompt, text, role=role, label=tag, model=model,
                                            attempt=attempt + 1, backend_usage=usage)
+                        self._note_call(model, True)
                         if schema is None:
                             return text
                         parsed = extract_json(text)
@@ -350,6 +465,7 @@ class AgentRunner:
                         return parsed
                     except Exception as e:  # noqa: BLE001
                         msg = str(e)
+                        self._note_call(model, False, msg)
             # 退避/重试在信号量之外等待(不占用并发额度)
             attempt += 1
             if attempt > max_attempts:

@@ -215,7 +215,7 @@ async function viewNew() {
 // ──────────────────────── view: dashboard ────────────────────────
 function viewDashboard(runId) {
   app.innerHTML = "";
-  const S = { findings: new Map(), risks: new Map(), coverage: null, recon: null, log: [], usageRows: [], usage: emptyUsage(), manifest: null, candidates: 0, status: "queued", round: 0, dry: 0, agents: 0, elapsed: 0 };
+  const S = { findings: new Map(), risks: new Map(), health: new Map(), coverage: null, recon: null, log: [], usageRows: [], usage: emptyUsage(), manifest: null, candidates: 0, status: "queued", round: 0, dry: 0, agents: 0, elapsed: 0 };
   let activeTab = "findings";
 
   const header = el("div", { class: "panel" });
@@ -253,10 +253,10 @@ function viewDashboard(runId) {
     header.append(stats);
   }
 
-  const TABS = [["findings", "漏洞"], ["coverage", "覆盖"], ["risks", "风险"], ["usage", "用量"], ["recon", "侦察"], ["activity", "活动"], ["exports", "导出"]];
+  const TABS = [["findings", "漏洞"], ["health", "模型"], ["coverage", "覆盖"], ["risks", "风险"], ["usage", "用量"], ["recon", "侦察"], ["activity", "活动"], ["exports", "导出"]];
   function renderTabs() {
     tabsBar.innerHTML = "";
-    const counts = { findings: S.findings.size, risks: S.risks.size, usage: S.usageRows.length };
+    const counts = { findings: S.findings.size, risks: S.risks.size, usage: S.usageRows.length, health: S.health.size };
     for (const [key, label] of TABS) {
       const t = el("div", { class: "tab" + (key === activeTab ? " active" : "") }, label);
       if (counts[key]) t.append(el("span", { class: "tabcount" }, String(counts[key])));
@@ -268,6 +268,7 @@ function viewDashboard(runId) {
   function renderTab() {
     tabBody.innerHTML = "";
     if (activeTab === "findings") return renderFindings();
+    if (activeTab === "health") return renderModels();
     if (activeTab === "coverage") return renderCoverage();
     if (activeTab === "risks") return renderRisks();
     if (activeTab === "usage") return renderUsage();
@@ -300,6 +301,43 @@ function viewDashboard(runId) {
       });
       tabBody.append(card);
     }
+  }
+
+  const HEALTH_TXT = { ok: "✅ 正常", down: "⛔ 不可达", degraded: "⚠️ 异常", checking: "⏳ 检查中", unknown: "· 未检查" };
+  function healthPill(s) { return el("span", { class: "pill health-" + (s || "unknown") }, HEALTH_TXT[s] || s || "未检查"); }
+  function renderModels() {
+    const list = [...S.health.values()];
+    const bar = el("div", { class: "row", style: "justify-content:space-between;margin-bottom:6px" },
+      el("strong", {}, "各模型健康度"),
+      el("button", { class: "btn secondary", onclick: recheckHealth }, "🩺 重新检查"));
+    tabBody.append(el("div", { class: "panel" }, bar,
+      el("p", { class: "muted", style: "margin:0" },
+        "运行开始前会对每个配置的模型发一个 1+1 探针;调用某模型前若健康状态陈旧/异常会自动补检。状态实时更新。")));
+    if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无模型健康数据(开始运行后会自动检测)。")); return; }
+    const order = { checking: 0, down: 1, degraded: 2, unknown: 3, ok: 4 };
+    list.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9) || String(a.model).localeCompare(String(b.model)));
+    const tbl = el("table", {}, el("thead", {}, el("tr", {},
+      el("th", {}, "状态"), el("th", {}, "模型"), el("th", {}, "延迟"), el("th", {}, "探针(正常/总)"),
+      el("th", {}, "成功调用"), el("th", {}, "失败"), el("th", {}, "最近探针答复"), el("th", {}, "最近检查"))));
+    const tb = el("tbody");
+    for (const h of list) {
+      const ans = h.error ? el("span", { class: "muted", title: h.error }, "⚠ " + h.error) : (h.answer || "—");
+      tb.append(el("tr", {},
+        el("td", {}, healthPill(h.status)),
+        el("td", { class: "loc" }, h.model || "—"),
+        el("td", {}, h.last_latency_ms ? Math.round(h.last_latency_ms) + " ms" : "—"),
+        el("td", {}, `${h.ok_checks || 0}/${h.checks || 0}`),
+        el("td", {}, String(h.calls || 0)),
+        el("td", {}, String(h.call_fails || 0)),
+        el("td", {}, ans),
+        el("td", {}, h.last_check_ts ? fmtTs(h.last_check_ts) : "—")));
+    }
+    tbl.append(tb);
+    tabBody.append(el("div", { class: "panel" }, tbl));
+  }
+  async function recheckHealth() {
+    try { const r = await api("POST", `/api/runs/${encodeURIComponent(runId)}/health/check`); flash(r.ok ? "已触发健康复检" : "无法复检(run 未在运行)"); }
+    catch (e) { flash(e.message); }
   }
 
   function renderCoverage() {
@@ -410,19 +448,23 @@ function viewDashboard(runId) {
       case "round_done": S.round = d.round; S.dry = d.dry_streak; renderHeader(); break;
       case "recon_done": if (d.purpose != null || d.threat_summary != null) { S.recon = Object.assign({}, S.recon, d); } fetchRecon(); break;
       case "run_done": S.status = "done"; renderHeader(); break;
+      case "model_health": if (d.model) { S.health.set(d.model, d); renderTabs(); if (activeTab === "health") renderTab(); } break;
+      case "health_check_start": if (Array.isArray(d.models)) for (const m of d.models) if (!S.health.has(m)) S.health.set(m, { model: m, status: "checking" }); renderTabs(); if (activeTab === "health") renderTab(); break;
+      case "health_check_done": flash(`🩺 健康检查:${d.ok}/${d.total} 正常` + ((d.unhealthy || []).length ? `,异常 ${d.unhealthy.join(", ")}` : "")); if (activeTab === "health") renderTab(); break;
       case "log": S.log.push(d.message); if (S.log.length > 600) S.log.shift(); if (activeTab === "activity") renderTab(); break;
     }
   }
   async function fetchRecon() { try { S.recon = await api("GET", `/api/runs/${encodeURIComponent(runId)}/recon`); if (activeTab === "recon") renderTab(); } catch (e) {} }
+  async function fetchHealth() { try { const h = await api("GET", `/api/runs/${encodeURIComponent(runId)}/health`); for (const r of (h.models || [])) if (r.model) S.health.set(r.model, r); renderTabs(); if (activeTab === "health") renderTab(); } catch (e) {} }
 
   async function boot() {
     try { S.manifest = await api("GET", `/api/runs/${encodeURIComponent(runId)}`); S.status = S.manifest.running ? "running" : S.manifest.status; } catch (e) {}
     renderHeader(); renderTabs(); renderTab();
-    fetchRecon();
+    fetchRecon(); fetchHealth();
     // SSE:从 seq 0 重放历史事件(重建 findings/coverage/risks/log)再接实时;EventSource 断线自动带 Last-Event-ID 续传
     const es = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events`);
     window._es = es;
-    const TYPES = ["run_status", "metrics", "usage", "candidate_found", "finding_confirmed", "risk_added", "surface_added", "coverage_update", "round_start", "round_done", "recon_done", "run_done", "log", "decompose_done", "poc_done", "error"];
+    const TYPES = ["run_status", "metrics", "usage", "candidate_found", "finding_confirmed", "risk_added", "surface_added", "coverage_update", "round_start", "round_done", "recon_done", "run_done", "log", "decompose_done", "poc_done", "error", "model_health", "health_check_start", "health_check_done"];
     for (const t of TYPES) es.addEventListener(t, (e) => { try { applyEvent(JSON.parse(e.data)); } catch (_) {} });
     es.onerror = () => { /* EventSource 自动重连 */ };
   }

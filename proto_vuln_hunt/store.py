@@ -73,6 +73,10 @@ class RunStore:
         return os.path.join(self.dir, "risks")
 
     @property
+    def health_path(self) -> str:                # 各模型健康检查快照(整体覆盖刷)
+        return os.path.join(self.dir, "health.json")
+
+    @property
     def events_path(self) -> str:
         return os.path.join(self.dir, "events.jsonl")
 
@@ -240,6 +244,17 @@ class RunStore:
             "usage": self.load_usage(),
             "summary": m.get("summary", {}),
         }
+
+    # health:各模型健康检查快照(model -> 记录;整体覆盖刷)
+    def save_health(self, models: Dict[str, Any]) -> None:
+        payload = {"models": list(models.values()), "updated_at": time.time()}
+        _atomic_write(self.health_path, json.dumps(payload, ensure_ascii=False, indent=2))
+
+    def load_health(self) -> Dict[str, Any]:
+        d = self._read_json(self.health_path)
+        if isinstance(d, dict) and isinstance(d.get("models"), list):
+            return d
+        return {"models": [], "updated_at": 0}
 
     # usage:每次 agent 调用一行 JSONL
     def append_usage(self, rec: Dict[str, Any]) -> None:

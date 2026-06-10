@@ -85,6 +85,9 @@ def cmd_run(args) -> int:
             "enable_poc": cfg.enable_poc, "decompose": cfg.decompose, "resume": cfg.resume,
             "methods_dir": cfg.methods_abs, "methods_ok": cfg.methods_ok(),
             "backend_command": cfg.backend_spec().command,
+            "health_check": {"enabled": cfg.health.enabled, "on_start": cfg.health.on_start,
+                             "gate": cfg.health.gate, "ttl_s": cfg.health.ttl_s,
+                             "all_models": cfg.all_models()},
         }, ensure_ascii=False, indent=2))
         return 0
 

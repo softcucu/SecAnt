@@ -39,7 +39,9 @@ class Pipeline:
         self.store = store or RunStore(cfg.out_dir).ensure()
         self._emit_cb = emitter or _noop_emit
         self._stop = stop_event   # 可为 None,惰性创建(兼容 py3.8 在事件循环外构造)
-        self.runner = AgentRunner(cfg, logger=self.log, usage_sink=self.record_usage)
+        self.runner = AgentRunner(cfg, logger=self.log, usage_sink=self.record_usage,
+                                  health_sink=self.record_health)
+        self.health_state: Dict[str, Dict[str, Any]] = {}   # model -> 最新健康记录
 
         # ── 运行状态(可被断点恢复) ──
         self.surface_data: Dict[str, Any] = {}
@@ -83,6 +85,38 @@ class Pipeline:
         except Exception:
             pass
         self.emit(EV.USAGE, rec)
+
+    def record_health(self, rec: Dict[str, Any]) -> None:
+        """模型健康记录更新:整体快照落盘 + 实时事件(供 Web「模型」页实时呈现)。"""
+        m = rec.get("model")
+        if m:
+            self.health_state[m] = rec
+        try:
+            self.store.save_health(self.health_state)
+        except Exception:
+            pass
+        self.emit(EV.MODEL_HEALTH, rec)
+
+    async def health_check_all(self) -> Dict[str, Any]:
+        """运行前(或按需)对所有配置的模型各发一个 1+1 探针,实时反映健康度。"""
+        models = self.cfg.all_models()
+        if not models:
+            self.log("⚠ 未配置任何模型,跳过健康检查")
+            self.emit(EV.HEALTH_DONE, {"total": 0, "ok": 0, "unhealthy": []})
+            return {"total": 0, "ok": 0, "unhealthy": []}
+        self.emit(EV.HEALTH_START, {"models": models})
+        self.log(f"🩺 模型健康检查:对 {len(models)} 个模型各发一个探针({', '.join(models)})…")
+        recs = await asyncio.gather(*[self.runner.probe_model(m, reason="startup") for m in models],
+                                    return_exceptions=True)
+        ok = sum(1 for r in recs if isinstance(r, dict) and r.get("status") == "ok")
+        bad = [r.get("model") for r in recs if isinstance(r, dict) and r.get("status") != "ok"]
+        if bad:
+            self.log(f"🩺 健康检查完成:{ok}/{len(models)} 正常;异常: {', '.join(str(b) for b in bad)}"
+                     f"(仍会尝试运行,失败将自动重试)")
+        else:
+            self.log(f"🩺 健康检查完成:{ok}/{len(models)} 全部正常")
+        self.emit(EV.HEALTH_DONE, {"total": len(models), "ok": ok, "unhealthy": bad})
+        return {"total": len(models), "ok": ok, "unhealthy": bad}
 
     def _stop_ev(self) -> asyncio.Event:
         if self._stop is None:
@@ -606,6 +640,8 @@ class Pipeline:
         self.log(f"启用 lens: {', '.join(self.cfg.lenses)} | run 目录: {self.store.dir} | "
                  f"方法库: {self.cfg.methods_abs} ({'就绪' if self.cfg.methods_ok() else '不可用→内联兜底'})")
         try:
+            if self.cfg.health.enabled and self.cfg.health.on_start and not self.stop_requested():
+                await self.health_check_all()
             await self.recon()
             stop_reason = await self.audit()
             result = self.synthesis(stop_reason)

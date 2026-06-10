@@ -99,6 +99,14 @@ class RunManager:
         rec["stop"].set()
         return True
 
+    def recheck_health(self, run_id: str) -> bool:
+        """对正在运行的 run 触发一次全模型健康复检(后台任务,实时经 SSE 回传)。"""
+        rec = self.active.get(run_id)
+        if not rec or rec["task"].done():
+            return False
+        asyncio.create_task(rec["pipeline"].health_check_all())
+        return True
+
     def reconcile_on_startup(self) -> None:
         """服务重启:把"清单写着 running 但其实没有任务在跑"的 run 标记为 interrupted。"""
         for info in self.registry.list_runs():
@@ -144,6 +152,8 @@ def create_app(cfg: Config):
                 "finders_per_lens": cfg.finders_per_lens, "max_rounds": cfg.max_rounds,
                 "dry_rounds": cfg.dry_rounds, "verify_votes": cfg.verify_votes,
                 "enable_poc": cfg.enable_poc, "decompose": cfg.decompose, "methods_dir": cfg.methods_abs,
+                "health": {"enabled": cfg.health.enabled, "on_start": cfg.health.on_start,
+                           "gate": cfg.health.gate, "ttl_s": cfg.health.ttl_s},
             },
         }
 
@@ -207,6 +217,18 @@ def create_app(cfg: Config):
     @app.get("/api/runs/{run_id}/recon")
     async def recon(run_id: str):
         return _store_or_404(run_id).load_recon()
+
+    # ── 模型健康 ──
+    @app.get("/api/runs/{run_id}/health")
+    async def health(run_id: str):
+        h = _store_or_404(run_id).load_health()
+        h["running"] = manager.is_running(run_id)
+        return h
+
+    @app.post("/api/runs/{run_id}/health/check")
+    async def health_check(run_id: str):
+        _store_or_404(run_id)
+        return {"ok": manager.recheck_health(run_id)}
 
     # ── 导出 ──
     @app.get("/api/runs/{run_id}/export/sarif")

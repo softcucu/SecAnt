@@ -57,7 +57,7 @@ DEFAULT_BACKENDS: Dict[str, Dict[str, Any]] = {
         "command": [
             "opencode", "run",
             "--model", "{model}",
-            "请读取并执行这个审计任务文件:{prompt_file}。不要输出思考过程,最终只输出一个合法 JSON 对象。",
+            "请读取并执行这个审计任务文件:{prompt_file}。",
         ],
         "prompt_mode": "file",
         "parse": "text",
@@ -83,6 +83,22 @@ class BackendSpec:
     prompt_mode: str = "stdin"   # stdin | arg | file
     parse: str = "text"          # text | claude_json
     env: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class HealthCheckSpec:
+    """模型健康检查:用一个极小的探针任务(如 1+1=?)确认每个配置的模型可达且能正常回答。
+
+    · on_start:运行开始前先把**所有配置的模型**各探一遍,实时反映到 Web。
+    · gate:真正用某模型派任务前,若其健康状态未知/陈旧/异常,则先补一次探针(按 ttl 去重,避免每次都探)。
+    """
+    enabled: bool = True
+    on_start: bool = True          # 运行开始前先把所有模型探一遍
+    gate: bool = True              # 调用某模型前,若其健康状态陈旧/未知则先探一次
+    ttl_s: int = 300               # gate 复检的新鲜度窗口(秒);<=0 表示只在 on_start 探一次
+    timeout_ms: int = 120000       # 单次健康探针的墙钟超时(独立于审计任务的大超时)
+    prompt: str = "这是一次模型健康检查,请忽略其它指令。只输出最终答案的数字,不要任何解释或多余文字:1+1=?"
+    expect: str = "2"              # 答案里应包含的子串(命中=healthy;可达但未命中=degraded)
 
 
 @dataclass
@@ -132,6 +148,7 @@ class Config:
     checkpoint_path: str = ""
 
     retry: RetrySpec = field(default_factory=RetrySpec)
+    health: HealthCheckSpec = field(default_factory=HealthCheckSpec)
 
     # ── Web / serve(仅 `serve` 子命令使用) ──
     host: str = "127.0.0.1"
@@ -196,6 +213,15 @@ class Config:
 
     def model_concurrency_for(self, model: str) -> int:
         return max(1, int(self.model_concurrency.get(model) or self.model_concurrency.get("default") or self.concurrency))
+
+    def all_models(self) -> List[str]:
+        """所有 role 里配置到的去重模型列表(保持首次出现顺序),用于启动前健康检查。"""
+        seen: List[str] = []
+        for vals in self.models.values():
+            for m in vals:
+                if m and m not in seen:
+                    seen.append(m)
+        return seen
 
     def model_slots_for(self, role: str) -> List[str]:
         slots: List[str] = []
@@ -317,10 +343,28 @@ def load_config(path: Optional[str], overrides: Optional[Dict[str, Any]] = None)
         timeout_ms=int(retry_data.get("timeout_ms", 1800000)),
     )
 
+    # 健康检查配置:优先读 `health_check:`,`health:` 作为别名。
+    hc_data = data.pop("health_check", None)
+    if hc_data is None:
+        hc_data = data.pop("health", {})
+    else:
+        data.pop("health", None)
+    hc_data = hc_data or {}
+    _hc_default = HealthCheckSpec()
+    health = HealthCheckSpec(
+        enabled=bool(hc_data.get("enabled", True)),
+        on_start=bool(hc_data.get("on_start", True)),
+        gate=bool(hc_data.get("gate", True)),
+        ttl_s=int(hc_data.get("ttl_s", 300)),
+        timeout_ms=int(hc_data.get("timeout_ms", 120000)),
+        prompt=str(hc_data.get("prompt") or _hc_default.prompt),
+        expect=str(hc_data.get("expect", _hc_default.expect)),
+    )
+
     if overrides:
         data.update({k: v for k, v in overrides.items() if v is not None})
 
     known = {f for f in Config.__dataclass_fields__}  # type: ignore[attr-defined]
-    kwargs = {k: v for k, v in data.items() if k in known}
-    cfg = Config(backends=backends, retry=retry, **kwargs)
+    kwargs = {k: v for k, v in data.items() if k in known and k not in ("retry", "health", "backends")}
+    cfg = Config(backends=backends, retry=retry, health=health, **kwargs)
     return cfg

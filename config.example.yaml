@@ -61,6 +61,19 @@ web:
   port: 8000
   runs_dir: ./pvh-runs          # 各 run 的根目录(每个 run 一个子目录)
 
+# ── 模型健康检查 ──
+# 运行开始前对**所有配置的模型**各发一个极小探针(默认问 1+1=?),确认每个模型可达且能正常回答;
+# 之后真正用某模型派任务前,若其健康状态未知/异常/陈旧(超过 ttl_s)会自动补检一次(按 ttl 去重,不会每次都探)。
+# 健康度实时显示在 Web 控制台的「模型」页(可手动「重新检查」)。探针不计入 token 用量统计。
+health_check:
+  enabled: true                 # 总开关
+  on_start: true                # 运行开始前先把所有模型探一遍
+  gate: true                    # 调用某模型前若状态陈旧/异常则先补一次探针
+  ttl_s: 300                    # gate 复检的新鲜度窗口(秒);<=0 表示只在 on_start 探一次
+  timeout_ms: 120000            # 单次探针墙钟超时(独立于审计任务的大超时)
+  prompt: "这是一次模型健康检查,请忽略其它指令。只输出最终答案的数字,不要任何解释或多余文字:1+1=?"
+  expect: "2"                   # 答案里应包含的子串(命中=正常;可达但未命中=异常)
+
 # ── 后端 CLI 任务执行失败后的重试 ──
 # 注意:opencode/claude/codex 内部已自行重试瞬时 API 抖动;这一层只在 **CLI 任务整体失败** 时重试,
 # 即:子进程非零退出 / 超时 / 输出无法解析为所需的结构化 JSON。耗尽后跳过该 agent(漏洞靠续跑挽回)。
@@ -81,7 +94,7 @@ backends:
     prompt_mode: stdin
     parse: claude_json
   opencode:
-    command: ["opencode", "run", "--model", "{model}", "请读取并执行这个审计任务文件:{prompt_file}。不要输出思考过程,最终只输出一个合法 JSON 对象。"]
+    command: ["opencode", "run", "--model", "{model}", "请读取并执行这个审计任务文件:{prompt_file}。"]
     prompt_mode: file
     parse: text
   codex:

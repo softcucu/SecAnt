@@ -35,6 +35,8 @@ tr:hover td{background:var(--panel2)}
 .sev-low{background:var(--low)} .sev-info{background:var(--info)} .sev-none{background:var(--info)}
 .st-running{background:var(--run)} .st-done{background:var(--ok)} .st-stopped{background:var(--warn)}
 .st-error{background:var(--crit)} .st-queued{background:var(--info)} .st-interrupted{background:var(--warn)}
+.health-ok{background:var(--ok)} .health-down{background:var(--crit)} .health-degraded{background:var(--warn)}
+.health-checking{background:var(--run)} .health-unknown{background:var(--info)}
 
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px}
 .stat{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px 12px}

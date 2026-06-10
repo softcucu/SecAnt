@@ -159,7 +159,8 @@ python3 -B scripts/test_opencode_prompt_file.py
 Web 端可逐条下载或一键导出全部;CLI `run` 默认导出到 out_dir(`--no-export` 关闭)。
 
 REST/SSE 接口(`serve` 时):`/api/runs`(GET/POST)、`/api/runs/{id}`、`/stop`、`/resume`、
-`/findings`、`/findings/{fid}`、`/coverage`、`/risks`、`/recon`、`/events`(SSE)、`/export/{sarif,index.md,finding/{fid}.md,all}`。
+`/findings`、`/findings/{fid}`、`/coverage`、`/risks`、`/recon`、`/health`(GET 各模型健康)、
+`/health/check`(POST 触发复检)、`/events`(SSE)、`/export/{sarif,index.md,finding/{fid}.md,all}`。
 
 ---
 
@@ -177,6 +178,7 @@ REST/SSE 接口(`serve` 时):`/api/runs`(GET/POST)、`/api/runs/{id}`、`/stop`�
 
 ## 健壮性
 
+- **模型健康检查**:运行开始前对**所有配置的模型**各发一个极小探针(默认问 `1+1=?`),确认每个模型可达且能正常回答;之后真正用某模型派任务前,若其健康状态未知/异常/陈旧(超过 `ttl_s`)会自动补检一次(按 ttl 去重,不会每次都探)。健康度(状态/延迟/探针答复/成功调用数/失败数)在 Web「模型」页**实时**呈现,可手动「重新检查」。探针不计入 token 用量。配置见 `config.example.yaml` 的 `health_check:` 块(可关闭)。
 - **并发门**:`asyncio.Semaphore`,任意时刻 ≤ `concurrency` 个 CLI 子进程在跑。
 - **CLI 任务失败重试**:opencode/claude/codex 内部已自行重试瞬时 API 抖动;本层只在 **CLI 任务整体失败**(子进程非零退出 / 超时 / 输出无法解析为所需结构化 JSON)时重试——指数退避(`retry.backoff_*`,疑似限流时自动延长)、最多 `retry.max_attempts` 次,耗尽后跳过该 agent(漏洞靠在途候选 + 续跑挽回)。
 - **单 agent 失败隔离**:任一子进程异常/未产出结构化结果只跳过该条,不拖垮整体。
