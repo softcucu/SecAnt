@@ -1,0 +1,42 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
+
+# ── 虚拟环境 ──
+.venv/
+venv/
+env/
+ENV/
+
+# ── proto-vuln-hunt 运行产物 ──
+# Web 控制台各 run 的根目录(config: web.runs_dir,默认 ./pvh-runs)
+pvh-runs/
+# CLI 默认 out_dir(<target>/.proto-vuln-hunt);也忽略本仓内任何同名目录
+.proto-vuln-hunt/
+
+# ── 用户私有配置 ──
+# config.example.yaml 是模板(纳入版本控制);用户实际配置不应提交
+my.yaml
+config.yaml
+config.local.*
+*.local.yaml
+
+# ── 测试 / 覆盖率 ──
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ── 编辑器 / 操作系统 ──
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db

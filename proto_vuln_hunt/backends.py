@@ -29,6 +29,23 @@ def looks_rate_limited(msg: str) -> bool:
     return bool(_RATE_RE.search(msg or ""))
 
 
+# 终端 CLI(尤其 opencode/codex 的 run 模式)常把会话/工具活动连同 ANSI 颜色码一起打到 stdout。
+# 这些转义序列会混进 JSON 文本里,导致 json.loads 失败。解析前统一剥掉。
+_ANSI_RE = re.compile(
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]"   # CSI 序列(含颜色 SGR、光标移动等)
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC 序列(标题等),以 BEL 或 ST 结束
+    r"|\x1b[@-Z\\-_]"             # 其它两字符转义
+)
+
+
+def strip_ansi(s: str) -> str:
+    if not s:
+        return s
+    s = _ANSI_RE.sub("", s)
+    # 去掉孤立的回车(进度条回刷)与残留的退格,避免污染 JSON
+    return s.replace("\r", "")
+
+
 def estimate_tokens(text: str) -> int:
     """轻量估算:ASCII 约 4 字符/token,非 ASCII 约 1 字符/token。"""
     if not text:
@@ -79,9 +96,15 @@ def _extract_usage(obj: Any) -> Optional[Dict[str, int]]:
 
 
 # ──────────────────────────── JSON 提取 ────────────────────────────
-def _balanced_json_candidates(s: str) -> List[str]:
-    """扫描出文本中所有"括号配对完整"的顶层 JSON 对象/数组子串。"""
-    out: List[str] = []
+# opencode/codex 的 run 模式常把一段自然语言 + ```json 代码块 + 工具活动一起打到 stdout,
+# 有时还夹带 // 注释、尾随逗号、被截断未闭合等。下面这套解析尽量从这种"脏文本"里把目标 JSON 捞出来:
+#   1) 收集所有候选(```json/``` 代码块、整段、括号配对扫描出的顶层 {…}/[…]);
+#   2) 每个候选先严格解析,失败再做温和修复(去注释/去尾逗号/补全未闭合)后再试;
+#   3) 用 schema 的顶层键给候选打分,选最可能是"最终答案"的那个(键命中多、来自代码块、体量大、靠后)。
+
+def _balanced_json_spans(s: str) -> List[Tuple[str, int]]:
+    """扫描出文本中所有"括号配对完整"的顶层 JSON 对象/数组子串及其起始位置。"""
+    out: List[Tuple[str, int]] = []
     n = len(s)
     i = 0
     while i < n:
@@ -92,6 +115,7 @@ def _balanced_json_candidates(s: str) -> List[str]:
         in_str = False
         esc = False
         j = i
+        closed = False
         while j < n:
             c = s[j]
             if in_str:
@@ -111,40 +135,169 @@ def _balanced_json_candidates(s: str) -> List[str]:
                         break
                     stack.pop()
                     if not stack:
-                        out.append(s[i:j + 1])
+                        out.append((s[i:j + 1], i))
+                        closed = True
                         break
             j += 1
+        if not closed and j >= n:
+            # 顶层括号一直没闭合(疑似被截断)→ 也作为候选,留给温和修复尝试补全
+            out.append((s[i:], i))
         i = (j + 1) if j > i else (i + 1)
     return out
 
 
-def extract_json(text: str) -> Optional[Any]:
-    """从 agent 自由文本里尽力解析出一个 JSON 值。优先级:
-    ```json 代码块(取最后一个) > 整段文本 > 括号配对扫描(取最后一个能解析的)。
+def _sanitize_jsonish(s: str) -> str:
+    """字符串感知地去掉 // 与 /* */ 注释、以及对象/数组里的尾随逗号(不动字符串字面量内部)。"""
+    out: List[str] = []
+    i, n = 0, len(s)
+    in_str = False
+    esc = False
+    while i < n:
+        c = s[i]
+        if in_str:
+            out.append(c)
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and s[i + 1] == "/":
+            j = i + 2
+            while j < n and s[j] != "\n":
+                j += 1
+            i = j
+            continue
+        if c == "/" and i + 1 < n and s[i + 1] == "*":
+            j = i + 2
+            while j + 1 < n and not (s[j] == "*" and s[j + 1] == "/"):
+                j += 1
+            i = j + 2
+            continue
+        if c == ",":
+            j = i + 1
+            while j < n and s[j] in " \t\r\n":
+                j += 1
+            if j < n and s[j] in "}]":   # 尾随逗号 → 丢弃
+                i += 1
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _autoclose(s: str) -> str:
+    """对被截断的 JSON 做尽力补全:补上未闭合的字符串引号与未闭合的括号。"""
+    stack: List[str] = []
+    in_str = False
+    esc = False
+    for c in s:
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c in "{[":
+                stack.append(c)
+            elif c in "}]":
+                if stack:
+                    stack.pop()
+    suffix = '"' if in_str else ""
+    for c in reversed(stack):
+        suffix += "}" if c == "{" else "]"
+    return s + suffix
+
+
+def _try_load(raw: str) -> Tuple[Any, bool]:
+    """尽力把一个候选串解析为 JSON:严格 → 去注释去尾逗号 → 再补全未闭合。返回 (值, 是否成功)。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return None, False
+    try:
+        return json.loads(raw), True
+    except Exception:
+        pass
+    sanitized = _sanitize_jsonish(raw)
+    try:
+        return json.loads(sanitized), True
+    except Exception:
+        pass
+    try:
+        return json.loads(_autoclose(sanitized)), True
+    except Exception:
+        return None, False
+
+
+def _schema_keys(schema: Optional[Dict[str, Any]]) -> Optional[set]:
+    """从 schema 取顶层期望键(required + properties),用于在多个候选里挑最贴合的那个。"""
+    if not isinstance(schema, dict):
+        return None
+    keys: set = set()
+    props = schema.get("properties")
+    if isinstance(props, dict):
+        keys.update(props.keys())
+    req = schema.get("required")
+    if isinstance(req, list):
+        keys.update(req)
+    return keys or None
+
+
+def extract_json(text: str, schema: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+    """从 agent 的自由文本(可能是"一段话 + JSON")里稳健地解析出目标 JSON。
+
+    传入 schema 时会据其顶层键在多个候选中择优(opencode 常把解释/工具活动和最终 JSON 混在一起)。
     """
     if not text:
         return None
-    # 1) fenced ```json ... ``` 代码块
-    fences = re.findall(r"```(?:json|JSON)?\s*\n(.*?)```", text, re.DOTALL)
-    for block in reversed(fences):
-        try:
-            return json.loads(block.strip())
-        except Exception:
-            continue
+    text = strip_ansi(text)
+    want = _schema_keys(schema)
+    want_array = isinstance(schema, dict) and schema.get("type") == "array"
+
+    # (value, pos, size, source_rank);source_rank 越小越优先:0=```json 块,1=``` 块,2=整段,3=括号扫描
+    candidates: List[Tuple[Any, int, int, int]] = []
+
+    def consider(raw: str, pos: int, source_rank: int) -> None:
+        val, ok = _try_load(raw)
+        if ok and isinstance(val, (dict, list)):
+            candidates.append((val, pos, len(raw or ""), source_rank))
+
+    # 1) fenced ``` 代码块(json 标注优先)
+    for m in re.finditer(r"```[ \t]*(json|JSON)?[ \t]*\r?\n(.*?)```", text, re.DOTALL):
+        consider(m.group(2), m.start(), 0 if m.group(1) else 1)
     # 2) 整段就是 JSON
-    t = text.strip()
-    try:
-        return json.loads(t)
-    except Exception:
-        pass
-    # 3) 括号配对扫描,取最后一个能解析的(通常是最终答案)
-    cands = _balanced_json_candidates(text)
-    for c in reversed(cands):
-        try:
-            return json.loads(c)
-        except Exception:
-            continue
-    return None
+    consider(text, 0, 2)
+    # 3) 括号配对扫描出的顶层片段
+    for raw, pos in _balanced_json_spans(text):
+        consider(raw, pos, 3)
+
+    if not candidates:
+        return None
+
+    def score(c: Tuple[Any, int, int, int]):
+        val, pos, size, source_rank = c
+        if want_array:
+            type_ok = 1 if isinstance(val, list) else 0
+            key_hits = 0
+        else:
+            type_ok = 1 if isinstance(val, dict) else 0
+            key_hits = sum(1 for k in want if k in val) if (want and isinstance(val, dict)) else 0
+        # 期望类型匹配 > schema 键命中数 > 来源优先(代码块) > 体量更大 > 位置更靠后(最终答案)
+        return (type_ok, key_hits, -source_rank, size, pos)
+
+    candidates.sort(key=score)
+    return candidates[-1][0]
 
 
 class AgentRunner:
@@ -309,7 +462,24 @@ class AgentRunner:
             usage = _extract_usage(json.loads(stdout))
         except Exception:
             usage = None
-        return stdout, usage
+        return strip_ansi(stdout), usage
+
+    def _dump_failed_output(self, role: str, label: str, model: str, attempt: int, text: str) -> str:
+        """解析结构化 JSON 失败时,把后端 CLI 的原始输出落盘,便于排查(尤其 opencode/codex)。"""
+        try:
+            dbg_dir = os.path.join(self.cfg.out_dir, "debug")
+            os.makedirs(dbg_dir, exist_ok=True)
+            safe = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{role}_{label}_{model}")[:80]
+            path = os.path.join(dbg_dir, f"parsefail_{self.agent_count}_{attempt}_{safe}.txt")
+            header = (f"# backend={self.cfg.backend} role={role} label={label} model={model} "
+                      f"attempt={attempt} len={len(text or '')}\n"
+                      f"# 后端 CLI 输出里找不到可解析的 JSON。常见原因:opencode/codex 把工具活动/思考一并打到 stdout,"
+                      f"或最终未输出 ```json 代码块。\n{'-' * 60}\n")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(header + (text or ""))
+            return path
+        except Exception:
+            return ""
 
     def _backoff_ms(self, attempt: int, msg: str) -> int:
         """指数退避;若失败像"被限流/额度耗尽"则用更长基数等服务端恢复。带确定性抖动分散惊群。"""
@@ -459,9 +629,13 @@ class AgentRunner:
                         self._note_call(model, True)
                         if schema is None:
                             return text
-                        parsed = extract_json(text)
+                        parsed = extract_json(text, schema)
                         if parsed is None:
-                            raise RuntimeError("CLI 未产出可解析的结构化 JSON")
+                            path = self._dump_failed_output(role, tag, model, attempt + 1, text)
+                            snippet = " ".join((text or "").split())[:240]
+                            self.log(f"⚠ {tag} 后端输出无可解析 JSON(共 {len(text or '')} 字符)"
+                                     f"{(';原始输出已存 ' + path) if path else ''};前 240 字符:{snippet}")
+                            raise RuntimeError("CLI 未产出可解析的结构化 JSON(原始输出已存到 run 目录 debug/)")
                         return parsed
                     except Exception as e:  # noqa: BLE001
                         msg = str(e)
