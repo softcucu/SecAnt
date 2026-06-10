@@ -11,7 +11,7 @@ def _jsonl(*events):
 
 
 class OpencodeEventParsingTests(unittest.TestCase):
-    def test_uses_final_text_message_after_tool_loop(self):
+    def test_merges_text_messages_after_tool_loop(self):
         stdout = _jsonl(
             {
                 "type": "step_start",
@@ -49,11 +49,11 @@ class OpencodeEventParsingTests(unittest.TestCase):
 
         self.assertIsNotNone(parsed)
         text, usage, session_id = parsed
-        self.assertEqual(text, "```json\n{\"answer\":\"2\"}\n```")
+        self.assertEqual(text, "I will read the file first.\n```json\n{\"answer\":\"2\"}\n```")
         self.assertEqual(session_id, "")
         self.assertEqual(usage, {"input_tokens": 10, "output_tokens": 3, "total_tokens": 13})
 
-    def test_keeps_stdout_text_when_tool_calls_is_last_event(self):
+    def test_keeps_available_text_when_tool_calls_is_last_event(self):
         stdout = _jsonl(
             {
                 "type": "text",
@@ -73,6 +73,32 @@ class OpencodeEventParsingTests(unittest.TestCase):
         text, _usage, session_id = parsed
         self.assertEqual(text, "I will read the file first.")
         self.assertEqual(session_id, "ses_123")
+
+    def test_merges_preamble_and_final_json(self):
+        stdout = _jsonl(
+            {
+                "type": "text",
+                "part": {"id": "p1", "messageID": "m1", "type": "text", "text": "先看看文件内容。</think>"},
+            },
+            {
+                "type": "step_finish",
+                "part": {"id": "p2", "messageID": "m1", "type": "step-finish", "reason": "tool-calls"},
+            },
+            {
+                "type": "text",
+                "part": {"id": "p3", "messageID": "m2", "type": "text", "text": "{\"regions\":[]}"},
+            },
+            {
+                "type": "step_finish",
+                "part": {"id": "p4", "messageID": "m2", "type": "step-finish", "reason": "stop"},
+            },
+        )
+
+        parsed = _extract_opencode_text(stdout)
+
+        self.assertIsNotNone(parsed)
+        text, _usage, _session_id = parsed
+        self.assertEqual(text, "先看看文件内容。</think>\n{\"regions\":[]}")
 
     def test_accepts_message_part_delta_events(self):
         stdout = _jsonl(

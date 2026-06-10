@@ -305,6 +305,12 @@ _OPENCODE_EVENT_TYPES = {
     "message.part.updated", "message.part.delta", "message.updated", "session.updated",
     "session.status",
 }
+class BackendOutputError(RuntimeError):
+    """后端输出本身不可用时抛出;保留完整 stdout/stderr 便于 debug 落盘。"""
+
+    def __init__(self, message: str, output: str = ""):
+        super().__init__(message)
+        self.output = output
 
 
 def _maybe_json_obj(v: Any) -> Optional[Dict[str, Any]]:
@@ -375,13 +381,13 @@ def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str
     """识别并解析 opencode `--format json` 的事件流(每行一个 JSON 事件),重建 assistant 的最终文本。
 
     返回 (text, usage, session_id);若 stdout 不像事件流则返回 None(交回上层按普通文本处理)。
-      · text       —— stdout 事件流中最后一个有文本的 assistant message 正文(同一 part 取最新,delta 逐段累加)。
+      · text       —— stdout 事件流中所有 assistant text message 正文按出现顺序合并。
       · usage      —— 取最后一个 step_finish 的 part.tokens 作为整轮真实 token 用量(取不到则 None,上层回退估算)。
       · session_id —— opencode 会话 ID,仅用于诊断。
 
-    设计取舍:这里只解析子进程 stdout,不读 opencode 的数据库/日志。不同 opencode 版本在工具调用后
-    会继续输出多步事件,所以不能用 step_finish(reason=tool-calls) 做完整性硬判;完整性由上层
-    关心的结果判断:健康检查看 expect 是否命中,结构化任务看 JSON 能否解析。
+    设计取舍:这里只解析子进程 stdout,不读 opencode 的数据库/日志。opencode 的一次 run 可能
+    包含多条 assistant message:先说"我去读文件",工具调用后再输出最终 JSON。因此不能在事件层
+    挑最后一条或按 reason 裁剪,而要把所有正文块合并,让 extract_json 从完整文本里找最终 JSON。
 
     注:`--format json` 只约束 opencode 的**输出封装**为事件流,**不**约束模型正文为 JSON;
     正文(可能是"一段话 + ```json 块")原样在 text 事件里,之后仍由 extract_json 进一步解析。
@@ -484,9 +490,11 @@ def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str
         text = msg_text(mid)
         if text.strip():
             groups.append((mid, text))
-    assistant_groups = [(mid, text) for mid, text in groups if message_roles.get(mid, "assistant") == "assistant"]
-    chosen = (assistant_groups or groups)
-    text = chosen[-1][1] if chosen else ""
+    # opencode 的 text 事件通常是 assistant 正文;若有明确 role=user 的 message,排除它。
+    chosen = [(mid, text) for mid, text in groups if message_roles.get(mid, "assistant") != "user"]
+    if not chosen:
+        chosen = groups
+    text = "\n".join(text for _mid, text in chosen)
     return text, usage, session_id
 
 
@@ -719,8 +727,10 @@ class AgentRunner:
         if oc is not None:
             text, oc_usage, _session_id = oc
             if not text.strip():
-                # 返回完整原始 stdout,让健康检查/结构化解析基于真实完整输出判断,而不是在事件层提前截断。
-                return strip_ansi(stdout), oc_usage
+                raise BackendOutputError(
+                    "opencode 只输出了工具调用前/工具调用中的中间文本,未在 stdout 中看到最终 assistant 文本",
+                    strip_ansi(stdout),
+                )
             return strip_ansi(text), oc_usage
         usage = None
         try:
@@ -912,6 +922,10 @@ class AgentRunner:
                         return parsed
                     except Exception as e:  # noqa: BLE001
                         msg = str(e)
+                        if isinstance(e, BackendOutputError) and e.output:
+                            path = self._dump_failed_output(role, tag, model, attempt + 1, e.output)
+                            if path:
+                                msg = f"{msg}(完整 stdout 已存 {path})"
                         self._note_call(model, False, msg)
             # 退避/重试在信号量之外等待(不占用并发额度)
             attempt += 1
