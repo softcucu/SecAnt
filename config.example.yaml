@@ -94,7 +94,9 @@ backends:
     prompt_mode: stdin
     parse: claude_json
   opencode:
-    command: ["opencode", "run", "--model", "{model}", "请读取并执行这个审计任务文件:{prompt_file}。"]
+    # --format json:opencode 以结构化事件流(每行一个 JSON 事件)输出,子进程跑完后才能确定性拿到完整最终文本,
+    # 避免默认 --format default(流式/TUI 渲染)在管道里只抓到部分中间输出。它只约束输出封装,不约束模型正文为 JSON。
+    command: ["opencode", "run", "--format", "json", "--model", "{model}", "请读取并执行这个审计任务文件:{prompt_file}。"]
     prompt_mode: file
     parse: text
   codex:

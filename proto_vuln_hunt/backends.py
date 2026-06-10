@@ -300,6 +300,55 @@ def extract_json(text: str, schema: Optional[Dict[str, Any]] = None) -> Optional
     return candidates[-1][0]
 
 
+def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str, int]]]]:
+    """识别并解析 opencode `--format json` 的事件流(每行一个 JSON 事件),重建 assistant 的**完整最终文本**。
+
+    返回 (text, usage);若 stdout 不像事件流则返回 None(交回上层按普通文本处理)。
+
+    说明:`--format json` 只把 **opencode 的输出封装**成结构化事件流,**不**约束模型正文必须是 JSON。
+    模型正文(可能是"一段话 + ```json 块")原样落在 text 事件的 part.text 里,之后仍由 extract_json 进一步解析。
+    用它的意义在于:默认 `--format default` 是给人看的流式/TUI 渲染,管道里抓到的常是**部分中间输出**;
+    事件流则能在子进程正常结束(EOF)后,确定性地拼出**最终**那段 assistant 文本,避免"提前拿到一点输出就返回"。
+    """
+    if not stdout or "{" not in stdout:
+        return None
+    lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    json_lines = [ln for ln in lines if ln.startswith("{")]
+    # 至少一半的非空行是 JSON 对象,才认定是事件流(避免把普通文本/单个 JSON 误判为事件流)
+    if len(json_lines) * 2 < len(lines):
+        return None
+    parts: Dict[Any, str] = {}
+    order: List[Any] = []
+    usage: Optional[Dict[str, int]] = None
+    saw_event = False
+    for ln in json_lines:
+        try:
+            ev = json.loads(ln)
+        except Exception:
+            continue
+        if not isinstance(ev, dict) or "type" not in ev:
+            continue
+        saw_event = True
+        part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
+        # 只收 assistant 的正文 text 片段;reasoning/tool/step 等事件忽略
+        if ev.get("type") == "text" and isinstance(part.get("text"), str):
+            pid = part.get("id") or f"_{len(order)}"
+            if pid not in parts:
+                order.append(pid)
+            parts[pid] = part["text"]      # 同一 part 多次出现(流式累积)取最新
+        u = _extract_usage(ev) or _extract_usage(part) or _extract_usage(part.get("tokens") or {})
+        if u:
+            usage = u
+    if not saw_event:
+        return None
+    text = "".join(parts[pid] for pid in order)
+    if not text.strip():
+        return None
+    return text, usage
+
+
 class AgentRunner:
     """封装并发门 + 重试 + 子进程调用。一个实例对应一次运行。"""
 
@@ -457,6 +506,11 @@ class AgentRunner:
                     raise RuntimeError(f"claude error: {str(obj.get('result'))[:300]}")
                 return str(obj.get("result", "") or ""), usage
             return stdout, usage
+        # opencode `--format json` 事件流:确定性地重建出 assistant 的完整最终文本(自动识别,兼容旧配置)
+        oc = _extract_opencode_text(stdout)
+        if oc is not None:
+            text, oc_usage = oc
+            return strip_ansi(text), oc_usage
         usage = None
         try:
             usage = _extract_usage(json.loads(stdout))
