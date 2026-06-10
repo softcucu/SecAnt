@@ -29,6 +29,12 @@ function fmtMs(ms) { ms = Number(ms || 0); if (!ms) return "—"; return ms < 10
 function sevPill(s) { return el("span", { class: "pill sev-" + (s || "none") }, s || "none"); }
 function stPill(s) { return el("span", { class: "pill st-" + (s || "queued") }, s || "queued"); }
 function fmtNum(n) { return Number(n || 0).toLocaleString(); }
+function fmtTok(n) {
+  n = Number(n || 0);
+  if (n >= 1e6) return (n / 1e6).toFixed(n < 1e7 ? 2 : 1) + "M";
+  if (n >= 1e4) return (n / 1e3).toFixed(n < 1e5 ? 1 : 0) + "K";
+  return n.toLocaleString();
+}
 function cssKey(s) { return String(s || "unknown").replace(/[^a-z0-9-]+/gi, "-").toLowerCase(); }
 function modelText(v) { return Array.isArray(v) ? v.join(", ") : (v || ""); }
 function splitModels(v) { return String(v || "").split(",").map(s => s.trim()).filter(Boolean); }
@@ -245,18 +251,18 @@ function viewDashboard(runId) {
         el("span", { class: "muted" }, `后端 ${esc(cfg.backend || "?")} · 威胁 ${esc(cfg.threat_model || "?")}`)),
       el("div", { class: "muted" }, `轮 ${S.round}/${cfg.max_rounds ?? "?"} · dry ${S.dry} · 用时 ${Math.round(S.elapsed)}s`)));
     const stats = el("div", { class: "stats" },
-      el("div", { class: "stat" }, el("div", { class: "n" }, String(S.findings.size)), el("div", { class: "l" }, "确认漏洞")),
+      el("div", { class: "stat" }, el("div", { class: "n" }, String(S.findings.size)), el("div", { class: "l" }, "疑似漏洞")),
       ...SEVS.map(s => el("div", { class: "stat" }, el("div", { class: "n sev-" + s, style: "color:var(--" + (s === "critical" ? "crit" : s === "high" ? "high" : s === "medium" ? "med" : s === "low" ? "low" : "info") + ")" }, String(bySev[s] || 0)), el("div", { class: "l" }, s))),
       el("div", { class: "stat" }, el("div", { class: "n" }, String(S.candidates)), el("div", { class: "l" }, "候选")),
       el("div", { class: "stat" }, el("div", { class: "n" }, String(S.risks.size)), el("div", { class: "l" }, "风险登记")),
       el("div", { class: "stat" }, el("div", { class: "n" }, String(S.agents)), el("div", { class: "l" }, "agent 调用")),
-      el("div", { class: "stat" }, el("div", { class: "n" }, fmtNum(S.usage.input_tokens)), el("div", { class: "l" }, "输入 token")),
-      el("div", { class: "stat" }, el("div", { class: "n" }, fmtNum(S.usage.output_tokens)), el("div", { class: "l" }, "输出 token")),
-      el("div", { class: "stat" }, el("div", { class: "n" }, fmtNum(S.usage.total_tokens)), el("div", { class: "l" }, "总 token")));
+      el("div", { class: "stat" }, el("div", { class: "n" }, fmtTok(S.usage.input_tokens)), el("div", { class: "l" }, "输入 token")),
+      el("div", { class: "stat" }, el("div", { class: "n" }, fmtTok(S.usage.output_tokens)), el("div", { class: "l" }, "输出 token")),
+      el("div", { class: "stat" }, el("div", { class: "n" }, fmtTok(S.usage.total_tokens)), el("div", { class: "l" }, "总 token")));
     header.append(stats);
   }
 
-  const TABS = [["findings", "漏洞"], ["agents", "Agent"], ["health", "模型"], ["coverage", "覆盖"], ["risks", "风险"], ["usage", "用量"], ["recon", "侦察"], ["activity", "活动"], ["exports", "导出"]];
+  const TABS = [["findings", "漏洞"], ["agents", "Agent"], ["health", "模型"], ["coverage", "攻击面覆盖"], ["risks", "潜在风险点"], ["usage", "历史任务"], ["recon", "侦察"], ["activity", "活动"], ["exports", "导出"]];
   function renderTabs() {
     tabsBar.innerHTML = "";
     const activeAgents = [...S.agentMap.values()].filter(isAgentActive).length;
@@ -284,7 +290,7 @@ function viewDashboard(runId) {
 
   function renderFindings() {
     const list = [...S.findings.values()].sort((a, b) => SEVS.indexOf(a.corrected_severity) - SEVS.indexOf(b.corrected_severity));
-    if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无确认漏洞(审计进行中会实时出现)。")); return; }
+    if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无疑似漏洞(审计进行中会实时出现)。")); return; }
     for (const f of list) {
       const head = el("div", { class: "head" }, sevPill(f.corrected_severity),
         el("span", { class: "title" }, f.title || f.id),
@@ -610,7 +616,7 @@ function viewDashboard(runId) {
       case "agent_update": applyAgentUpdate(d); renderTabs(); if (activeTab === "agents") renderTab(); break;
       case "candidate_found": S.candidates++; renderHeader(); break;
       case "finding_confirmed":
-        if (d.id && !S.findings.has(d.id)) { S.findings.set(d.id, d); flash("✔ 确认漏洞 " + d.id + " [" + d.corrected_severity + "]"); }
+        if (d.id && !S.findings.has(d.id)) { S.findings.set(d.id, d); flash("✔ 疑似漏洞 " + d.id + " [" + d.corrected_severity + "]"); }
         else if (d.id) S.findings.set(d.id, d);
         renderHeader(); renderTabs(); if (activeTab === "findings") renderTab(); break;
       case "risk_added": { const k = (d.area || "") + "::" + (d.file || ""); S.risks.set(k, d); renderHeader(); renderTabs(); if (activeTab === "risks") renderTab(); break; }
