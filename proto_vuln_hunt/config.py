@@ -53,7 +53,8 @@ DEFAULT_BACKENDS: Dict[str, Dict[str, Any]] = {
     },
     "opencode": {
         # 模型格式需为 provider/model(如 anthropic/claude-sonnet-4-6)。
-        # opencode 的完整提示词不要放在 argv 里:长 prompt 容易被 shell/系统参数长度截断。
+        # 提示词作为 opencode run 的单个 positional message argv 传入;执行时不经过 shell,
+        # 因此换行/空格会原样保留,不会被 shell 分行截断。
         # --format json:让 opencode 以"每行一个 JSON 事件"的结构化事件流输出(而非默认给人看的流式/TUI 渲染),
         # 这样子进程跑完后能确定性地拿到 assistant 的**完整最终文本**,避免管道里只抓到部分中间输出。
         # 注意:它只约束 opencode 的输出封装,不约束模型正文必须是 JSON;正文仍由 extract_json 进一步解析。
@@ -61,9 +62,9 @@ DEFAULT_BACKENDS: Dict[str, Dict[str, Any]] = {
             "opencode", "run",
             "--format", "json",
             "--model", "{model}",
-            "请读取并执行这个审计任务文件:{prompt_file}。",
+            "{prompt}",
         ],
-        "prompt_mode": "file",
+        "prompt_mode": "arg",
         "parse": "text",
     },
     "codex": {

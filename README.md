@@ -34,7 +34,7 @@ pip install -r requirements.txt          # CLI(run)仅需 PyYAML;Web 控制台(s
 | 后端 | 非交互调用 | 模型名格式 |
 |---|---|---|
 | `claude`   | `claude -p --output-format json ...`(提示词走 stdin) | `claude-opus-4-8` / `claude-sonnet-4-6` |
-| `opencode` | `opencode run --format json --model provider/model <prompt_file 指令>` | `anthropic/claude-sonnet-4-6`、`openai/gpt-5` |
+| `opencode` | `opencode run --format json --model provider/model <prompt>` | `anthropic/claude-sonnet-4-6`、`openai/gpt-5` |
 | `codex`    | `codex exec --model <m> <prompt>`                     | `gpt-5-codex` / `o3` |
 
 > claude/codex 默认以"绕过审批/全自动"模式运行(`--dangerously-skip-permissions` /
@@ -114,8 +114,8 @@ backends:                             # (可选)自定义任意 CLI 的调用方
     prompt_mode: stdin                # stdin | arg | file
     parse: claude_json                # claude_json | text
   opencode:
-    command: ["opencode","run","--format","json","--model","{model}","请读取并执行这个审计任务文件:{prompt_file}。不要输出思考过程,最终只输出一个合法 JSON 对象。"]
-    prompt_mode: file
+    command: ["opencode","run","--format","json","--model","{model}","{prompt}"]
+    prompt_mode: arg
     parse: text
 ```
 
@@ -126,13 +126,9 @@ backends:                             # (可选)自定义任意 CLI 的调用方
 **自定义后端**:`command` 是 token 列表,运行时把 `{model}` 替换为当前角色模型、`{prompt}` 替换为提示词
 (仅 `prompt_mode: arg` 时需要)、`{prompt_file}` 替换为提示词临时文件路径(仅 `prompt_mode: file` 时需要);
 `stdin` 模式则把提示词从标准输入喂入。`parse` 决定如何从 stdout 取回 agent 文本(`claude_json` 取 JSON
-的 `.result`,`text` 直接用 stdout)。opencode 默认使用 `file` 模式,避免长提示词作为命令行参数时被截断。
-
-可用下面的本地脚本验证 opencode 风格调用不会把多行长提示词塞进 argv,同时验证每个模型的并发上限:
-
-```bash
-python3 -B scripts/test_opencode_prompt_file.py
-```
+的 `.result`,`text` 直接用 stdout)。opencode 默认把提示词作为 `run` 的单个 positional message argv 传入,
+不经过 shell,因此换行/空格会原样保留;不要在自定义 opencode command 里用 `bash -c "...{prompt}..."` 之类的
+shell 插值方式,否则换行会被 shell 当作命令分隔。
 
 ---
 

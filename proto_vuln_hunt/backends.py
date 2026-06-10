@@ -655,10 +655,14 @@ class AgentRunner:
                       timeout_s: Optional[float] = None,
                       direct_prompt: bool = False) -> Tuple[str, Optional[Dict[str, int]]]:
         prompt_file = ""
-        uses_prompt_file = (
-            self.spec.prompt_mode == "file"
-            or any("{prompt_file}" in tok for tok in self.spec.command)
+        uses_prompt = any("{prompt}" in tok for tok in self.spec.command)
+        uses_prompt_file = self.spec.prompt_mode == "file" or any(
+            "{prompt_file}" in tok for tok in self.spec.command
         )
+        if self.cfg.backend == "opencode" and (uses_prompt or uses_prompt_file):
+            # opencode run receives the audit prompt as one positional message argv.
+            # Never splice multi-line prompt text into another token or through a shell.
+            direct_prompt = True
         if (not direct_prompt) and uses_prompt_file:
             prompt_file = self._write_prompt_file(prompt)
 

@@ -96,8 +96,9 @@ backends:
   opencode:
     # --format json:opencode 以结构化事件流(每行一个 JSON 事件)输出,子进程跑完后才能确定性拿到完整最终文本,
     # 避免默认 --format default(流式/TUI 渲染)在管道里只抓到部分中间输出。它只约束输出封装,不约束模型正文为 JSON。
-    command: ["opencode", "run", "--format", "json", "--model", "{model}", "请读取并执行这个审计任务文件:{prompt_file}。"]
-    prompt_mode: file
+    # {prompt} 会作为单个 positional message argv 传给 opencode run;不经过 shell,换行不会被分行截断。
+    command: ["opencode", "run", "--format", "json", "--model", "{model}", "{prompt}"]
+    prompt_mode: arg
     parse: text
   codex:
     command: ["codex", "exec", "--model", "{model}", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "{prompt}"]

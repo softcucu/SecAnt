@@ -1,9 +1,12 @@
 import asyncio
 import json
+import os
 import sys
+import tempfile
 import unittest
 
-from proto_vuln_hunt.backends import _drain_process, _extract_opencode_text
+from proto_vuln_hunt.backends import AgentRunner, _drain_process, _extract_opencode_text
+from proto_vuln_hunt.config import BackendSpec, Config
 
 
 def _jsonl(*events):
@@ -148,6 +151,71 @@ class ProcessDrainTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(out_b, b"firstsecond")
         self.assertEqual(err_b, b"err")
+
+    async def test_legacy_opencode_prompt_file_config_sends_prompt_as_message(self):
+        script = (
+            "import json,sys;"
+            "print(json.dumps({'type':'text','part':{'id':'p','messageID':'m','type':'text','text':sys.argv[-1]}}))"
+        )
+        prompt = "PROMPT BODY\nsecond line with spaces\n最后一行"
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Config(
+                target=d,
+                out_dir=os.path.join(d, "out"),
+                backend="opencode",
+                backends={
+                    "opencode": BackendSpec(
+                        name="opencode",
+                        command=[
+                            sys.executable,
+                            "-c",
+                            script,
+                            "请读取并执行这个审计任务文件:{prompt_file}。",
+                        ],
+                        prompt_mode="file",
+                        parse="text",
+                    )
+                },
+            )
+            runner = AgentRunner(cfg, logger=lambda *_args, **_kwargs: None)
+
+            text, _usage = await runner._invoke(prompt, "unused-model", d, timeout_s=5)
+
+        self.assertEqual(text, prompt)
+
+    async def test_opencode_arg_prompt_keeps_multiline_prompt_in_single_argv(self):
+        script = (
+            "import json,sys;"
+            "payload=json.dumps({'argv':sys.argv[1:]},ensure_ascii=False);"
+            "print(json.dumps({'type':'text','part':{'id':'p','messageID':'m','type':'text','text':payload}},ensure_ascii=False))"
+        )
+        prompt = "line1\nline2 with spaces\n$(printf should-not-run) && echo no"
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Config(
+                target=d,
+                out_dir=os.path.join(d, "out"),
+                backend="opencode",
+                backends={
+                    "opencode": BackendSpec(
+                        name="opencode",
+                        command=[
+                            sys.executable,
+                            "-c",
+                            script,
+                            "--model",
+                            "{model}",
+                            "{prompt}",
+                        ],
+                        prompt_mode="arg",
+                        parse="text",
+                    )
+                },
+            )
+            runner = AgentRunner(cfg, logger=lambda *_args, **_kwargs: None)
+
+            text, _usage = await runner._invoke(prompt, "unused-model", d, timeout_s=5)
+
+        self.assertEqual(json.loads(text), {"argv": ["--model", "unused-model", prompt]})
 
 
 if __name__ == "__main__":
