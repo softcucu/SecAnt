@@ -269,6 +269,24 @@ def strip_reasoning(text: str) -> str:
     return text[idx + len("</think>"):] if idx != -1 else text
 
 
+def _collect_json_candidates(text: str) -> List[Tuple[str, int, int]]:
+    """收集 extract_json 会逐个喂给 json.loads 的候选 (raw, pos, source_rank)。
+
+    口径与 extract_json 完全一致(同一份 fenced 正则 + 括号扫描),供 extract_json 与调试落盘共用,
+    避免"以为的候选"与"真正解析的候选"不一致。入参须是已 strip_reasoning+strip_ansi 的文本。
+    source_rank 越小越优先:0=```json 块,1=``` 块,2=整段,3=括号扫描。"""
+    out: List[Tuple[str, int, int]] = []
+    # 1) fenced ``` 代码块(json 标注优先);换行可选,兼容 inline ```json {…}``` 同行形态
+    for m in re.finditer(r"```[ \t]*(json|JSON)?[ \t]*\r?\n?(.*?)```", text, re.DOTALL):
+        out.append((m.group(2), m.start(), 0 if m.group(1) else 1))
+    # 2) 整段就是 JSON
+    out.append((text, 0, 2))
+    # 3) 括号配对扫描出的顶层片段
+    for raw, pos in _balanced_json_spans(text):
+        out.append((raw, pos, 3))
+    return out
+
+
 def extract_json(text: str, schema: Optional[Dict[str, Any]] = None) -> Optional[Any]:
     """从 agent 的自由文本(可能是"一段话 + JSON")里稳健地解析出目标 JSON。
 
@@ -280,22 +298,12 @@ def extract_json(text: str, schema: Optional[Dict[str, Any]] = None) -> Optional
     want = _schema_keys(schema)
     want_array = isinstance(schema, dict) and schema.get("type") == "array"
 
-    # (value, pos, size, source_rank);source_rank 越小越优先:0=```json 块,1=``` 块,2=整段,3=括号扫描
+    # (value, pos, size, source_rank)
     candidates: List[Tuple[Any, int, int, int]] = []
-
-    def consider(raw: str, pos: int, source_rank: int) -> None:
+    for raw, pos, source_rank in _collect_json_candidates(text):
         val, ok = _try_load(raw)
         if ok and isinstance(val, (dict, list)):
             candidates.append((val, pos, len(raw or ""), source_rank))
-
-    # 1) fenced ``` 代码块(json 标注优先)
-    for m in re.finditer(r"```[ \t]*(json|JSON)?[ \t]*\r?\n(.*?)```", text, re.DOTALL):
-        consider(m.group(2), m.start(), 0 if m.group(1) else 1)
-    # 2) 整段就是 JSON
-    consider(text, 0, 2)
-    # 3) 括号配对扫描出的顶层片段
-    for raw, pos in _balanced_json_spans(text):
-        consider(raw, pos, 3)
 
     if not candidates:
         return None
@@ -308,11 +316,28 @@ def extract_json(text: str, schema: Optional[Dict[str, Any]] = None) -> Optional
         else:
             type_ok = 1 if isinstance(val, dict) else 0
             key_hits = sum(1 for k in want if k in val) if (want and isinstance(val, dict)) else 0
-        # 期望类型匹配 > schema 键命中数 > 来源优先(代码块) > 体量更大 > 位置更靠后(最终答案)
-        return (type_ok, key_hits, -source_rank, size, pos)
+        # 期望类型匹配 > schema 键命中数 > 来源优先(代码块) > 位置更靠后(最终答案) > 体量更大
+        # 位置排在体量之前:同来源/同命中时,最终答案(靠后)胜过更大的早期草稿 JSON。
+        return (type_ok, key_hits, -source_rank, pos, size)
 
     candidates.sort(key=score)
     return candidates[-1][0]
+
+
+def best_json_candidate(text: str) -> str:
+    """返回 extract_json 真正会喂给 json.loads、且最可能是最终答案的那段候选串。
+
+    复用 `_collect_json_candidates`(与 extract_json 同一套候选),按其偏好挑选:来源优先
+    (fenced > 括号片段 > 整段)、同来源取位置最靠后(最终答案)。剥掉 <think>/ANSI,输出纯文本,
+    解析失败时单独落盘,便于直接 json.loads/jsonlint 复现报错。"""
+    s = strip_reasoning(strip_ansi(text or ""))
+    cands = _collect_json_candidates(s)
+    if not cands:
+        return s.strip()
+    # 展示偏好:fenced(0/1)> 括号片段(3,纯 {…})> 整段(2,可能含散文);同档取 pos 最大。
+    rank_order = {0: 0, 1: 1, 3: 2, 2: 3}
+    raw, _pos, _rank = min(cands, key=lambda c: (rank_order[c[2]], -c[1]))
+    return (raw or "").strip()
 
 
 _OPENCODE_EVENT_TYPES = {
@@ -792,19 +817,30 @@ class AgentRunner:
             usage = None
         return strip_ansi(stdout), usage
 
-    def _dump_failed_output(self, role: str, label: str, model: str, attempt: int, text: str) -> str:
-        """解析结构化 JSON 失败时,把后端 CLI 的原始输出落盘,便于排查(尤其 opencode/codex)。"""
+    def _dump_failed_output(self, role: str, label: str, model: str, attempt: int, text: str,
+                            dump_candidate: bool = False) -> str:
+        """解析结构化 JSON 失败时,把后端 CLI 的原始输出落盘,便于排查(尤其 opencode/codex)。
+
+        dump_candidate=True 时,在同前缀再写一个 `.jsonload.json` 文件,内容是 extract_json 真正会喂给
+        json.loads 的那段候选串(由 best_json_candidate 抽取),可直接丢 json.loads/jsonlint 复现报错。"""
         try:
             dbg_dir = os.path.join(self.cfg.out_dir, "debug")
             os.makedirs(dbg_dir, exist_ok=True)
             safe = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{role}_{label}_{model}")[:80]
-            path = os.path.join(dbg_dir, f"parsefail_{self.agent_count}_{attempt}_{safe}.txt")
+            base = os.path.join(dbg_dir, f"parsefail_{self.agent_count}_{attempt}_{safe}")
+            path = base + ".txt"
             header = (f"# backend={self.cfg.backend} role={role} label={label} model={model} "
                       f"attempt={attempt} len={len(text or '')}\n"
                       f"# 后端 CLI 输出里找不到可解析的 JSON。常见原因:opencode/codex 把工具活动/思考一并打到 stdout,"
                       f"或最终未输出 ```json 代码块。\n{'-' * 60}\n")
             with open(path, "w", encoding="utf-8") as f:
                 f.write(header + (text or ""))
+            if dump_candidate:
+                try:
+                    with open(base + ".jsonload.json", "w", encoding="utf-8") as f:
+                        f.write(best_json_candidate(text))
+                except Exception:
+                    pass
             return path
         except Exception:
             return ""
@@ -1008,7 +1044,8 @@ class AgentRunner:
                             return text
                         parsed = extract_json(text, schema)
                         if parsed is None:
-                            path = self._dump_failed_output(role, tag, model, attempt_no, text)
+                            path = self._dump_failed_output(role, tag, model, attempt_no, text,
+                                                            dump_candidate=True)
                             snippet = " ".join((text or "").split())[:240]
                             self.log(f"⚠ {tag} 后端输出无可解析 JSON(共 {len(text or '')} 字符)"
                                      f"{(';原始输出已存 ' + path) if path else ''};前 240 字符:{snippet}")

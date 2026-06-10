@@ -5,7 +5,12 @@ import sys
 import tempfile
 import unittest
 
-from proto_vuln_hunt.backends import AgentRunner, _drain_process, _extract_opencode_text
+from proto_vuln_hunt.backends import (
+    AgentRunner,
+    _drain_process,
+    _extract_opencode_text,
+    extract_json,
+)
 from proto_vuln_hunt.config import BackendSpec, Config
 
 
@@ -127,6 +132,82 @@ class OpencodeEventParsingTests(unittest.TestCase):
         text, _usage, session_id = parsed
         self.assertEqual(text, "hello")
         self.assertEqual(session_id, "")
+
+
+class ExtractJsonReasoningTests(unittest.TestCase):
+    SCHEMA = {"type": "object", "properties": {"findings": {"type": "array"}}}
+
+    def test_strips_multiple_think_blocks_and_takes_final_json(self):
+        text = (
+            "<think>先读 a.c</think>\n"
+            "我去看了文件。\n"
+            "<think>再读 b.c,草拟 {\"findings\":[1,2,3]}</think>\n"
+            "```json {\"findings\":[]} ```"
+        )
+        self.assertEqual(extract_json(text, self.SCHEMA), {"findings": []})
+
+    def test_final_answer_wins_over_larger_earlier_draft(self):
+        # 草稿 JSON 在最后一个 </think> 之后(无 think 包裹),且体量更大 → 仍取最终答案(pos>size)
+        text = (
+            "</think>\n"
+            "```json\n{\"findings\":[{\"a\":1},{\"b\":2},{\"c\":3},{\"d\":4}]}\n```\n"
+            "最终结果:\n"
+            "```json\n{\"findings\":[]}\n```"
+        )
+        self.assertEqual(extract_json(text, self.SCHEMA), {"findings": []})
+
+    def test_inline_fenced_json_same_line(self):
+        self.assertEqual(
+            extract_json("```json {\"findings\":[]}```", self.SCHEMA),
+            {"findings": []},
+        )
+
+    def test_dangling_close_tag_then_json(self):
+        text = "先看看文件内容。</think>\n```json\n{\"findings\":[]}\n```"
+        self.assertEqual(extract_json(text, self.SCHEMA), {"findings": []})
+
+    def test_plain_fenced_json_without_think_unchanged(self):
+        text = "分析完毕。\n```json\n{\"findings\":[{\"id\":1}]}\n```"
+        self.assertEqual(extract_json(text, self.SCHEMA), {"findings": [{"id": 1}]})
+
+
+class DumpFailedOutputTests(unittest.TestCase):
+    def _runner(self, out_dir):
+        cfg = Config(
+            target=out_dir,
+            out_dir=out_dir,
+            backend="opencode",
+            models={"default": ["m"]},
+            backends={
+                "opencode": BackendSpec(
+                    name="opencode", command=["x"], prompt_mode="arg", parse="text"
+                )
+            },
+        )
+        cfg.health.enabled = False
+        return AgentRunner(cfg, logger=lambda *_a, **_k: None)
+
+    def test_writes_candidate_jsonload_file(self):
+        # <think> 思维链 + 一个语法坏掉的最终 ```json 块
+        text = "<think>草拟 {\"x\":1}</think>\n```json\n{\"findings\": [}\n```"
+        with tempfile.TemporaryDirectory() as d:
+            runner = self._runner(d)
+            path = runner._dump_failed_output("audit", "unit", "m", 1, text, dump_candidate=True)
+            self.assertTrue(path and os.path.exists(path))
+            with open(path, encoding="utf-8") as f:
+                self.assertIn("findings", f.read())  # 主文件保留重建正文
+
+            cand_path = path[:-len(".txt")] + ".jsonload.json"
+            self.assertTrue(os.path.exists(cand_path))
+            with open(cand_path, encoding="utf-8") as f:
+                # 纯候选串:已剥 <think>、已脱 ```json 围栏,正是 extract_json 喂给 json.loads 的那段
+                self.assertEqual(f.read(), "{\"findings\": [}")
+
+    def test_no_candidate_file_when_flag_off(self):
+        with tempfile.TemporaryDirectory() as d:
+            runner = self._runner(d)
+            path = runner._dump_failed_output("audit", "unit", "m", 1, "```json\n{}\n```")
+            self.assertFalse(os.path.exists(path[:-len(".txt")] + ".jsonload.json"))
 
 
 class ProcessDrainTests(unittest.IsolatedAsyncioTestCase):
