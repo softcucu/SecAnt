@@ -403,34 +403,87 @@ function viewDashboard(runId) {
     }
   }
 
+  function subtaskRow(t) {
+    const meta = [
+      (t.lenses || []).length ? (t.lenses || []).join("/") : "",
+      t.passes ? `${t.passes} 轮` : "",
+      t.candidates ? `候选 ${t.candidates}` : "",
+      t.risks ? `风险 ${t.risks}` : "",
+    ].filter(Boolean).join(" · ");
+    return el("div", { class: "subtask pri-" + cssKey(t.priority || "info") },
+      statusBadge(t.status),
+      el("span", { class: "sobj" }, t.name || "(未命名子任务)"),
+      el("span", { class: "smeta" }, meta));
+  }
+
   function renderCoverage() {
     const c = S.coverage;
-    if (!c) { tabBody.append(el("div", { class: "panel empty" }, "暂无覆盖数据。")); return; }
+    if (!c) { tabBody.append(el("div", { class: "panel empty" }, "暂无覆盖数据(运行开始后会出现攻击面审计进度与拆解的子任务)。")); return; }
     const p = c.progress || { done: 0, clean: 0, total: 0 };
     const pct = p.total ? Math.round(100 * p.done / p.total) : 0;
-    const prog = el("div", { class: "panel" },
+    tabBody.append(el("div", { class: "panel" },
       el("div", { class: "row", style: "justify-content:space-between" },
         el("strong", {}, `审计覆盖:${p.done}/${p.total} 工作项已完成(其中未发现漏洞 ${p.clean})`),
         el("span", { class: "muted" }, pct + "%")),
-      el("div", { class: "bar" }, el("span", { style: `width:${pct}%;background:var(--ok)` })));
-    tabBody.append(prog);
-    const tbl = el("table", {}, el("thead", {}, el("tr", {},
-      el("th", {}, "状态"), el("th", {}, "工作项"), el("th", {}, "类型"), el("th", {}, "轮"), el("th", {}, "lens"), el("th", {}, "候选"), el("th", {}, "新面"), el("th", {}, "风险"))));
-    const tb = el("tbody");
-    const order = { "completed-findings": 0, "in-progress": 1, "completed-clean": 2, "decomposed": 3, "incomplete": 1.5, "pending": 4 };
-    for (const r of [...(c.ledger || [])].sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9))) {
-      tb.append(el("tr", {}, el("td", {}, statusBadge(r.status)), el("td", {}, r.name || ""), el("td", {}, r.kind || ""),
-        el("td", {}, String(r.passes || 0)), el("td", {}, (r.lenses || []).join("/")), el("td", {}, String(r.candidates || 0)),
-        el("td", {}, String(r.surfaces || 0)), el("td", {}, String(r.risks || 0))));
+      el("div", { class: "bar" }, el("span", { style: `width:${pct}%;background:var(--ok)` }))));
+
+    const ledger = c.ledger || [];
+    const regionRecs = ledger.filter(r => r.kind === "region");
+    const tasks = ledger.filter(r => r.kind === "task");
+    const variants = ledger.filter(r => r.kind === "variant");
+    const tasksByRegion = new Map();
+    for (const t of tasks) {
+      const k = t.region || "(未归类子任务)";
+      if (!tasksByRegion.has(k)) tasksByRegion.set(k, []);
+      tasksByRegion.get(k).push(t);
     }
-    tbl.append(tb);
-    tabBody.append(el("div", { class: "panel" }, el("h3", {}, "审计覆盖台账"), tbl));
+
+    // 攻击面 × 拆解的子任务(region 卡片,内嵌子任务)
+    const regionNames = new Set(regionRecs.map(r => r.name));
+    if (regionRecs.length || tasks.length) {
+      tabBody.append(el("h3", { class: "section-title" }, "攻击面审计进度(区域 → 拆解的子任务)"));
+      for (const rg of regionRecs) {
+        const subs = tasksByRegion.get(rg.name) || [];
+        const card = el("div", { class: "region" },
+          el("div", { class: "region-head" },
+            rg.priority ? sevPill(PRI_PILL[rg.priority] || "info") : null,
+            el("span", { class: "rname" }, rg.name || ""),
+            rg.category ? el("span", { class: "tag" }, rg.category) : null,
+            statusBadge(rg.status),
+            el("span", { class: "rmeta" }, `${subs.length} 个子任务 · 候选 ${rg.candidates || 0} · 风险 ${rg.risks || 0}`)),
+          subs.length ? el("div", { class: "subtasks" }, ...subs.map(subtaskRow)) : null);
+        tabBody.append(card);
+      }
+      // 区域记录里没有的 region(兜底:子任务的 region 名不在 region 台账里)
+      for (const [rname, subs] of tasksByRegion) {
+        if (regionNames.has(rname)) continue;
+        tabBody.append(el("div", { class: "region" },
+          el("div", { class: "region-head" }, el("span", { class: "rname" }, rname),
+            el("span", { class: "rmeta" }, `${subs.length} 个子任务`)),
+          el("div", { class: "subtasks" }, ...subs.map(subtaskRow))));
+      }
+    }
+
+    // 历史模式排查(variant 工作项)
+    if (variants.length) {
+      tabBody.append(el("h3", { class: "section-title" }, "历史模式同类变体排查"));
+      const vt = el("table", {}, el("thead", {}, el("tr", {},
+        el("th", {}, "状态"), el("th", {}, "问题模式"), el("th", {}, "出处"), el("th", {}, "轮"), el("th", {}, "候选"))));
+      const vtb = el("tbody");
+      for (const v of variants) vtb.append(el("tr", {}, el("td", {}, statusBadge(v.status)), el("td", {}, v.name || ""),
+        el("td", {}, v.source || "—"), el("td", {}, String(v.passes || 0)), el("td", {}, String(v.candidates || 0))));
+      vt.append(vtb);
+      tabBody.append(el("div", { class: "panel" }, vt));
+    }
+
+    // 审计中动态新增的攻击面
     if ((c.surfaces || []).length) {
+      tabBody.append(el("h3", { class: "section-title" }, "审计中动态新增的攻击面"));
       const st = el("table", {}, el("thead", {}, el("tr", {}, el("th", {}, "轮"), el("th", {}, "动态新增攻击面"), el("th", {}, "来自"), el("th", {}, "为何可疑"))));
       const stb = el("tbody");
       for (const s of c.surfaces) stb.append(el("tr", {}, el("td", {}, "r" + (s.round || "?")), el("td", {}, s.name || ""), el("td", {}, s.from || ""), el("td", {}, s.why || "")));
       st.append(stb);
-      tabBody.append(el("div", { class: "panel" }, el("h3", {}, "审计中动态新增的攻击面"), st));
+      tabBody.append(el("div", { class: "panel" }, st));
     }
   }
   const STATUS_TXT = { "decomposed": "🧩 已拆解", "completed-clean": "✅ 未发现", "completed-findings": "⚠️ 有候选", "in-progress": "🔄 进行中", "incomplete": "⛔ 未审完", "pending": "⏳ 待审" };
@@ -446,17 +499,51 @@ function viewDashboard(runId) {
     tabBody.append(el("div", { class: "panel" }, tbl));
   }
 
+  const PRI_PILL = { high: "high", medium: "medium", low: "low" };
   function renderRecon() {
     const r = S.recon;
-    if (!r) { tabBody.append(el("div", { class: "panel empty" }, "侦察数据加载中…")); return; }
+    if (!r) { tabBody.append(el("div", { class: "panel empty" }, "侦察数据加载中…(运行开始后侦察 agent 会产出项目用途、攻击面地图与历史问题模式)")); return; }
     const sec = (t, b) => el("div", { class: "panel" }, el("h3", {}, t), el("div", { class: "md", html: mdToHtml(b || "(无)") }));
     tabBody.append(sec("项目用途", r.purpose), sec("威胁分析", r.threat_summary), sec("仓库知识", r.repo_knowledge));
-    if ((r.regions || []).length) {
-      const tbl = el("table", {}, el("thead", {}, el("tr", {}, el("th", {}, "优先级"), el("th", {}, "区域"), el("th", {}, "类别"), el("th", {}, "不可信输入"), el("th", {}, "文件"))));
+    if (r.build_hint) tabBody.append(sec("编译提示 build_hint", r.build_hint));
+
+    // 攻击面地图(recon 识别的初始攻击面区域)
+    const regions = r.regions || [];
+    if (regions.length) {
+      tabBody.append(el("h3", { class: "section-title" }, `攻击面地图 · ${regions.length} 个区域`));
+      for (const rg of [...regions].sort((a, b) => (({ high: 0, medium: 1, low: 2 })[a.priority] ?? 3) - (({ high: 0, medium: 1, low: 2 })[b.priority] ?? 3))) {
+        const card = el("div", { class: "region" },
+          el("div", { class: "region-head" },
+            sevPill(PRI_PILL[rg.priority] || "info"),
+            el("span", { class: "rname" }, rg.name || "(未命名)"),
+            el("span", { class: "tag" }, rg.category || "other"),
+            rg.trust_boundary ? el("span", { class: "rmeta" }, "信任边界:" + rg.trust_boundary) : null),
+          rg.untrusted_input ? el("div", { class: "region-why" }, el("strong", {}, "不可信输入:"), " " + rg.untrusted_input) : null,
+          (rg.entry_points || []).length ? el("div", { class: "region-why" }, el("strong", {}, "入口:"), " " + rg.entry_points.join(", ")) : null,
+          (rg.crypto_apis || []).length ? el("div", { class: "region-why" }, el("strong", {}, "crypto API:"), " " + rg.crypto_apis.join(", ")) : null,
+          (rg.files || []).length ? el("div", { class: "region-files" }, (rg.files || []).join("  ·  ")) : null);
+        tabBody.append(card);
+      }
+    } else {
+      tabBody.append(el("div", { class: "panel empty" }, "尚无攻击面区域(侦察未完成或失败)。"));
+    }
+
+    // 历史问题模式(同类变体排查种子)
+    const hist = r.history || [];
+    tabBody.append(el("h3", { class: "section-title" }, `历史问题模式 · ${hist.length} 条`));
+    if (hist.length) {
+      const tbl = el("table", {}, el("thead", {}, el("tr", {}, el("th", {}, "lens"), el("th", {}, "问题模式"), el("th", {}, "出处"), el("th", {}, "相关文件"))));
       const tb = el("tbody");
-      for (const rg of r.regions) tb.append(el("tr", {}, el("td", {}, sevPill(({ high: "high", medium: "medium", low: "low" })[rg.priority] || "info")), el("td", {}, rg.name || ""), el("td", {}, rg.category || ""), el("td", {}, rg.untrusted_input || ""), el("td", { class: "loc" }, (rg.files || []).join(", "))));
+      for (const h of hist) tb.append(el("tr", {},
+        el("td", {}, el("span", { class: "tag" }, h.lens_hint || "—")),
+        el("td", {}, h.pattern || ""),
+        el("td", {}, h.source || "—"),
+        el("td", { class: "loc" }, (h.files || []).join(", ") || "—")));
       tbl.append(tb);
-      tabBody.append(el("div", { class: "panel" }, el("h3", {}, "攻击面地图"), tbl));
+      tabBody.append(el("div", { class: "panel" }, tbl,
+        el("p", { class: "muted", style: "margin:8px 0 0" }, "每条历史模式会作为「同类变体排查」种子,派 agent 在全仓搜索同类代码模式。")));
+    } else {
+      tabBody.append(el("div", { class: "panel empty" }, "未提取到历史问题模式。"));
     }
   }
 
@@ -528,7 +615,7 @@ function viewDashboard(runId) {
         renderHeader(); renderTabs(); if (activeTab === "findings") renderTab(); break;
       case "risk_added": { const k = (d.area || "") + "::" + (d.file || ""); S.risks.set(k, d); renderHeader(); renderTabs(); if (activeTab === "risks") renderTab(); break; }
       case "surface_added": case "coverage_update":
-        if (ev.type === "coverage_update") S.coverage = d;
+        if (ev.type === "coverage_update") S.coverage = Object.assign({}, S.coverage, d);
         if (activeTab === "coverage") renderTab(); break;
       case "round_start": S.round = d.round; renderHeader(); break;
       case "round_done": S.round = d.round; S.dry = d.dry_streak; renderHeader(); break;
@@ -541,12 +628,14 @@ function viewDashboard(runId) {
     }
   }
   async function fetchRecon() { try { S.recon = await api("GET", `/api/runs/${encodeURIComponent(runId)}/recon`); if (activeTab === "recon") renderTab(); } catch (e) {} }
+  async function fetchCoverage() { try { const c = await api("GET", `/api/runs/${encodeURIComponent(runId)}/coverage`); if (c) { S.coverage = Object.assign({}, S.coverage, c); if (activeTab === "coverage") renderTab(); } } catch (e) {} }
+  async function fetchRisks() { try { const list = await api("GET", `/api/runs/${encodeURIComponent(runId)}/risks`); for (const r of (list || [])) { const k = (r.area || "") + "::" + (r.file || ""); if (!S.risks.has(k)) S.risks.set(k, r); } renderHeader(); renderTabs(); if (activeTab === "risks") renderTab(); } catch (e) {} }
   async function fetchHealth() { try { const h = await api("GET", `/api/runs/${encodeURIComponent(runId)}/health`); for (const r of (h.models || [])) if (r.model) S.health.set(r.model, r); renderTabs(); if (activeTab === "health") renderTab(); } catch (e) {} }
 
   async function boot() {
     try { S.manifest = await api("GET", `/api/runs/${encodeURIComponent(runId)}`); S.status = S.manifest.running ? "running" : S.manifest.status; } catch (e) {}
     renderHeader(); renderTabs(); renderTab();
-    fetchRecon(); fetchHealth();
+    fetchRecon(); fetchHealth(); fetchCoverage(); fetchRisks();
     // SSE:从 seq 0 重放历史事件(重建 findings/coverage/risks/log)再接实时;EventSource 断线自动带 Last-Event-ID 续传
     const es = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events`);
     window._es = es;

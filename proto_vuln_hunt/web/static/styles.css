@@ -13,7 +13,8 @@ a:hover{text-decoration:underline}
 .topbar{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:10}
 .brand{font-weight:600;font-size:16px}
 .topbar nav a{margin-left:18px;color:var(--text)}
-main{padding:20px;max-width:1200px;margin:0 auto}
+main{padding:20px clamp(20px,4vw,56px);max-width:1760px;margin:0 auto;width:100%}
+.topbar{padding-left:clamp(20px,4vw,56px);padding-right:clamp(20px,4vw,56px)}
 
 .btn{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:8px 14px;cursor:pointer;font-size:14px}
 .btn:hover{background:var(--accent2)}
@@ -85,5 +86,20 @@ input[type=text],input[type=number],select,textarea{width:100%;background:var(--
 .cols{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 @media(max-width:760px){.cols{grid-template-columns:1fr}}
 .empty{color:var(--muted);padding:20px;text-align:center}
+
+/* 攻击面区域卡片 + 子任务嵌套 */
+.region{border:1px solid var(--border);border-radius:8px;margin-bottom:10px;overflow:hidden;background:var(--panel)}
+.region-head{display:flex;gap:10px;align-items:center;padding:10px 12px;background:var(--panel2);flex-wrap:wrap}
+.region-head .rname{font-weight:600}
+.region-head .rmeta{color:var(--muted);font-size:12px}
+.region-files{color:var(--muted);font-family:ui-monospace,Menlo,monospace;font-size:12px;padding:6px 12px;border-top:1px solid var(--border);word-break:break-all}
+.region-why{padding:6px 12px;font-size:13px}
+.subtasks{padding:4px 12px 10px}
+.subtask{display:flex;gap:10px;align-items:baseline;padding:6px 8px;border-left:2px solid var(--border);margin:4px 0 4px 8px}
+.subtask .sobj{flex:1}
+.subtask .smeta{color:var(--muted);font-size:12px;font-family:ui-monospace,Menlo,monospace}
+.pri-high{border-left-color:var(--high)} .pri-medium{border-left-color:var(--med)} .pri-low{border-left-color:var(--low)}
+.tag{display:inline-block;padding:1px 7px;border-radius:5px;font-size:11px;background:var(--panel2);border:1px solid var(--border);color:var(--muted)}
+.section-title{margin:18px 0 8px;font-size:15px}
 .flash{position:fixed;right:16px;bottom:16px;background:var(--panel2);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:6px;padding:10px 14px;box-shadow:0 4px 14px rgba(0,0,0,.4);animation:fade 4s forwards}
 @keyframes fade{0%{opacity:0;transform:translateY(8px)}10%{opacity:1;transform:none}80%{opacity:1}100%{opacity:0}}

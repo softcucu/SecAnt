@@ -150,6 +150,9 @@ class Pipeline:
         if not r:
             r = {"key": k, "kind": item.get("kind"),
                  "name": item.get("name") or item.get("objective") or item.get("pattern") or "",
+                 "region": item.get("region") or (item.get("name") if item.get("kind") == "region" else ""),
+                 "category": item.get("category") or "", "priority": item.get("priority") or "",
+                 "source": item.get("source") or "",
                  "lenses": [], "passes": 0, "candidates": 0, "surfaces": 0, "risks": 0,
                  "lastRound": 0, "status": "pending"}
             self.ledger_map[k] = r
@@ -210,7 +213,7 @@ class Pipeline:
         n_done = sum(1 for r in self.ledger_arr if str(r.get("status")).startswith("completed"))
         n_clean = sum(1 for r in self.ledger_arr if r.get("status") == "completed-clean")
         self.emit(EV.COVERAGE_UPDATE, {
-            "ledger": self.ledger_arr, "surfaces": self.surface_log,
+            "ledger": self.ledger_arr, "surfaces": self.surface_log, "regions": self.regions,
             "progress": {"done": n_done, "clean": n_clean, "total": len(self.ledger_arr)},
         })
 
