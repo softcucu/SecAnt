@@ -177,7 +177,7 @@ class DumpFailedOutputTests(unittest.TestCase):
             target=out_dir,
             out_dir=out_dir,
             backend="opencode",
-            models={"default": ["m"]},
+            models={"audit": ["m"]},
             backends={
                 "opencode": BackendSpec(
                     name="opencode", command=["x"], prompt_mode="arg", parse="text"
@@ -272,7 +272,7 @@ class ProcessDrainTests(unittest.IsolatedAsyncioTestCase):
                 target=d,
                 out_dir=os.path.join(d, "out"),
                 backend="dummy",
-                models={"default": ["unit-model"]},
+                models={"audit": ["unit-model"]},
                 backends={
                     "dummy": BackendSpec(
                         name="dummy",
@@ -315,7 +315,7 @@ class ProcessDrainTests(unittest.IsolatedAsyncioTestCase):
                 target=d,
                 out_dir=os.path.join(d, "out"),
                 backend="dummy",
-                models={"default": ["unit-model"]},
+                models={"recon": ["unit-model"]},
                 backends={
                     "dummy": BackendSpec(
                         name="dummy",

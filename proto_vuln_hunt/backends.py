@@ -595,8 +595,10 @@ async def _drain_process(
                     pass
             except (BrokenPipeError, ConnectionResetError):
                 pass
-        await proc.wait()
-        return await asyncio.gather(out_task, err_task)
+        out_b, err_b = await asyncio.gather(out_task, err_task)
+        if proc.returncode is None:
+            await proc.wait()
+        return out_b, err_b
 
     try:
         return await asyncio.wait_for(run(), timeout=timeout_s)
@@ -613,19 +615,6 @@ async def _drain_process(
             if not task.done():
                 task.cancel()
         raise
-
-
-class _NullAsyncCtx:
-    """空的 async 上下文(无并发门);用于 use_global_gate=False 时跳过全局信号量。
-    无状态、可复用单例,兼容 py3.8(不依赖 contextlib.nullcontext 的 async 支持)。"""
-    async def __aenter__(self):
-        return None
-
-    async def __aexit__(self, *exc):
-        return False
-
-
-_NULL_ASYNC_CTX = _NullAsyncCtx()
 
 
 class AgentRunner:
@@ -656,6 +645,7 @@ class AgentRunner:
         self._jitter = 0
         self._model_cursor: Dict[str, int] = {}
         self._model_sems: Dict[str, asyncio.Semaphore] = {}
+        self._capacity_wait_s = 0.05
 
     def _emit_agent(self, rec: Dict[str, Any]) -> None:
         if not self.agent_sink:
@@ -676,9 +666,13 @@ class AgentRunner:
             self._model_sems[model] = asyncio.Semaphore(self.cfg.model_concurrency_for(model))
         return self._model_sems[model]
 
+    @staticmethod
+    def _sem_capacity(sem: asyncio.Semaphore) -> int:
+        return int(getattr(sem, "_value", 0) or 0)
+
     async def reserve_slots(self, n: int) -> int:
-        """从**全局并发池**预占 n 个名额并一直持有(用于给独立阶段如 git 历史挖掘留出专属额度:
-        被持有的名额计入总并发,主流程因此只剩 总-n 可用;该阶段结束后用 release_slots 归还,主流程回满)。
+        """从**全局并发池**预占 n 个名额并一直持有(兼容旧的专用通道实现):
+        被持有的名额计入总并发;该通道结束后用 release_slots 归还。
         取消安全:获取途中被取消会先归还已拿到的,再抛出。返回实际占到的名额数。"""
         if n <= 0:
             return 0
@@ -710,6 +704,89 @@ class AgentRunner:
         i = self._model_cursor.get(role, 0)
         self._model_cursor[role] = i + 1
         return models[i % len(models)]
+
+    def _ready_model(self, role: str, *, advance: bool) -> str:
+        """按加权轮换顺序选择一个当前有空闲 per-model 名额的模型。
+
+        这里使用 semaphore 的即时容量做调度提示;真正执行前仍会 acquire,因此即使容量在
+        同一事件循环 tick 内变化也不会越过并发上限。
+        """
+        models = self.cfg.model_slots_for(role)
+        if not models:
+            return ""
+        start = self._model_cursor.get(role, 0)
+        for off in range(len(models)):
+            idx = (start + off) % len(models)
+            model = models[idx]
+            if self._sem_capacity(self._model_semaphore(model)) > 0:
+                if advance:
+                    self._model_cursor[role] = idx + 1
+                return model
+        return ""
+
+    def role_has_capacity(self, role: str, *, use_global_gate: bool = True) -> bool:
+        """供上层优先级调度器做非阻塞容量判断。
+
+        返回 False 只表示"此刻没有可立即启动的容量";调用方可以先调度队列中更靠后的
+        其它 role,避免某个模型满载时把全局 worker 卡住。
+        """
+        if use_global_gate and self._sem_capacity(self._semaphore()) <= 0:
+            return False
+        return bool(self._ready_model(role, advance=False))
+
+    def role_capacity_limit(self, role: str) -> int:
+        """该 role 理论上可同时启动的模型槽数,用于上层避免同一调度 tick 过量派发。"""
+        slots = self.cfg.model_slots_for(role)
+        if not slots:
+            return self.cfg.concurrency
+        return max(1, min(self.cfg.concurrency, len(slots)))
+
+    async def _wait_capacity_tick(self, should_stop: Optional[Callable[[], bool]]) -> bool:
+        if should_stop is not None and should_stop():
+            return False
+        await asyncio.sleep(self._capacity_wait_s)
+        return should_stop is None or not should_stop()
+
+    async def _acquire_run_capacity(
+        self,
+        role: str,
+        *,
+        use_global_gate: bool,
+        should_stop: Optional[Callable[[], bool]],
+    ) -> tuple[str, bool]:
+        """同时取得全局名额和一个可用模型名额。
+
+        关键点是不会在持有全局名额时等待某个已满的模型:如果当前 role 没有任何模型空位,
+        会立即释放刚拿到的全局名额,让其它可运行任务继续推进。
+        """
+        while True:
+            if should_stop is not None and should_stop():
+                return "", False
+            acquired_global = False
+            global_sem = self._semaphore()
+            if use_global_gate:
+                if self._sem_capacity(global_sem) <= 0:
+                    if not await self._wait_capacity_tick(should_stop):
+                        return "", False
+                    continue
+                await global_sem.acquire()
+                acquired_global = True
+
+            model = self._ready_model(role, advance=True)
+            if model:
+                await self._model_semaphore(model).acquire()
+                return model, acquired_global
+
+            if acquired_global:
+                global_sem.release()
+            if not await self._wait_capacity_tick(should_stop):
+                return "", False
+
+    def _release_run_capacity(self, model: str, acquired_global: bool) -> None:
+        if model:
+            self._model_semaphore(model).release()
+        if acquired_global:
+            self._semaphore().release()
 
     def _write_prompt_file(self, prompt: str) -> str:
         prompt_dir = os.path.join(self.cfg.out_dir, "prompts")
@@ -1036,8 +1113,7 @@ class AgentRunner:
         失败重试上限取 `retries`(未传则用 cfg.retry.max_attempts);耗尽后返回 fallback(跳过,靠续跑挽回)。
         retry_forever=True 时忽略重试上限,一直重试到成功或 should_stop() 变真。
         use_global_gate=False:本次调用不再去抢全局 concurrency 名额(仅受 per-model 信号量约束)。
-        仅供已通过 reserve_slots 预占好全局名额的独立阶段(如 git 历史挖掘)使用——名额已被预占持有、
-        计入总并发,故这里直接复用、不重复申请;该阶段结束 release_slots 后名额归还,主流程回满。
+        仅供已通过 reserve_slots 预占好全局名额的兼容通道使用,避免重复申请全局名额。
         """
         tag = label or role
         run_cwd = cwd or os.path.abspath(os.path.expanduser(self.cfg.target))
@@ -1059,6 +1135,16 @@ class AgentRunner:
             self._emit_agent(rec)
 
         emit_agent("queued", prompt_chars=len(prompt or ""), schema=bool(schema))
+        if not self.cfg.model_slots_for(role):
+            msg = f"角色 {role} 未配置可用模型"
+            self.log(f"⚠ {tag} CLI 任务无法启动: {msg}")
+            emit_agent(
+                "failed",
+                attempt=0,
+                duration_ms=int((time.time() - agent_started) * 1000),
+                error=msg,
+            )
+            return fallback
 
         async def retry_sleep(wait_ms: int) -> bool:
             if should_stop is None:
@@ -1085,64 +1171,90 @@ class AgentRunner:
                     error=msg,
                 )
                 return fallback
-            model = self._next_model(role)
-            await self.ensure_healthy(model)   # gate:调用前按需补一次健康探针(ttl 去重,不阻断)
-            global_gate = self._semaphore() if use_global_gate else _NULL_ASYNC_CTX
-            async with self._model_semaphore(model):
-                async with global_gate:
-                    attempt_no = attempt + 1
-                    attempt_started = time.time()
-                    emit_agent("running", model=model, attempt=attempt_no)
+            health_model = self._ready_model(role, advance=False)
+            while not health_model:
+                if not await self._wait_capacity_tick(should_stop):
+                    msg = "用户请求停止"
+                    self.log(f"⚠ {tag} CLI 任务停止等待模型容量: {msg}")
+                    emit_agent(
+                        "failed",
+                        attempt=attempt,
+                        duration_ms=int((time.time() - agent_started) * 1000),
+                        error=msg,
+                    )
+                    return fallback
+                health_model = self._ready_model(role, advance=False)
+            await self.ensure_healthy(health_model)   # gate:调用前按需补一次健康探针(ttl 去重,不阻断)
+            model, acquired_global = await self._acquire_run_capacity(
+                role,
+                use_global_gate=use_global_gate,
+                should_stop=should_stop,
+            )
+            if not model:
+                msg = "用户请求停止"
+                self.log(f"⚠ {tag} CLI 任务停止等待并发容量: {msg}")
+                emit_agent(
+                    "failed",
+                    attempt=attempt,
+                    duration_ms=int((time.time() - agent_started) * 1000),
+                    error=msg,
+                )
+                return fallback
+            attempt_no = attempt + 1
+            attempt_started = time.time()
+            emit_agent("running", model=model, attempt=attempt_no)
 
-                    def on_output(stream: str, chunk: str) -> None:
-                        emit_agent("output", model=model, attempt=attempt_no, stream=stream, chunk=chunk)
+            def on_output(stream: str, chunk: str) -> None:
+                emit_agent("output", model=model, attempt=attempt_no, stream=stream, chunk=chunk)
 
-                    try:
-                        text, usage = await self._invoke(prompt, model, run_cwd, on_output=on_output)
-                        self._record_usage(prompt, text, role=role, label=tag, model=model,
-                                           attempt=attempt_no, backend_usage=usage)
-                        self._note_call(model, True)
-                        if schema is None:
-                            emit_agent(
-                                "done",
-                                model=model,
-                                attempt=attempt_no,
-                                duration_ms=int((time.time() - agent_started) * 1000),
-                                attempt_ms=int((time.time() - attempt_started) * 1000),
-                                output_chars=len(text or ""),
-                            )
-                            return text
-                        parsed = extract_json(text, schema)
-                        if parsed is None:
-                            path = self._dump_failed_output(role, tag, model, attempt_no, text,
-                                                            dump_candidate=True)
-                            snippet = " ".join((text or "").split())[:240]
-                            self.log(f"⚠ {tag} 后端输出无可解析 JSON(共 {len(text or '')} 字符)"
-                                     f"{(';原始输出已存 ' + path) if path else ''};前 240 字符:{snippet}")
-                            raise RuntimeError("CLI 未产出可解析的结构化 JSON(原始输出已存到 run 目录 debug/)")
-                        emit_agent(
-                            "done",
-                            model=model,
-                            attempt=attempt_no,
-                            duration_ms=int((time.time() - agent_started) * 1000),
-                            attempt_ms=int((time.time() - attempt_started) * 1000),
-                            output_chars=len(text or ""),
-                        )
-                        return parsed
-                    except Exception as e:  # noqa: BLE001
-                        msg = str(e)
-                        if isinstance(e, BackendOutputError) and e.output:
-                            path = self._dump_failed_output(role, tag, model, attempt_no, e.output)
-                            if path:
-                                msg = f"{msg}(完整 stdout 已存 {path})"
-                        self._note_call(model, False, msg)
-                        emit_agent(
-                            "failed_attempt",
-                            model=model,
-                            attempt=attempt_no,
-                            attempt_ms=int((time.time() - attempt_started) * 1000),
-                            error=msg[:500],
-                        )
+            try:
+                text, usage = await self._invoke(prompt, model, run_cwd, on_output=on_output)
+                self._record_usage(prompt, text, role=role, label=tag, model=model,
+                                   attempt=attempt_no, backend_usage=usage)
+                self._note_call(model, True)
+                if schema is None:
+                    emit_agent(
+                        "done",
+                        model=model,
+                        attempt=attempt_no,
+                        duration_ms=int((time.time() - agent_started) * 1000),
+                        attempt_ms=int((time.time() - attempt_started) * 1000),
+                        output_chars=len(text or ""),
+                    )
+                    return text
+                parsed = extract_json(text, schema)
+                if parsed is None:
+                    path = self._dump_failed_output(role, tag, model, attempt_no, text,
+                                                    dump_candidate=True)
+                    snippet = " ".join((text or "").split())[:240]
+                    self.log(f"⚠ {tag} 后端输出无可解析 JSON(共 {len(text or '')} 字符)"
+                             f"{(';原始输出已存 ' + path) if path else ''};前 240 字符:{snippet}")
+                    raise RuntimeError("CLI 未产出可解析的结构化 JSON(原始输出已存到 run 目录 debug/)")
+                emit_agent(
+                    "done",
+                    model=model,
+                    attempt=attempt_no,
+                    duration_ms=int((time.time() - agent_started) * 1000),
+                    attempt_ms=int((time.time() - attempt_started) * 1000),
+                    output_chars=len(text or ""),
+                )
+                return parsed
+            except Exception as e:  # noqa: BLE001
+                msg = str(e)
+                if isinstance(e, BackendOutputError) and e.output:
+                    path = self._dump_failed_output(role, tag, model, attempt_no, e.output)
+                    if path:
+                        msg = f"{msg}(完整 stdout 已存 {path})"
+                self._note_call(model, False, msg)
+                emit_agent(
+                    "failed_attempt",
+                    model=model,
+                    attempt=attempt_no,
+                    attempt_ms=int((time.time() - attempt_started) * 1000),
+                    error=msg[:500],
+                )
+            finally:
+                self._release_run_capacity(model, acquired_global)
             # 退避/重试在信号量之外等待(不占用并发额度)
             attempt += 1
             if (not retry_forever) and attempt > max_attempts:

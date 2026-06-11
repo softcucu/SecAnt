@@ -7,23 +7,24 @@
 # 可选内置:claude | opencode | codex(也可在下方 backends: 里自定义/覆盖调用方式)
 backend: claude
 
-# ── 模型:按阶段(role)分别指定;缺省回落到 default ──
-# role 取值:recon / decompose / audit / verify / report / poc / synthesis / util
+# ── 模型:按阶段(role)分别指定;不再支持 models.default 回落 ──
+# 当前会运行的 role 必须显式配置。常用 role:recon / history / recheck / decompose / audit / verify / report / poc
 # 每个 role 可写单个模型,也可写模型列表;列表会按 agent 调用轮换使用。
 # 注意:
 #   · claude   模型名形如  claude-opus-4-8 / claude-sonnet-4-6 / claude-haiku-4-5-20251001
 #   · opencode 模型名形如  provider/model,如 anthropic/claude-sonnet-4-6、openai/gpt-5
 #   · codex    模型名形如  gpt-5-codex / o3 等
 models:
-  default: claude-sonnet-4-6
   recon: claude-opus-4-8        # 侦察/威胁建模用更强的模型
-  history: claude-sonnet-4-6    # git 历史问题模式挖掘(每条提交一个 agent;独立于侦察、与主流程并行)
-  recheck: claude-sonnet-4-6    # 专用优先排查 agent(历史变体 + 风险点复查;独立优先队列、默认并发 1)
+  history: claude-sonnet-4-6    # git 历史问题模式挖掘(每条提交一个 agent;与 high audit finder 同级调度)
+  recheck: claude-sonnet-4-6    # 专用优先排查 agent(历史变体 + 风险点复查;最高优先级、默认并发 1)
+  decompose: claude-sonnet-4-6  # region 拆解
   audit:                         # 审计 finder 可用多模型轮换,分散容量/视角
     - claude-sonnet-4-6
     - claude-opus-4-8
   verify: claude-sonnet-4-6     # 对抗验证
-  synthesis: claude-sonnet-4-6
+  report: claude-sonnet-4-6     # 确认漏洞报告正文
+  poc: claude-sonnet-4-6        # 高危 PoC/harness 尝试(enable_poc=true 时需要)
 
 # ── 并发 ──
 # concurrency 是全局 agent 上限;model_concurrency 是单个模型自己的上限。
@@ -48,16 +49,15 @@ params:
   max_subtasks_per_region: 16
   max_files_per_unit: 4
 
-# ── git 历史问题模式挖掘(独立阶段,run 一开始即启动,与健康检查/侦察/拆解/审计并行) ──
+# ── git 历史问题模式挖掘(统一调度队列中与 high audit finder 同级) ──
 # 从侦察中抽离:遍历 git log 的提交,**每条提交派 1 个 agent**(role=history)读其改动,
 # 判定是否安全修复;相关者提炼成「历史问题模式」,随挖随补回灌到 Web「历史问题」页签与审计队列(同类变体排查种子)。
-# 这一块不阻塞后续阶段;断点续跑时会先恢复 historyDone,避免重复分析已处理提交。
-# 并发模型:从**总并发池**预占 concurrency 个名额(计入总并发,主流程因此暂用 总-预占),
-# 始终给历史挖掘留出能用的额度;待全部提交分析完毕,预占的名额**归还**,主流程回满。
+# 这一块不阻塞侦察和审计;健康检查后即与 recon 同时启动,并与 high audit finder 按同一优先级参与统一排队。
+# 断点续跑时会先恢复 historyDone,避免重复分析已处理提交。
 history:
   enabled: true                 # 总开关(非 git 仓自动跳过)
   max_commits: 200              # 最多分析多少条最近提交(0 = 不限)
-  concurrency: 1                # 预占的并发名额(默认 1:留 1 个名额逐条处理提交;计入总并发,至少给主流程留 1)
+  concurrency: 1                # 兼容旧配置;统一调度下实际并发由全局 concurrency + role/model 容量决定
   # since: "1 year ago"         # 可选:只看某时间段的提交(git log --since)
   # paths: "src lib"            # 可选:限定 git log 路径(留空则用 scope;空格分隔多个)
   poll_interval_s: 3            # 审计循环等待历史变体灌入的轮询间隔(秒)

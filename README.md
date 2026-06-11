@@ -86,12 +86,15 @@ python -m proto_vuln_hunt run --config my.yaml --target /repo --scope src/x.c \
 ```yaml
 backend: claude                       # claude | opencode | codex
 
-models:                               # 按 role 配模型,缺省回落到 default;列表会轮换使用
-  default: claude-sonnet-4-6
-  recon:   claude-opus-4-8            # role: recon/history/decompose/audit/verify/report/poc/synthesis/util
-  history: claude-sonnet-4-6          # git 历史问题模式挖掘(每条提交一个 agent,与主流程并行)
+models:                               # 按 role 显式配模型;不支持 models.default 回落;列表会轮换使用
+  recon:   claude-opus-4-8            # 常用 role: recon/history/recheck/decompose/audit/verify/report/poc
+  history: claude-sonnet-4-6          # git 历史问题模式挖掘(每条提交一个 agent,与 high audit finder 同级调度)
+  recheck: claude-sonnet-4-6
+  decompose: claude-sonnet-4-6
   audit:   [claude-sonnet-4-6, claude-opus-4-8]
   verify:  claude-sonnet-4-6
+  report:  claude-sonnet-4-6
+  poc:     claude-sonnet-4-6
 
 concurrency: 4                        # 全局同时运行的 agent 上限
 model_concurrency:                    # 单个模型自己的并发上限;未列出则默认等于全局 concurrency
@@ -122,8 +125,9 @@ backends:                             # (可选)自定义任意 CLI 的调用方
     parse: text
 ```
 
-**模型配置**:每个 role 可写字符串或列表。字符串里也可以用逗号分隔多个模型,例如
-`--model gpt-5-codex,o3` 或 `audit: "anthropic/a,openai/b"`。同一 role 下的 agent 调用会按
+**模型配置**:每个会运行的 role 必须显式配置模型,不再从 `models.default` 回落。每个 role 可写字符串或列表。
+字符串里也可以用逗号分隔多个模型,例如 `--model gpt-5-codex,o3` 会把同一组模型展开到当前会运行的所有 role,
+或写 `audit: "anthropic/a,openai/b"`。同一 role 下的 agent 调用会按
 `model_concurrency` 加权轮换模型,并由每个模型自己的 semaphore 强制限流。
 
 **自定义后端**:`command` 是 token 列表,运行时把 `{model}` 替换为当前角色模型、`{prompt}` 替换为提示词
@@ -166,13 +170,13 @@ REST/SSE 接口(`serve` 时):`/api/runs`(GET/POST)、`/api/runs/{id}`、`/stop`�
 
 ## 工作流程(对齐原 workflow)
 
-1. **Recon** — 读仓库知识 → 项目用途 + 威胁分析(列表)+ 攻击面地图 + build_hint(或从断点恢复)。**不再**在此读 git 历史。
-   - **History(并行)** — run 一开始即启动、与健康检查/侦察/拆解/审计**并行**的独立阶段:遍历 `git log`,**每条提交派 1 个 agent**(role=`history`)判定是否安全修复;相关者提炼成「历史问题模式」随挖随补,回灌 Web「历史问题」页签与审计队列(同类变体排查种子)。**不阻塞**后续阶段。并发上:从**总并发池**预占 `history.concurrency` 个名额(计入总并发,主流程暂用 `总-预占`,至少给主流程留 1),挖掘**全部结束后归还**,主流程回满;配置见 `config.example.yaml` 的 `history:` 块。
-2. **Decompose** — 把每个大 region 拆成有界子任务(每个 agent 代码量可控)。
-3. **Audit** — 工作队列 loop-until-dry:每攻击面 × lens × N finder;动态回灌新攻击面;每轮存断点。
-4. **Verify** — 逐发现 `verify_votes` 票多视角对抗反驳,多数否决即杀。
-5. **Report** — 每条存活漏洞立即生成 7 段式正文,作为结构化记录进 state + 发 `finding_confirmed` 事件(SSE 流式呈现)。
-6. **PoC**(可选) — 高危项在隔离 git worktree 副本里尝试最小化编译触发(非 git/编不动则降级静态 PoC)。
+1. **Recon + History** — 健康检查后同时启动:recon 读仓库知识 → 项目用途 + 威胁分析(列表)+ 攻击面地图 + build_hint(或从断点恢复);history 遍历 `git log`,每条提交派 1 个 agent(role=`history`)判定是否安全修复。recon 本身**不再**读 git 历史。
+2. **Unified Scheduler** — history commit 分析从启动起就在统一优先级队列里,与 high audit finder 同级;recheck 最高优先级;候选验证/报告流水线高于普通审计;decompose 低于已拆出的 audit,因此一个 region 拆完即可开审,不必等待全部 region 拆完。相同优先级按入队时间 FIFO。若队首任务所需模型容量不可用,调度器会扫描后续任务并先启动有可用模型的任务,避免模型空闲。
+3. **History Feedback** — history 提炼出的「历史问题模式」随挖随补,回灌 Web「历史问题」页签与 recheck 同类变体排查队列。
+4. **Audit** — 工作队列 loop-until-dry:每攻击面 × lens × N finder;动态回灌新攻击面;每个审计项完成即存断点。
+5. **Verify** — 逐发现 `verify_votes` 票多视角对抗反驳,多数否决即杀。
+6. **Report** — 每条存活漏洞立即生成 7 段式正文,作为结构化记录进 state + 发 `finding_confirmed` 事件(SSE 流式呈现)。
+7. **PoC**(可选) — 高危项在隔离 git worktree 副本里尝试最小化编译触发(非 git/编不动则降级静态 PoC)。
 7. **Synthesis** — 去重 + 写汇总到 `run.json`/`state.json` + 发 `run_done`(MD/SARIF 留待导出时渲染)。
 
 ---

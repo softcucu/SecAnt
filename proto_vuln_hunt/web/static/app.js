@@ -176,7 +176,8 @@ async function viewNew() {
   const tmSel = el("select", { id: "threat_model" }, ...["REMOTE", "LOCAL_UNPRIVILEGED", "BOTH"].map(t => el("option", { value: t, selected: t === d.threat_model ? "" : null }, t)));
   const lensChecks = el("div", { class: "checks" }, ...meta.lenses.map(l =>
     el("label", {}, el("input", { type: "checkbox", value: l, class: "lens", checked: (d.lenses || []).includes(l) ? "" : null }), l)));
-  const modelRows = el("div", { class: "grid" }, ...["default", ...meta.roles].map(role =>
+  const modelRoles = meta.roles.filter(role => role !== "synthesis" && role !== "util");
+  const modelRows = el("div", { class: "grid" }, ...modelRoles.map(role =>
     f("模型 · " + role, inp("model_" + role, modelText((d.models || {})[role]), "text"))));
 
   const left = el("div", {},
@@ -196,7 +197,7 @@ async function viewNew() {
       el("label", {}, el("input", { type: "checkbox", id: "enable_poc", checked: d.enable_poc ? "" : null }), "启用 PoC"),
       el("label", {}, el("input", { type: "checkbox", id: "decompose", checked: d.decompose ? "" : null }), "区域拆解")),
     el("div", { class: "panel", style: "padding:10px" },
-      el("div", { class: "muted", style: "margin-bottom:6px" }, "每角色模型(留空=用 default)"),
+      el("div", { class: "muted", style: "margin-bottom:6px" }, "每角色模型(运行中的角色必须填写)"),
       modelRows,
       f("模型并发 model=limit", inp("model_concurrency", kvText(d.model_concurrency), "text"))),
   );
@@ -206,7 +207,7 @@ async function viewNew() {
     const target = document.getElementById("target").value.trim();
     if (!target) { flash("请填写目标目录"); return; }
     const models = {};
-    for (const role of ["default", ...meta.roles]) {
+    for (const role of modelRoles) {
       const vals = splitModels(document.getElementById("model_" + role).value);
       if (vals.length) models[role] = vals;
     }

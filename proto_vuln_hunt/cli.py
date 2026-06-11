@@ -23,7 +23,7 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--out-dir", dest="out_dir", help="run 目录(产物/断点);默认 <target>/.proto-vuln-hunt")
     p.add_argument("--backend", choices=["claude", "opencode", "codex"], help="后端 CLI(覆盖配置)")
     p.add_argument("--concurrency", type=int, help="同时运行的 agent 上限")
-    p.add_argument("--model", help="所有角色统一使用的默认模型(覆盖 models.default;多个模型可用逗号分隔)")
+    p.add_argument("--model", help="为所有会运行的任务 role 显式设置同一组模型(多个模型可用逗号分隔)")
     p.add_argument("--model-concurrency", dest="model_concurrency", help="每个模型自己的并发上限,如 default=1,openai/gpt-5=2")
     p.add_argument("--threat-model", dest="threat_model", choices=["REMOTE", "LOCAL_UNPRIVILEGED", "BOTH"])
     p.add_argument("--lenses", help="逗号分隔的 lens 子集,如 memory,integer,dos")
@@ -73,7 +73,11 @@ def _overrides_from_args(args) -> dict:
 def cmd_run(args) -> int:
     cfg = load_config(getattr(args, "config", None), _overrides_from_args(args))
     if getattr(args, "model", None):
-        cfg.models = normalize_models({**cfg.models, "default": args.model})
+        shared = normalize_models({"shared": args.model}).get("shared") or []
+        if shared:
+            cfg.models.pop("default", None)
+            for role in cfg.required_model_roles():
+                cfg.models[role] = list(shared)
 
     if getattr(args, "print_config", False):
         print(json.dumps({
@@ -84,6 +88,7 @@ def cmd_run(args) -> int:
             "max_rounds": cfg.max_rounds, "dry_rounds": cfg.dry_rounds, "verify_votes": cfg.verify_votes,
             "enable_poc": cfg.enable_poc, "decompose": cfg.decompose, "resume": cfg.resume,
             "methods_dir": cfg.methods_abs, "methods_ok": cfg.methods_ok(),
+            "model_config_error": cfg.model_config_error(),
             "backend_command": cfg.backend_spec().command,
             "health_check": {"enabled": cfg.health.enabled, "on_start": cfg.health.on_start,
                              "gate": cfg.health.gate, "ttl_s": cfg.health.ttl_s,
@@ -91,8 +96,10 @@ def cmd_run(args) -> int:
         }, ensure_ascii=False, indent=2))
         return 0
 
-    if not cfg.models.get("default") and not any(cfg.models.values()):
-        print("⚠ 未配置任何模型(models.default 为空)。请在配置文件设置 models,或用 --model 指定。", file=sys.stderr)
+    model_error = cfg.model_config_error()
+    if model_error:
+        print(f"⚠ 模型配置错误:{model_error}", file=sys.stderr)
+        return 2
 
     # 惰性 import,避免 serve-only 环境缺依赖时报错
     from .events import EventBus

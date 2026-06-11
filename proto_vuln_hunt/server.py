@@ -181,6 +181,10 @@ def create_app(cfg: Config):
         payload = await req.json()
         if not (payload.get("target") or cfg.target):
             raise HTTPException(400, "target is required")
+        run_cfg = build_run_config(cfg, payload)
+        model_error = run_cfg.model_config_error()
+        if model_error:
+            raise HTTPException(400, model_error)
         run_id = manager.create_and_launch(payload)
         return {"run_id": run_id}
 

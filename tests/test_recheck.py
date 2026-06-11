@@ -201,6 +201,29 @@ class TestConfig(unittest.TestCase):
         from proto_vuln_hunt.config import ROLES
         self.assertIn("recheck", ROLES)
 
+    def test_models_default_is_not_a_role_fallback(self):
+        cfg = Config(models={"default": ["m"]}, decompose=False, enable_poc=False)
+        cfg.history.enabled = False
+        cfg.recheck.enabled = False
+        self.assertEqual(cfg.models_for("audit"), [])
+        self.assertIn("models.default 已不支持", cfg.model_config_error())
+        self.assertIn("audit", cfg.missing_model_roles())
+
+    def test_required_roles_accept_explicit_models(self):
+        cfg = Config(
+            models={
+                "recon": ["m"],
+                "audit": ["m"],
+                "verify": ["m"],
+                "report": ["m"],
+            },
+            decompose=False,
+            enable_poc=False,
+        )
+        cfg.history.enabled = False
+        cfg.recheck.enabled = False
+        self.assertEqual(cfg.model_config_error(), "")
+
 
 if __name__ == "__main__":
     unittest.main()

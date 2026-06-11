@@ -1,4 +1,4 @@
-"""编排器:侦察 → 区域拆解 → 审计循环(loop-until-dry + 动态扩面)→ 逐发现对抗验证 →
+"""编排器:侦察 → 统一优先级调度(拆解 / history / audit / recheck / 验证流水线) →
 流式产出确认漏洞 →(高危)PoC → 汇总。断点续跑 + 并发门 + CLI 任务失败重试。
 
 结构化为主:运行期**只写结构化态**(经 RunStore 按关注点分文件落盘:checkpoint.json / recon.json /
@@ -46,7 +46,7 @@ class Pipeline:
         # ── 运行状态(可被断点恢复) ──
         self.surface_data: Dict[str, Any] = {}
         self.regions: List[Dict[str, Any]] = []
-        self.history: List[Dict[str, Any]] = []      # 由 git 历史挖掘并行回灌的「历史问题模式」
+        self.history: List[Dict[str, Any]] = []      # 由 git 历史挖掘回灌的「历史问题模式」
         self.history_keys = set()                    # 历史模式去重(按 pattern 文本)
         self.history_done = set()                    # 已分析过的 git 提交 hash(续跑跳过)
         self._history_task: Optional[asyncio.Task] = None
@@ -68,6 +68,13 @@ class Pipeline:
         self.completed_items = set()
         self.confirmed: List[Dict[str, Any]] = []
         self.queue: List[Dict[str, Any]] = []
+        self._queue_seq = 0
+        self._audit_passes: Dict[str, Dict[str, Any]] = {}
+        self._decompose_total = 0
+        self._decompose_done = 0
+        self._history_enqueued = False
+        self._retrying_past_max_rounds = False
+        self._active_roles: Dict[str, int] = {}
         self.surface_log: List[Dict[str, Any]] = []
         self.risk_notes: List[Dict[str, Any]] = []
         self.risk_keys = set()
@@ -180,7 +187,7 @@ class Pipeline:
             "seenSurface": list(self.seen_surface),
             "completedItems": list(self.completed_items),
             "historyDone": list(self.history_done),
-            "pendingQueue": self.queue,
+            "pendingQueue": self._checkpoint_queue(),
             "pendingPriorityQueue": self.pq,
             "pendingFindings": list(self.pending_findings.values()),
         }
@@ -229,6 +236,106 @@ class Pipeline:
             "ledger": self.ledger_arr, "surfaces": self.surface_log, "regions": self.regions,
             "progress": {"done": n_done, "clean": n_clean, "total": len(self.ledger_arr)},
         })
+
+    # ──────────────────────── 优先级调度队列 ────────────────────────
+    _PRI_BY_AREA = {"high": 0, "medium": 1, "low": 2}
+    _INTERNAL_KINDS = {"_finder", "_finding", "_history_commit", "_recheck"}
+
+    @staticmethod
+    def _runtime_clean_item(item: Dict[str, Any]) -> Dict[str, Any]:
+        return {k: v for k, v in item.items() if not str(k).startswith("_")}
+
+    def _checkpoint_queue(self) -> List[Dict[str, Any]]:
+        """断点只保存可恢复的顶层审计项;运行时展开的 finder/history/finding 不写入 checkpoint。"""
+        out: List[Dict[str, Any]] = []
+        seen = set()
+        for it in self.queue:
+            if it.get("kind") in self._INTERNAL_KINDS:
+                continue
+            k = item_key(it)
+            if k in seen or k in self.completed_items:
+                continue
+            seen.add(k)
+            out.append(self._runtime_clean_item(it))
+        for st in self._audit_passes.values():
+            it = st.get("item") or {}
+            k = item_key(it)
+            if k in seen or k in self.completed_items:
+                continue
+            seen.add(k)
+            out.append(self._runtime_clean_item(it))
+        return out
+
+    def _enqueue_work(self, item: Dict[str, Any]) -> None:
+        self._queue_seq += 1
+        item["_queue_seq"] = self._queue_seq
+        self.queue.append(item)
+
+    def _refresh_enqueue_order(self, item: Dict[str, Any]) -> None:
+        self._queue_seq += 1
+        item["_queue_seq"] = self._queue_seq
+
+    def _ensure_queue_order(self) -> None:
+        for it in self.queue:
+            if not it.get("_queue_seq"):
+                self._refresh_enqueue_order(it)
+
+    def _area_rank(self, item: Dict[str, Any]) -> int:
+        return self._PRI_BY_AREA.get(item.get("priority") or "medium", 1)
+
+    def _work_priority(self, item: Dict[str, Any]) -> int:
+        kind = item.get("kind")
+        if kind == "_recheck":
+            return 0
+        if kind == "_finding":
+            return 5
+        if kind in ("_finder", "_history_commit"):
+            return 20 + self._area_rank(item)
+        if kind == "region" and self.cfg.decompose:
+            return 40 + self._area_rank(item)
+        if kind in ("region", "task", "surface"):
+            return 20 + self._area_rank(item)
+        return 50
+
+    def _work_role(self, item: Dict[str, Any]) -> Optional[str]:
+        kind = item.get("kind")
+        if kind == "_recheck":
+            return "recheck"
+        if kind == "_finding":
+            return "verify"
+        if kind == "_history_commit":
+            return "history"
+        if kind == "_finder":
+            return "audit"
+        if kind == "region" and self.cfg.decompose:
+            return "decompose"
+        return None
+
+    def _work_sort_key(self, item: Dict[str, Any]) -> tuple[int, int]:
+        return (self._work_priority(item), int(item.get("_queue_seq") or 0))
+
+    def _can_dispatch_work(self, item: Dict[str, Any]) -> bool:
+        if item.get("kind") == "_recheck" and self._active_roles.get("recheck", 0) >= max(1, self.cfg.recheck.concurrency):
+            return False
+        role = self._work_role(item)
+        if role is None:
+            return True
+        if not self.cfg.model_slots_for(role):
+            return True
+        limit_fn = getattr(self.runner, "role_capacity_limit", None)
+        role_limit = int(limit_fn(role)) if callable(limit_fn) else self.cfg.concurrency
+        if self._active_roles.get(role, 0) >= max(1, role_limit):
+            return False
+        has_capacity = getattr(self.runner, "role_has_capacity", None)
+        if not callable(has_capacity):
+            return True
+        return bool(has_capacity(role))
+
+    def _enqueue_finding(self, finding: Dict[str, Any]) -> None:
+        fk = finding_key(finding)
+        if fk in self.processed_keys:
+            return
+        self._enqueue_work({"kind": "_finding", "finding_key": fk, "finding": finding})
 
     # 风险点 severity_hint 排序(用于判断是否够格自动入排查队列)
     _RISK_SEV_ORDER = {"high": 3, "medium": 2, "low": 1, "info": 0}
@@ -349,11 +456,18 @@ class Pipeline:
                               "untrusted_input": region.get("untrusted_input"), "trust_boundary": region.get("trust_boundary"),
                               "priority": region.get("priority")})
         for t in tasks:
-            self.queue.append(t)
+            self._enqueue_work(t)
         self.completed_items.add(rkey)
         rec["status"] = "decomposed"
         rec["subtasks"] = len(tasks)
         rec["lastRound"] = self.round
+        if self._decompose_total:
+            self._decompose_done += 1
+            if self._decompose_done >= self._decompose_total:
+                task_n = sum(1 for it in self.queue if it.get("kind") == "task")
+                self.emit(EV.DECOMPOSE_DONE, {"tasks": task_n, "regions": self._decompose_done})
+                self.checkpoint(self.round)
+                self.emit_coverage()
         self.log(f"🧩 拆解 {region.get('name')} → {len(tasks)} 个审计子任务")
         return len(tasks)
 
@@ -521,13 +635,13 @@ class Pipeline:
             }
         self.surface_data = surface
         self.regions = sorted(surface.get("regions") or [], key=lambda r: ({"high": 0, "medium": 1, "low": 2}).get(r.get("priority"), 3))
-        # 历史问题模式不再由侦察 agent 产出,改由独立 git 历史挖掘从 run 一开始并行产出。
+        # 历史问题模式不再由侦察 agent 产出,改由 history 任务在统一队列中产出。
         self.surface_data["history"] = self.history
         self.build_hint = surface.get("build_hint") or ""
         for r in self.regions:
-            self.queue.append({"kind": "region", **r})
+            self._enqueue_work({"kind": "region", **r})
         self.log(f"侦察完成:攻击面区域 {len(self.regions)} 个,build_hint {'有' if self.build_hint else '无'}"
-                 f"(历史问题模式由并行的 git 历史挖掘阶段产出)")
+                 f"(历史问题模式由统一调度的 git history 任务产出)")
         if surface.get("purpose"):
             self.log(f"项目用途: {str(surface['purpose'])[:120]}")
         self.emit(EV.RECON_DONE, {"resumed": False, "regions": len(self.regions),
@@ -549,7 +663,7 @@ class Pipeline:
     def _queue_retry_only(queue: List[Dict[str, Any]]) -> bool:
         return bool(queue) and all(bool(it.get("retry_after_failure")) for it in queue)
 
-    # ──────── 并行阶段:git 历史问题模式挖掘(每条提交一个 agent,独立于侦察、不阻塞主流程)────────
+    # ──────── git 历史问题模式挖掘(每条提交一个 agent,与 high audit finder 同级调度)────────
     def _collect_commits(self) -> List[Dict[str, str]]:
         """读取 git log 提交清单(hash + 标题)。非 git 仓 / 出错 → 空列表。"""
         target = self._abs_target()
@@ -583,14 +697,14 @@ class Pipeline:
         return self._history_task is not None and not self._history_task.done()
 
     def _start_history_mining(self) -> None:
-        """与主流程并行启动 git 历史挖掘(留出专用 agent 额度,不占主并发池)。"""
-        if not self.cfg.history.enabled:
-            return
-        if self._history_task is not None:
-            return
-        self._history_task = asyncio.create_task(self.mine_git_history())
+        """兼容旧调用点:现在只把 history commit 投进统一优先级队列。"""
+        self._enqueue_history_commits()
 
-    async def mine_git_history(self) -> None:
+    def _enqueue_history_commits(self) -> None:
+        """把 git log 分析任务投进统一优先级队列,与 high audit finder 同级排队。"""
+        if self._history_enqueued or not self.cfg.history.enabled:
+            return
+        self._history_enqueued = True
         commits = self._collect_commits()
         if not commits:
             self.log("🕮 git 历史挖掘:非 git 仓或无匹配提交,跳过该阶段")
@@ -599,45 +713,20 @@ class Pipeline:
         if not todo:
             self.log("🕮 git 历史挖掘:所有提交均已分析过(断点),跳过")
             return
-        # 从全局并发池预占额度并一直持有:计入总并发(主流程因此只剩 总-预占 可用);
-        # 留至少 1 个名额给主流程,挖掘全部结束后归还,主流程回满。
-        want = min(self.cfg.history.concurrency, max(0, self.cfg.concurrency - 1))
-        acquired = await self.runner.reserve_slots(want)
-        bypass = acquired > 0                     # 占到名额 → agent 直接复用、不再抢全局门
-        limit = acquired if bypass else self.cfg.history.concurrency
-        if acquired:
-            self.log(f"🕮 git 历史挖掘启动:{len(todo)}/{len(commits)} 条提交待分析"
-                     f"(已从总并发预占 {acquired} 个名额、计入总并发,主流程暂用 {self.cfg.concurrency - acquired};"
-                     f"与侦察/拆解/审计并行;挖掘结束后归还)")
-        else:
-            self.log(f"🕮 git 历史挖掘启动:{len(todo)}/{len(commits)} 条提交待分析"
-                     f"(总并发为 {self.cfg.concurrency},无法预留专属名额,暂与主流程共享全局并发池)")
-        sem = asyncio.Semaphore(max(1, limit))
-        try:
-            async def one(c: Dict[str, str]) -> None:
-                if self.stop_requested():
-                    return
-                async with sem:
-                    if self.stop_requested():
-                        return
-                    await self._mine_one_commit(c, bypass)
+        for c in todo:
+            self._enqueue_work({"kind": "_history_commit", "commit": c, "priority": "high"})
+        self.log(f"🕮 git 历史挖掘入队:{len(todo)}/{len(commits)} 条提交待分析"
+                 "(与 high audit finder 同优先级参与统一调度)")
 
-            await asyncio.gather(*[one(c) for c in todo], return_exceptions=True)
-            self.log(f"🕮 git 历史挖掘完成:共提炼历史问题模式 {len(self.history)} 条"
-                     f"{';归还预占的 ' + str(acquired) + ' 个并发名额,主流程回满' if acquired else ''}")
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            self.log(f"⚠ git 历史挖掘异常(忽略继续): {str(e)[:160]}")
-        finally:
-            self.runner.release_slots(acquired)
+    async def mine_git_history(self) -> None:
+        self._enqueue_history_commits()
 
     async def _mine_one_commit(self, c: Dict[str, str], bypass: bool = True) -> None:
         res = await self.runner.run(
             self.pb.history_commit(c, S.HISTORY_COMMIT_SCHEMA),
             role="history", label=f"history:{c['hash'][:8]}",
             schema=S.HISTORY_COMMIT_SCHEMA, retries=1, fallback=None,
-            use_global_gate=not bypass)          # 已预占名额则复用,不重复申请全局门
+            use_global_gate=not bypass)
         self.history_done.add(c["hash"])
         if not res or not res.get("security_related"):
             return
@@ -654,141 +743,242 @@ class Pipeline:
                  "files": res.get("files") or [], "rationale": res.get("rationale") or ""}
         self.history.append(entry)
         self.surface_data["history"] = self.history
-        # 回灌为「同类变体排查」项,放进专用优先排查队列(最高优先,由 recheck 角色逐条处理)
+        # 回灌为「同类变体排查」项,放进优先排查队列(最高优先,由 recheck 角色处理)
         self._enqueue_variant(entry)
         self.emit(EV.HISTORY_ADDED, {**entry, "total": len(self.history)})
         self.persist_recon()
         self.log(f"🕮 历史模式 +1[{entry['lens_hint']}]:{pattern[:60]} ← {source[:40]}")
 
+    def _start_audit_pass(self, item: Dict[str, Any]) -> None:
+        ik = item_key(item)
+        if ik in self.completed_items:
+            return
+        self.round += 1
+        item["pass"] = (item.get("pass") or 0) + 1
+        item["newThisRound"] = 0
+        item["newSurfacesThisRound"] = 0
+        item["failedFinders"] = 0
+        rec = self.ledger_rec(item)
+        rec["passes"] = item["pass"]
+        rec["lastRound"] = self.round
+        rec["status"] = "in-progress"
+        audit_id = f"{ik}#{item['pass']}#{self.round}"
+        lenses = self.lenses_for(item)
+        pending = 0
+        for lens_key in lenses:
+            if lens_key not in rec["lenses"]:
+                rec["lenses"].append(lens_key)
+            for i in range(self.cfg.finders_per_lens):
+                self._enqueue_work({
+                    "kind": "_finder",
+                    "audit_id": audit_id,
+                    "item": item,
+                    "lens_key": lens_key,
+                    "idx": i,
+                    "priority": item.get("priority"),
+                })
+                pending += 1
+        self._audit_passes[audit_id] = {"item": item, "rec": rec, "pending": pending}
+        self.emit(EV.ROUND_START, {"round": self.round, "queue_len": len(self.queue)})
+        if pending == 0:
+            self._finish_audit_pass(audit_id)
+
+    async def _run_finder_job(self, work: Dict[str, Any]) -> None:
+        audit_id = work.get("audit_id")
+        st = self._audit_passes.get(audit_id)
+        if not st:
+            return
+        item = st["item"]
+        rec = st["rec"]
+        try:
+            await self._run_finder(item, work.get("lens_key") or "memory", int(work.get("idx") or 0), rec)
+        except Exception as e:  # noqa: BLE001
+            item["failedFinders"] = item.get("failedFinders", 0) + 1
+            self.log(f"⚠ finder 调度异常,审计项稍后重试: {str(e)[:140]}")
+        finally:
+            st["pending"] = max(0, int(st.get("pending") or 0) - 1)
+            if st["pending"] == 0:
+                self._finish_audit_pass(audit_id)
+
+    def _finish_audit_pass(self, audit_id: str) -> None:
+        st = self._audit_passes.pop(audit_id, None)
+        if not st:
+            return
+        item = st["item"]
+        rec = st["rec"]
+        ik = item_key(item)
+        if ik in self.completed_items:
+            return
+        new_findings = int(item.get("newThisRound") or 0)
+        new_surfaces = int(item.get("newSurfacesThisRound") or 0)
+        failed = int(item.get("failedFinders") or 0) > 0
+        if failed:
+            self._mark_retry_after_failure(item)
+            self._refresh_enqueue_order(item)
+            self.queue.append(item)
+            rec["status"] = "incomplete"
+            if item.get("pass", 0) >= self.cfg.max_rounds:
+                self._retrying_past_max_rounds = True
+            self.log("本轮有 1 个审计项因 CLI/结构化输出连续失败被放回队尾,稍后继续重试")
+        elif new_findings > 0 and item["pass"] < self.cfg.max_rounds:
+            self._clear_retry_after_failure(item)
+            self._refresh_enqueue_order(item)
+            self.queue.append(item)
+            rec["status"] = "in-progress"
+        else:
+            self._clear_retry_after_failure(item)
+            self.completed_items.add(ik)
+            rec["status"] = "completed-findings" if rec.get("candidates", 0) > 0 else "completed-clean"
+        dry_streak = 0 if (new_findings or new_surfaces) else 1
+        self.log(f"轮 {self.round}: 本项新候选 {new_findings}, 新攻击面 {new_surfaces}, 队列剩 {len(self.queue)}, "
+                 f"风险登记 {len(self.risk_notes)}")
+        self.emit(EV.ROUND_DONE, {"round": self.round, "new_findings": new_findings, "new_surfaces": new_surfaces,
+                                  "queue_len": len(self.queue), "dry_streak": dry_streak, "risks": len(self.risk_notes)})
+        self.emit(EV.METRICS, self._summary_snapshot(self.round))
+        self.checkpoint(self.round)
+        self.emit_coverage()
+
+    def _pop_next_work(self) -> Optional[Dict[str, Any]]:
+        self._ensure_queue_order()
+        if self.cfg.recheck.enabled and self.pq and self._active_roles.get("recheck", 0) < max(1, self.cfg.recheck.concurrency):
+            probe = {"kind": "_recheck"}
+            if self._can_dispatch_work(probe):
+                it = self._pop_priority()
+                if it is not None:
+                    self._refresh_enqueue_order(probe)
+                    probe["item"] = it
+                    return probe
+
+        while True:
+            if not self.queue:
+                return None
+            ordered = sorted(enumerate(self.queue), key=lambda x: self._work_sort_key(x[1]))
+            expanded = False
+            for idx, item in ordered:
+                kind = item.get("kind")
+                if kind == "task" or kind == "surface" or (kind == "region" and not self.cfg.decompose):
+                    self.queue.pop(idx)
+                    self._start_audit_pass(item)
+                    expanded = True
+                    break
+                if item_key(item) in self.completed_items and kind not in self._INTERNAL_KINDS:
+                    self.queue.pop(idx)
+                    expanded = True
+                    break
+                if self._can_dispatch_work(item):
+                    return self.queue.pop(idx)
+            if not expanded:
+                return None
+
+    async def _run_work(self, work: Dict[str, Any], role: Optional[str] = None) -> None:
+        try:
+            kind = work.get("kind")
+            if kind == "_finder":
+                await self._run_finder_job(work)
+                return
+            if kind == "_finding":
+                f = work.get("finding") or {}
+                if f:
+                    await self.process_finding(f)
+                return
+            if kind == "_history_commit":
+                c = work.get("commit") or {}
+                if c:
+                    await self._mine_one_commit(c, bypass=False)
+                return
+            if kind == "_recheck":
+                self._recheck_inflight += 1
+                try:
+                    await self._run_recheck(work.get("item") or {}, use_global_gate=True)
+                finally:
+                    self._recheck_inflight -= 1
+                return
+            if kind == "region" and self.cfg.decompose:
+                await self.decompose_region(work)
+        finally:
+            if role:
+                self._active_roles[role] = max(0, self._active_roles.get(role, 0) - 1)
+
+    async def _run_scheduler(self, *, stop_when: Optional[Callable[[], bool]] = None,
+                             stop_when_idle: bool = True) -> None:
+        """统一调度循环。
+
+        stop_when 用于 recon 并行窗口:条件满足后不再启动新工作,但会等待已启动工作收尾;
+        stop_when_idle=True 用于正式审计阶段:队列和在途项都清空后退出。
+        """
+        active: List[asyncio.Task] = []
+        while not self.stop_requested():
+            done_now = [t for t in active if t.done()]
+            active = [t for t in active if not t.done()]
+            for t in done_now:
+                try:
+                    t.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:  # noqa: BLE001
+                    self.log(f"⚠ 调度工作项异常(忽略继续): {str(e)[:160]}")
+
+            may_start = stop_when is None or not stop_when()
+            made_progress = False
+            while may_start and len(active) < self.cfg.concurrency:
+                work = self._pop_next_work()
+                if work is None:
+                    break
+                role = self._work_role(work)
+                if role:
+                    self._active_roles[role] = self._active_roles.get(role, 0) + 1
+                active.append(asyncio.create_task(self._run_work(work, role)))
+                made_progress = True
+                may_start = stop_when is None or not stop_when()
+
+            if active:
+                if not made_progress and may_start and (self.queue or self.pq):
+                    await asyncio.wait(active, timeout=0.25, return_when=asyncio.FIRST_COMPLETED)
+                else:
+                    await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+                continue
+
+            if stop_when is not None and stop_when():
+                break
+
+            has_pending = bool(self.queue or self.pq or self._audit_passes or self._recheck_inflight)
+            if has_pending:
+                await asyncio.sleep(min(self.cfg.history.poll_interval_s, self.cfg.recheck.poll_interval_s, 1))
+                continue
+            if stop_when_idle:
+                break
+            await asyncio.sleep(0.1)
+
+        if active:
+            if self.stop_requested():
+                for t in active:
+                    t.cancel()
+            await asyncio.gather(*active, return_exceptions=True)
+
     # ──────────────────────── 阶段 ② 审计循环 ────────────────────────
     async def audit(self) -> str:
         for f in list(self.pending_findings.values()):
-            self.in_flight.append(asyncio.create_task(self.process_finding(f)))
+            self._enqueue_finding(f)
         if self.pending_findings:
             self.log(f"续跑:重注入 {len(self.pending_findings)} 条在途候选到验证/报告流水线")
 
         self.round = self.start_round
-        dry_streak = 0
-        max_passes = self.cfg.max_rounds
-        retrying_past_max_rounds = False
+        self._retrying_past_max_rounds = False
+        self._enqueue_history_commits()
+        self._decompose_total = sum(1 for it in self.queue if it.get("kind") == "region" and item_key(it) not in self.completed_items)
+        if self._decompose_total and self.cfg.decompose:
+            self.log(f"区域拆解已入统一队列:{self._decompose_total} 个 region 将按优先级逐步拆解,拆出即审")
 
-        if self.cfg.decompose:
-            region_items = [it for it in self.queue if it.get("kind") == "region" and item_key(it) not in self.completed_items]
-            if region_items:
-                self.queue = [it for it in self.queue if it.get("kind") != "region"]
-                self.log(f"区域拆解:对 {len(region_items)} 个 region 并发拆解为有界子任务…")
-                await asyncio.gather(*[self.decompose_region(it) for it in region_items], return_exceptions=True)
-                task_n = sum(1 for it in self.queue if it.get("kind") == "task")
-                self.log(f"拆解完成:队列现有 {task_n} 个审计子任务 + {len(self.queue) - task_n} 个其它项")
-                self.emit(EV.DECOMPOSE_DONE, {"tasks": task_n, "regions": len(region_items)})
-                self.checkpoint(self.round)
-                self.emit_coverage()
-
-        while (self.queue or dry_streak < self.cfg.dry_rounds or self._history_active()) \
-                and not self.stop_requested():
-            if self.round >= self.cfg.max_rounds:
-                if self._queue_retry_only(self.queue):
-                    if not retrying_past_max_rounds:
-                        retrying_past_max_rounds = True
-                        self.log(f"已达到 maxRounds({self.cfg.max_rounds}),但队列只剩瞬时失败重试项;"
-                                 "继续补审直到成功或用户停止")
-                else:
-                    break
-            if not self.queue:
-                # 主队列暂空:只要 git 历史挖掘 / 优先排查队列还有活,就等它们(不空烧回合数、不提前收敛)
-                if self._history_active() or self.pq or self._recheck_inflight > 0:
-                    await asyncio.sleep(self.cfg.history.poll_interval_s)
-                    continue
-                self.log(f"轮 {self.round}: 队列已空且无新攻击面回灌,提前收敛")
-                break
-            self.round += 1
-            self.emit(EV.ROUND_START, {"round": self.round, "queue_len": len(self.queue)})
-            batch = self.queue
-            self.queue = []
-            new_findings = 0
-            new_surfaces = 0
-            audit_tasks = []
-            retry_later: List[Dict[str, Any]] = []
-
-            for item in batch:
-                if item_key(item) in self.completed_items:
-                    continue
-                item["pass"] = (item.get("pass") or 0) + 1
-                item["newThisRound"] = 0
-                item["newSurfacesThisRound"] = 0
-                item["failedFinders"] = 0
-                rec = self.ledger_rec(item)
-                rec["passes"] = item["pass"]
-                rec["lastRound"] = self.round
-                rec["status"] = "in-progress"
-                for lens_key in self.lenses_for(item):
-                    if lens_key not in rec["lenses"]:
-                        rec["lenses"].append(lens_key)
-                    for i in range(self.cfg.finders_per_lens):
-                        audit_tasks.append(asyncio.create_task(self._run_finder(item, lens_key, i, rec)))
-
-            await asyncio.gather(*audit_tasks, return_exceptions=True)
-            for item in batch:
-                if item_key(item) in self.completed_items:
-                    continue
-                new_findings += item.get("newThisRound", 0)
-                new_surfaces += item.get("newSurfacesThisRound", 0)
-
-            for item in batch:
-                ik = item_key(item)
-                if ik in self.completed_items:
-                    continue
-                rec = self.ledger_map.get(ik)
-                failed = item.get("failedFinders", 0) > 0
-                if failed:
-                    self._mark_retry_after_failure(item)
-                    retry_later.append(item)
-                    if rec:
-                        rec["status"] = "incomplete"
-                elif item.get("newThisRound", 0) > 0 and item["pass"] < max_passes:
-                    self._clear_retry_after_failure(item)
-                    self.queue.append(item)
-                    if rec:
-                        rec["status"] = "in-progress"
-                else:
-                    self._clear_retry_after_failure(item)
-                    self.completed_items.add(ik)
-                    if rec:
-                        rec["status"] = "completed-findings" if rec.get("candidates", 0) > 0 else "completed-clean"
-            if retry_later:
-                self.queue.extend(retry_later)
-                self.log(f"本轮有 {len(retry_later)} 个审计项因 CLI/结构化输出连续失败被放回队尾,稍后继续重试")
-
-            if new_findings == 0 and new_surfaces == 0:
-                dry_streak += 1
-            else:
-                dry_streak = 0
-            self.log(f"轮 {self.round}: 本轮新候选 {new_findings}, 新攻击面 {new_surfaces}, 队列剩 {len(self.queue)}, "
-                     f"dryStreak {dry_streak}/{self.cfg.dry_rounds}, 风险登记 {len(self.risk_notes)}")
-            self.emit(EV.ROUND_DONE, {"round": self.round, "new_findings": new_findings, "new_surfaces": new_surfaces,
-                                      "queue_len": len(self.queue), "dry_streak": dry_streak, "risks": len(self.risk_notes)})
-            self.emit(EV.METRICS, self._summary_snapshot(self.round))
-            self.checkpoint(self.round)
-            self.emit_coverage()
+        await self._run_scheduler(stop_when_idle=True)
+        if not self.queue and not self.pq and not self._audit_passes and not self._recheck_inflight:
+            self.log(f"轮 {self.round}: 队列已空且无新攻击面回灌,提前收敛")
 
         if self.stop_requested():
             stop_reason = "用户请求停止"
-        elif self.round >= self.cfg.max_rounds:
-            if retrying_past_max_rounds and not self.queue:
-                stop_reason = f"达到 maxRounds({self.cfg.max_rounds});失败重试队列已补审完成"
-            else:
-                stop_reason = f"达到 maxRounds({self.cfg.max_rounds})"
+        elif self._retrying_past_max_rounds and not self.queue:
+            stop_reason = f"达到 maxRounds({self.cfg.max_rounds});失败重试队列已补审完成"
         else:
             stop_reason = f"收敛(连续 {self.cfg.dry_rounds} 轮无新增)"
-        # git 历史挖掘收尾:正常退出时它一般已结束;若因停止/达上限而仍在跑,则取消并回收
-        if self._history_task is not None:
-            if not self._history_task.done() and self.stop_requested():
-                self._history_task.cancel()
-            try:
-                await self._history_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-        # 优先排查通道收尾:主审计已收敛、历史挖掘已结束 → 通知 recheck 排空剩余优先项后退出
         self._audit_done = True
         if self._recheck_task is not None:
             if self._recheck_stop is not None:
@@ -838,7 +1028,7 @@ class Pipeline:
             self.pending_findings[fk] = f
             self.emit(EV.CANDIDATE_FOUND, {"key": fk, "title": f.get("title"), "bug_class": f.get("bug_class"),
                                            "file": f.get("file"), "line": f.get("line"), "lens": lens_key})
-            self.in_flight.append(asyncio.create_task(self.process_finding(f)))
+            self._enqueue_finding(f)
         for s in (res.get("new_surfaces") or []):
             sk = (s.get("name") or "").strip().lower()
             if not sk or sk in self.seen_surface:
@@ -846,8 +1036,8 @@ class Pipeline:
             self.seen_surface.add(sk)
             item["newSurfacesThisRound"] = item.get("newSurfacesThisRound", 0) + 1
             rec["surfaces"] = rec.get("surfaces", 0) + 1
-            self.queue.append({"kind": "surface", "name": s.get("name"), "why": s.get("why"),
-                               "files": s.get("files"), "lens_hint": s.get("lens_hint")})
+            self._enqueue_work({"kind": "surface", "name": s.get("name"), "why": s.get("why"),
+                                "files": s.get("files"), "lens_hint": s.get("lens_hint")})
             entry = {"name": s.get("name"), "why": s.get("why"), "files": s.get("files"),
                      "lens_hint": s.get("lens_hint") or lens_key, "round": self.round, "from": rec.get("name")}
             self.surface_log.append(entry)
@@ -856,7 +1046,7 @@ class Pipeline:
             if self.record_risk(n, lens_key, self.round, from_recheck=from_recheck):
                 rec["risks"] = rec.get("risks", 0) + 1
 
-    # ──────── 专用优先排查通道:历史变体 + 风险点复查(并发上限独立,懒占全局名额)────────
+    # ──────── 专用优先排查:历史变体 + 风险点复查(统一调度队列中的最高优先级)────────
     def _recheck_active(self) -> bool:
         return self._recheck_task is not None and not self._recheck_task.done()
 
@@ -898,7 +1088,7 @@ class Pipeline:
                         return
                     got = await self.runner.reserve_slots(1)   # 懒占:用时才占 1 个全局名额
                     try:
-                        await self._run_recheck(it)
+                        await self._run_recheck(it, use_global_gate=False)
                     finally:
                         self.runner.release_slots(got)          # 用完即还,主池回满
             finally:
@@ -917,7 +1107,7 @@ class Pipeline:
             inflight.append(asyncio.create_task(worker(it)))
         await asyncio.gather(*inflight, return_exceptions=True)
 
-    async def _run_recheck(self, item: Dict[str, Any]) -> None:
+    async def _run_recheck(self, item: Dict[str, Any], *, use_global_gate: bool = True) -> None:
         if self.stop_requested():
             return
         kind = item.get("kind")
@@ -943,8 +1133,8 @@ class Pipeline:
         if lens_key not in rec["lenses"]:
             rec["lenses"].append(lens_key)
         res = await self.runner.run(prompt, role="recheck", label=label, schema=S.FINDINGS_SCHEMA,
-                                    use_global_gate=False,
-                                    should_stop=self.stop_requested)   # 名额已由 worker 预占,复用、不重复申请全局门
+                                    use_global_gate=use_global_gate,
+                                    should_stop=self.stop_requested)
         if not res:
             self._mark_retry_after_failure(item)
             rec["status"] = "incomplete"
@@ -1032,13 +1222,23 @@ class Pipeline:
         self.log(f"启用 lens: {', '.join(self.cfg.lenses)} | run 目录: {self.store.dir} | "
                  f"方法库: {self.cfg.methods_abs} ({'就绪' if self.cfg.methods_ok() else '不可用→内联兜底'})")
         try:
+            model_error = self.cfg.model_config_error()
+            if model_error:
+                raise ValueError(f"模型配置错误:{model_error}")
             resumed = self.restore_checkpoint()
-            self._start_history_mining()   # 从 run 开始即并行分析 git log;不等待健康检查/侦察完成
             if self.cfg.health.enabled and self.cfg.health.on_start and not self.stop_requested():
                 await self.health_check_all()
             if not resumed:
-                await self.recon(try_restore=False)
-            self._start_recheck()          # 专用优先排查通道:历史变体 + 风险点复查,与审计并行
+                recon_task = asyncio.create_task(self.recon(try_restore=False))
+                await asyncio.sleep(0)
+                self._enqueue_history_commits()
+                history_sched = asyncio.create_task(
+                    self._run_scheduler(stop_when=lambda: recon_task.done(), stop_when_idle=False)
+                )
+                try:
+                    await recon_task
+                finally:
+                    await history_sched
             stop_reason = await self.audit()
             result = self.synthesis(stop_reason)
             self.emit(EV.RUN_STATUS, {"status": result["status"]})

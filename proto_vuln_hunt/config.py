@@ -26,10 +26,11 @@ BUNDLED_METHODS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 # 审计 lens(8 类)
 ALL_LENSES = ["memory", "integer", "race", "injection", "authn", "crypto", "dos", "infoleak"]
 
-# 流水线里会用到的 agent 角色;每个角色都可在 models 里单独指定模型,缺省回落到 default。
-# history:独立于侦察、与主流程并行的「git 历史问题模式挖掘」(每条提交一个 agent)。
-# recheck:专用优先排查角色——处理历史问题变体 + 已登记风险点的复查(独立优先队列、默认并发 1)。
+# 流水线里会用到的 agent 角色;每个会运行的角色都必须在 models 里显式指定模型。
+# history:统一调度队列中的「git 历史问题模式挖掘」(每条提交一个 agent,与 high audit finder 同级)。
+# recheck:专用优先排查角色——处理历史问题变体 + 已登记风险点的复查(最高优先级、默认并发 1)。
 ROLES = ["recon", "history", "recheck", "decompose", "audit", "verify", "report", "poc", "synthesis", "util"]
+TASK_MODEL_ROLES = ["recon", "history", "recheck", "decompose", "audit", "verify", "report", "poc"]
 
 
 # ──────────────────────────── 后端默认调用模板 ────────────────────────────
@@ -124,15 +125,15 @@ class RetrySpec:
 
 @dataclass
 class HistorySpec:
-    """git 历史问题模式挖掘:从侦察中**抽离**出来、与主流程(侦察/拆解/审计)**并行**运行的独立阶段。
+    """git 历史问题模式挖掘:从侦察中**抽离**出来,与 recon 同时启动。
 
     遍历 `git log` 的提交,**每条提交派 1 个 agent**(role=history)读其改动并判定是否安全修复;
     相关者提炼成「历史问题模式」回灌到 history[](作为同类变体排查种子)与审计队列。
-    这一块不阻塞后续阶段开展——侦察完即开审,历史模式随挖随补。
+    这一块不阻塞侦察和审计:按 high audit finder 同级排队,历史模式随挖随补。
     """
     enabled: bool = True
     max_commits: int = 200          # 最多分析多少条最近的提交
-    concurrency: int = 1            # 专用 agent 额度(默认 1:始终留 1 个 agent 逐条处理提交)
+    concurrency: int = 1            # 兼容旧配置;统一调度下实际并发由全局 concurrency + role/model 容量决定
     since: str = ""                 # 可选:git log --since=<...> 只看某时间段
     paths: str = ""                 # 可选:限定 git log 的路径(留空则用 scope;空格分隔多个)
     poll_interval_s: int = 3        # 审计循环等待历史变体灌入的轮询间隔(秒)
@@ -254,7 +255,7 @@ class Config:
         return models[0] if models else ""
 
     def models_for(self, role: str) -> List[str]:
-        return list(self.models.get(role) or self.models.get("default") or [])
+        return list(self.models.get(role) or [])
 
     def model_concurrency_for(self, model: str) -> int:
         return max(1, int(self.model_concurrency.get(model) or self.model_concurrency.get("default") or self.concurrency))
@@ -262,11 +263,41 @@ class Config:
     def all_models(self) -> List[str]:
         """所有 role 里配置到的去重模型列表(保持首次出现顺序),用于启动前健康检查。"""
         seen: List[str] = []
-        for vals in self.models.values():
+        for role, vals in self.models.items():
+            if role == "default":
+                continue
             for m in vals:
                 if m and m not in seen:
                     seen.append(m)
         return seen
+
+    def required_model_roles(self) -> List[str]:
+        roles = ["recon", "audit", "verify", "report"]
+        if self.history.enabled:
+            roles.append("history")
+        if self.recheck.enabled:
+            roles.append("recheck")
+        if self.decompose:
+            roles.append("decompose")
+        if self.enable_poc:
+            roles.append("poc")
+        return [r for r in TASK_MODEL_ROLES if r in roles]
+
+    def missing_model_roles(self) -> List[str]:
+        return [r for r in self.required_model_roles() if not self.models_for(r)]
+
+    def unsupported_model_keys(self) -> List[str]:
+        return [k for k in self.models if k == "default"]
+
+    def model_config_error(self) -> str:
+        problems: List[str] = []
+        unsupported = self.unsupported_model_keys()
+        if unsupported:
+            problems.append("models.default 已不支持;请为每个任务 role 显式配置模型")
+        missing = self.missing_model_roles()
+        if missing:
+            problems.append("缺少模型配置: " + ", ".join(f"models.{r}" for r in missing))
+        return "; ".join(problems)
 
     def model_slots_for(self, role: str) -> List[str]:
         slots: List[str] = []
@@ -406,7 +437,7 @@ def load_config(path: Optional[str], overrides: Optional[Dict[str, Any]] = None)
         expect=str(hc_data.get("expect", _hc_default.expect)),
     )
 
-    # git 历史问题模式挖掘配置(独立、与主流程并行的阶段)。
+    # git 历史问题模式挖掘配置(统一调度队列中与 high audit finder 同级)。
     hist_data = data.pop("history", {}) or {}
     _h_default = HistorySpec()
     history = HistorySpec(

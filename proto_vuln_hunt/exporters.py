@@ -56,7 +56,7 @@ def render_recon_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
         f"## 2. 威胁分析\n{_as_md(sd.get('threat_summary'), '(侦察未给出)')}\n\n"
         f"## 3. 仓库知识与安全背景\n{_as_md(sd.get('repo_knowledge'))}\n\n"
         f"## 4. 攻击面地图(按优先级)\n{reg_table}\n\n"
-        f"## 5. 历史问题模式(由并行 git 历史挖掘提炼,同类变体排查种子)\n{hist_table}\n\n"
+        f"## 5. 历史问题模式(由统一调度的 git history 任务提炼,同类变体排查种子)\n{hist_table}\n\n"
         f"## 6. 编译提示(供 PoC)\n{sd.get('build_hint') or '(未识别)'}\n\n"
         "---\n*由 proto-vuln-hunt(python) 从结构化态导出。*\n"
     )
