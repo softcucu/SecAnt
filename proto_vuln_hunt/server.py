@@ -110,6 +110,29 @@ class RunManager:
             return False
         return store.update_risk_severity(rid, severity) is not None
 
+    def reconfigure(self, run_id: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """运行中动态调整模型/并发。run 在跑 → 走 pipeline(实时改信号量 + 落盘 + SSE);
+        否则只把白名单字段并进 manifest.config,留待续跑时生效。返回生效快照或 None(run 不存在)。"""
+        clean: Dict[str, Any] = {}
+        if isinstance(patch.get("models"), dict):
+            clean["models"] = patch["models"]
+        if isinstance(patch.get("model_concurrency"), dict):
+            clean["model_concurrency"] = patch["model_concurrency"]
+        if patch.get("concurrency") is not None:
+            try:
+                clean["concurrency"] = max(1, int(patch["concurrency"]))
+            except (TypeError, ValueError):
+                pass
+        if not clean:
+            return None
+        rec = self.active.get(run_id)
+        if rec and not rec["task"].done():
+            return rec["pipeline"].reconfigure(clean)
+        store = self.registry.get(run_id)
+        if not store or not store.exists():
+            return None
+        return {"config": store.update_config(clean), "running": False}
+
     def recheck_health(self, run_id: str) -> bool:
         """对正在运行的 run 触发一次全模型健康复检(后台任务,实时经 SSE 回传)。"""
         rec = self.active.get(run_id)
@@ -241,6 +264,18 @@ def create_app(cfg: Config):
     @app.get("/api/runs/{run_id}/recon")
     async def recon(run_id: str):
         return _store_or_404(run_id).load_recon()
+
+    # ── 运行中动态调参:模型增减 / 并发调整 ──
+    @app.post("/api/runs/{run_id}/config")
+    async def reconfigure_run(run_id: str, req: Request):
+        _store_or_404(run_id)
+        body = await req.json()
+        if "lenses" in body:  # 防御:本接口只接受模型/并发,其它字段忽略
+            body.pop("lenses", None)
+        snapshot = manager.reconfigure(run_id, body or {})
+        if snapshot is None:
+            raise HTTPException(400, "无可应用的配置(仅支持 models / model_concurrency / concurrency)")
+        return {"ok": True, **snapshot}
 
     # ── 模型健康 ──
     @app.get("/api/runs/{run_id}/health")

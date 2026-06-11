@@ -34,6 +34,7 @@ HEALTH_START = "health_check_start"  # {models}
 HEALTH_DONE = "health_check_done"    # {total, ok, unhealthy}
 MODEL_HEALTH = "model_health"        # {model, status, last_latency_ms, answer, error, checks, calls, ...}
 RUN_DONE = "run_done"              # {summary}
+CONFIG_UPDATED = "config_updated"  # {models, model_concurrency, concurrency, model_config_error}(运行中动态调参)
 ERROR = "error"                    # {message}
 
 

@@ -130,6 +130,14 @@ class RunStore:
             m["status"] = status
         self.save_manifest(m)
 
+    def update_config(self, patch: Dict[str, Any]) -> Dict[str, Any]:
+        """把若干字段合并进 manifest.config(供运行中动态调参 / 续跑时沿用)。返回更新后的 config。"""
+        m = self.load_manifest() or {"id": self.id, "created_at": time.time(), "config": {}, "summary": {}}
+        cfg = {**(m.get("config") or {}), **(patch or {})}
+        m["config"] = cfg
+        self.save_manifest(m)
+        return cfg
+
     # ── 结构化态(按关注点分文件) ──
     @staticmethod
     def _read_json(path: str) -> Optional[Any]:

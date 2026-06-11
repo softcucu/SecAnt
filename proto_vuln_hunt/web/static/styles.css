@@ -13,8 +13,8 @@ a:hover{text-decoration:underline}
 .topbar{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:10}
 .brand{font-weight:600;font-size:16px}
 .topbar nav a{margin-left:18px;color:var(--text)}
-main{padding:20px clamp(20px,4vw,56px);max-width:1760px;margin:0 auto;width:100%}
-.topbar{padding-left:clamp(20px,4vw,56px);padding-right:clamp(20px,4vw,56px)}
+main{padding:20px clamp(12px,1.6vw,24px);max-width:none;margin:0;width:100%}
+.topbar{padding-left:clamp(12px,1.6vw,24px);padding-right:clamp(12px,1.6vw,24px)}
 
 .btn{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:8px 14px;cursor:pointer;font-size:14px}
 .btn:hover{background:var(--accent2)}
@@ -33,8 +33,30 @@ main{padding:20px clamp(20px,4vw,56px);max-width:1760px;margin:0 auto;width:100%
 
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top}
-th{color:var(--muted);font-weight:500}
+th{color:var(--muted);font-weight:500;white-space:nowrap}
 tr:hover td{background:var(--panel2)}
+.table-wrap{width:100%;overflow-x:auto}
+.data-table{table-layout:fixed;min-width:980px}
+.data-table td{overflow-wrap:anywhere}
+.data-table .loc{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:var(--muted);word-break:break-all}
+.run-table th:nth-child(1),.run-table td:nth-child(1){width:92px}
+.run-table th:nth-child(3),.run-table td:nth-child(3){width:120px}
+.run-table th:nth-child(4),.run-table td:nth-child(4),.run-table th:nth-child(5),.run-table td:nth-child(5){width:72px}
+.run-table th:nth-child(6),.run-table td:nth-child(6){width:190px}
+.run-table th:nth-child(7),.run-table td:nth-child(7){width:78px}
+.risk-table{min-width:1120px}
+.risk-table th:nth-child(1),.risk-table td:nth-child(1){width:100px}
+.risk-table th:nth-child(2),.risk-table td:nth-child(2){width:18%}
+.risk-table th:nth-child(3),.risk-table td:nth-child(3){width:20%}
+.risk-table th:nth-child(5),.risk-table td:nth-child(5){width:92px}
+.risk-table th:nth-child(6),.risk-table td:nth-child(6){width:108px}
+.history-table{min-width:1180px}
+.history-table th:nth-child(1),.history-table td:nth-child(1){width:92px}
+.history-table th:nth-child(2),.history-table td:nth-child(2){width:34%}
+.history-table th:nth-child(3),.history-table td:nth-child(3){width:116px}
+.history-table th:nth-child(4),.history-table td:nth-child(4){width:112px}
+.history-table th:nth-child(5),.history-table td:nth-child(5){width:170px}
+.history-table th:nth-child(6),.history-table td:nth-child(6){width:24%}
 
 .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;color:#fff}
 .sev-critical{background:var(--crit)} .sev-high{background:var(--high)} .sev-medium{background:var(--med)}

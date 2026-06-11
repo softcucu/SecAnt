@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import collections
 import math
 import json
 import os
@@ -15,7 +16,7 @@ import tempfile
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .config import Config
+from .config import Config, normalize_model_concurrency, normalize_models
 
 # 后端 CLI 已自行重试瞬时 API 抖动;本层只在"CLI 任务整体失败"时重试(非零退出/超时/输出不可解析)。
 # 这个正则只用来**判断该不该退避更久**:若失败信息像"被限流/额度耗尽",则用更长退避等服务端恢复。
@@ -617,6 +618,86 @@ async def _drain_process(
         raise
 
 
+class DynamicSemaphore:
+    """容量可在运行中调整的 asyncio 信号量(用于动态增减并发)。
+
+    语义与 asyncio.Semaphore 一致(acquire/release/locked),额外支持 set_limit(n):
+      · 扩容:立即放行等量的等待者;
+      · 缩容:**不打断**已持有的名额,只阻止新的获取,直到占用自然回落到新上限以下。
+    缩容时内部可用计数 _value 可能暂时为负,后续 release 会把它逐步抬回正值。
+    实现照搬 CPython asyncio.Semaphore 的等待者唤醒逻辑,并加上 `_value > 0` 的放行护栏。
+    """
+
+    def __init__(self, value: int = 1):
+        value = max(0, int(value))
+        self._value = value            # 当前可用名额(缩容后可能为负)
+        self._limit = value            # 配置上限(用于自省 / 再次调整)
+        self._waiters: "collections.deque[asyncio.Future]" = collections.deque()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    def available(self) -> int:
+        return max(0, self._value)
+
+    def locked(self) -> bool:
+        return self._value <= 0 or any(not w.cancelled() for w in self._waiters)
+
+    async def acquire(self) -> bool:
+        if not self.locked():
+            self._value -= 1
+            return True
+        fut = asyncio.get_event_loop().create_future()
+        self._waiters.append(fut)
+        try:
+            try:
+                await fut
+            finally:
+                if fut in self._waiters:
+                    self._waiters.remove(fut)
+        except asyncio.CancelledError:
+            if not fut.cancelled():
+                # 已被唤醒(拿到名额)但随即被取消 → 归还并转交下一个等待者
+                self._value += 1
+                self._wake_next()
+            raise
+        if self._value > 0:
+            self._wake_next()
+        return True
+
+    def release(self) -> None:
+        self._value += 1
+        self._wake_next()
+
+    def _wake_next(self) -> None:
+        if self._value <= 0:
+            return
+        for fut in self._waiters:
+            if not fut.done():
+                self._value -= 1
+                fut.set_result(True)
+                return
+
+    def set_limit(self, value: int) -> None:
+        """调整容量上限;按差值同步可用名额,扩容则立即唤醒等量等待者。"""
+        value = max(0, int(value))
+        delta = value - self._limit
+        if not delta:
+            return
+        self._limit = value
+        self._value += delta
+        for _ in range(max(0, delta)):
+            self._wake_next()
+
+    async def __aenter__(self) -> "DynamicSemaphore":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        self.release()
+
+
 class AgentRunner:
     """封装并发门 + 重试 + 子进程调用。一个实例对应一次运行。"""
 
@@ -625,7 +706,7 @@ class AgentRunner:
                  health_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
                  agent_sink: Optional[Callable[[Dict[str, Any]], None]] = None):
         self.cfg = cfg
-        self._sem: Optional[asyncio.Semaphore] = None  # 惰性创建(避免在事件循环外构造时绑错 loop,兼容 py3.8)
+        self._sem: Optional[DynamicSemaphore] = None  # 惰性创建(避免在事件循环外构造时绑错 loop,兼容 py3.8)
         self.spec = cfg.backend_spec()
         self.log = logger
         self.usage_sink = usage_sink
@@ -644,7 +725,7 @@ class AgentRunner:
         }
         self._jitter = 0
         self._model_cursor: Dict[str, int] = {}
-        self._model_sems: Dict[str, asyncio.Semaphore] = {}
+        self._model_sems: Dict[str, DynamicSemaphore] = {}
         self._capacity_wait_s = 0.05
 
     def _emit_agent(self, rec: Dict[str, Any]) -> None:
@@ -656,19 +737,39 @@ class AgentRunner:
         except Exception:
             pass
 
-    def _semaphore(self) -> asyncio.Semaphore:
+    def _semaphore(self) -> DynamicSemaphore:
         if self._sem is None:
-            self._sem = asyncio.Semaphore(self.cfg.concurrency)
+            self._sem = DynamicSemaphore(self.cfg.concurrency)
         return self._sem
 
-    def _model_semaphore(self, model: str) -> asyncio.Semaphore:
+    def _model_semaphore(self, model: str) -> DynamicSemaphore:
         if model not in self._model_sems:
-            self._model_sems[model] = asyncio.Semaphore(self.cfg.model_concurrency_for(model))
+            self._model_sems[model] = DynamicSemaphore(self.cfg.model_concurrency_for(model))
         return self._model_sems[model]
 
     @staticmethod
-    def _sem_capacity(sem: asyncio.Semaphore) -> int:
-        return int(getattr(sem, "_value", 0) or 0)
+    def _sem_capacity(sem: DynamicSemaphore) -> int:
+        return sem.available()
+
+    def reconfigure(self, *, concurrency: Optional[int] = None,
+                    model_concurrency: Optional[Any] = None) -> Dict[str, Any]:
+        """运行中动态调整并发门(全局并发 + 每模型并发),就地改写 cfg 并重设已存在的信号量。
+
+        必须在该 run 的事件循环线程内调用(经 Pipeline.reconfigure / 服务端协程)。
+        模型的增删由 cfg.models 决定、调度时动态读取,无需在此处理;这里只负责并发容量。
+        """
+        if concurrency is not None:
+            self.cfg.concurrency = max(1, int(concurrency))
+            if self._sem is not None:
+                self._sem.set_limit(self.cfg.concurrency)
+        if model_concurrency is not None:
+            self.cfg.model_concurrency = normalize_model_concurrency(model_concurrency)
+        # 不论是全局并发变了(影响未单独配置的模型的默认值)还是 per-model 配置变了,
+        # 都把已存在的每模型信号量按最新有效上限重设一遍。
+        for model, sem in self._model_sems.items():
+            sem.set_limit(self.cfg.model_concurrency_for(model))
+        return {"concurrency": self.cfg.concurrency,
+                "model_concurrency": dict(self.cfg.model_concurrency)}
 
     async def reserve_slots(self, n: int) -> int:
         """从**全局并发池**预占 n 个名额并一直持有(兼容旧的专用通道实现):

@@ -21,7 +21,7 @@ from . import schemas as S
 from .backends import AgentRunner
 from .common import (class_code, finalize_findings, finding_key, item_key,
                      most_severe, pad3, slim_finding)
-from .config import Config
+from .config import Config, normalize_models
 from .prompts import VERIFY_LENSES, PromptBuilder
 from .store import RunStore, STATUS_DONE, STATUS_ERROR, STATUS_RUNNING, STATUS_STOPPED
 
@@ -103,6 +103,7 @@ class Pipeline:
         except Exception:
             pass
         self.emit(EV.USAGE, rec)
+        self.emit(EV.METRICS, self._summary_snapshot(self.round))
 
     def record_health(self, rec: Dict[str, Any]) -> None:
         """模型健康记录更新:整体快照落盘 + 实时事件(供 Web「模型」页实时呈现)。"""
@@ -118,6 +119,8 @@ class Pipeline:
     def record_agent(self, rec: Dict[str, Any]) -> None:
         """agent 子进程状态与 stdout/stderr chunk:经 SSE 推给 Web「Agent」页。"""
         self.emit(EV.AGENT_UPDATE, rec)
+        if rec.get("status") != "output":
+            self.emit(EV.METRICS, self._summary_snapshot(self.round))
 
     async def health_check_all(self) -> Dict[str, Any]:
         """运行前(或按需)对所有配置的模型各发一个 1+1 探针,实时反映健康度。"""
@@ -404,6 +407,76 @@ class Pipeline:
         self.store.save_risk(note)
         self.emit(EV.RISK_SEVERITY_CHANGED, {"id": rid, "severity_hint": sev, "old": old, "action": action})
         return True
+
+    # ──────────────────────── 运行中动态调参 ────────────────────────
+    def reconfigure(self, patch: Dict[str, Any]) -> Dict[str, Any]:
+        """运行中动态调整模型与并发(供 Web 接口调用)。可含:
+          · models:{role: [model, ...]} —— 增/减某角色的模型(空列表=清空该角色,会触发配置错误提示);
+          · model_concurrency:{model: limit} —— 每模型并发上限;
+          · concurrency:int —— 全局并发。
+        就地改写 self.cfg(scheduler/各 acquire 都实时读它)并重设已存在的信号量;
+        新增模型的 per-model 信号量在首次派任务时按新配置惰性创建。返回当前生效快照(含配置校验)。
+        """
+        patch = patch or {}
+        changed: List[str] = []
+
+        if "models" in patch and isinstance(patch["models"], dict):
+            old_models = self.cfg.all_models()
+            self.cfg.models = normalize_models(patch["models"])
+            new_models = self.cfg.all_models()
+            added = [m for m in new_models if m not in old_models]
+            removed = [m for m in old_models if m not in new_models]
+            if added or removed:
+                bits = []
+                if added:
+                    bits.append("新增 " + ", ".join(added))
+                if removed:
+                    bits.append("移除 " + ", ".join(removed))
+                changed.append("模型(" + ";".join(bits) + ")")
+            else:
+                changed.append("模型分配")
+            # 启动健康探针只覆盖了当时配置的模型;新增的模型在后台补探一次。
+            if added and self.cfg.health.enabled:
+                for m in added:
+                    asyncio.ensure_future(self.runner.probe_model(m, reason="reconfigure"))
+
+        conc = patch.get("concurrency")
+        mconc = patch.get("model_concurrency") if "model_concurrency" in patch else None
+        if conc is not None:
+            changed.append(f"全局并发→{max(1, int(conc))}")
+        if mconc is not None:
+            changed.append("每模型并发")
+        if conc is not None or mconc is not None:
+            self.runner.reconfigure(concurrency=conc, model_concurrency=mconc)
+
+        # 落盘到 manifest.config:续跑沿用最新配置
+        try:
+            self.store.update_config({
+                "models": self.cfg.models,
+                "model_concurrency": self.cfg.model_concurrency,
+                "concurrency": self.cfg.concurrency,
+            })
+        except Exception:
+            pass
+
+        snapshot = self.config_snapshot()
+        if changed:
+            self.log("⚙ 动态调参:" + " | ".join(changed) + f"(全局并发 {self.cfg.concurrency})")
+        if snapshot.get("model_config_error"):
+            self.log("⚠ 当前模型配置不完整:" + snapshot["model_config_error"] + "(已派出的任务不受影响)")
+        self.emit(EV.CONFIG_UPDATED, snapshot)
+        return snapshot
+
+    def config_snapshot(self) -> Dict[str, Any]:
+        """当前生效的模型/并发配置快照(含逐模型实际并发上限与配置校验)。"""
+        eff = {m: self.cfg.model_concurrency_for(m) for m in self.cfg.all_models()}
+        return {
+            "models": self.cfg.models,
+            "model_concurrency": self.cfg.model_concurrency,
+            "effective_model_concurrency": eff,
+            "concurrency": self.cfg.concurrency,
+            "model_config_error": self.cfg.model_config_error(),
+        }
 
     # ──────────────────────── lens 选择 ────────────────────────
     def lenses_for(self, item: Dict[str, Any]) -> List[str]:
