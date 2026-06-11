@@ -152,7 +152,7 @@ def render_finding_md(finding: Dict[str, Any]) -> str:
     body = (finding.get("report_body") or "").strip()
     if not body:
         poc = finding.get("poc")
-        body = (f"## ① Description\n{finding.get('description') or finding.get('title')}\n\n"
+        body = (f"## ① 漏洞描述\n{finding.get('description') or finding.get('title')}\n\n"
                 f"## ⑦ PoC / 验证结果\n{json.dumps(poc, ensure_ascii=False) if poc else '(无)'}\n")
     return f"---\n{fm_lines}\n---\n\n{body}\n"
 

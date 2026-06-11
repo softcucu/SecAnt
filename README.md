@@ -181,14 +181,14 @@ REST/SSE 接口(`serve` 时):`/api/runs`(GET/POST)、`/api/runs/{id}`、`/stop`�
 
 - **模型健康检查**:运行开始前对**所有配置的模型**各发一个极小探针(默认问 `1+1=?`),确认每个模型可达且能正常回答;之后真正用某模型派任务前,若其健康状态未知/异常/陈旧(超过 `ttl_s`)会自动补检一次(按 ttl 去重,不会每次都探)。健康度(状态/延迟/探针答复/成功调用数/失败数)在 Web「模型」页**实时**呈现,可手动「重新检查」。探针不计入 token 用量。配置见 `config.example.yaml` 的 `health_check:` 块(可关闭)。
 - **并发门**:`asyncio.Semaphore`,任意时刻 ≤ `concurrency` 个 CLI 子进程在跑。
-- **CLI 任务失败重试**:opencode/claude/codex 内部已自行重试瞬时 API 抖动;本层只在 **CLI 任务整体失败**(子进程非零退出 / 超时 / 输出无法解析为所需结构化 JSON)时重试——指数退避(`retry.backoff_*`,疑似限流时自动延长)、最多 `retry.max_attempts` 次,耗尽后跳过该 agent(漏洞靠在途候选 + 续跑挽回)。
-- **单 agent 失败隔离**:任一子进程异常/未产出结构化结果只跳过该条,不拖垮整体。
+- **CLI 任务失败重试**:opencode/claude/codex 内部已自行重试瞬时 API 抖动;本层只在 **CLI 任务整体失败**(子进程非零退出 / 超时 / 输出无法解析为所需结构化 JSON)时重试——指数退避(`retry.backoff_*`,疑似限流时自动延长)。`retry.max_attempts` 是单组最多重试次数;recon 会不限组数一直重试到拿到结构化结果或用户停止,audit/recheck 单组耗尽后把该审计项放回队尾稍后继续重试。
+- **单 agent 失败隔离**:任一子进程异常/未产出结构化结果只影响该 agent/审计项,不拖垮整体;audit/recheck 会回队重试。
 - **断点续跑**:侦察后/每轮/收尾各存 `state.json`;在途候选(`pendingFindings`)整块持久化,续跑重注入,synthesis 再按 `file:line:bug_class` 去重。Web 重启时把"清单写着 running 但已无任务"的 run 标记为 `interrupted`,可一键续跑。
 - **实时事件**:`Pipeline` 经 `EventBus` 发结构化事件 → 同步落 `events.jsonl` + 广播给 SSE 订阅者;前端用 `EventSource`(断线自动带 `Last-Event-ID` 续传)。
 
 ## 已知边界
 
-- 结构化输出靠"要求 agent 输出 ```json 块 + 本地解析",而非引擎级强约束;解析失败按 CLI 任务失败有限重试。
+- 结构化输出靠"要求 agent 输出 ```json 块 + 本地解析",而非引擎级强约束;解析失败按 CLI 任务失败策略重试,recon 不再因有限次数失败直接使用兜底攻击面。
 - PoC 的 worktree 隔离依赖目标是 git 仓;否则在主仓目录跑(以静态 PoC 为主)。
 - 并发等同你机器能开的子进程数;真实并发还受后端服务端限流约束。
 - Web 控制台默认绑 `127.0.0.1`、无鉴权(本地单机工具)。对外暴露请自行加反代/鉴权。

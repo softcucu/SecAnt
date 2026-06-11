@@ -106,7 +106,8 @@ health_check:
 
 # ── 后端 CLI 任务执行失败后的重试 ──
 # 注意:opencode/claude/codex 内部已自行重试瞬时 API 抖动;这一层只在 **CLI 任务整体失败** 时重试,
-# 即:子进程非零退出 / 超时 / 输出无法解析为所需的结构化 JSON。耗尽后跳过该 agent(漏洞靠续跑挽回)。
+# 即:子进程非零退出 / 超时 / 输出无法解析为所需的结构化 JSON。max_attempts 是单组重试次数;
+# recon 会一直重试到成功或用户停止,audit/recheck 单组耗尽后把审计项放回队尾稍后继续重试。
 retry:
   max_attempts: 4               # 失败后最多再重试几次(总尝试 = 1 + max_attempts)
   backoff_base_ms: 2000         # 退避基数(指数增长;疑似限流时自动延长)

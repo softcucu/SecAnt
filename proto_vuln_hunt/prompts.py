@@ -9,12 +9,19 @@ import json
 from typing import Any, Dict, List
 
 
+OUTPUT_LANGUAGE_ZH = (
+    "【语言要求】除 JSON 字段名、schema 枚举值、代码/命令/路径/函数名/报错原文等必须原样保留的内容外,"
+    "最终输出中的所有自然语言必须使用中文;不要用英文写标题、摘要、描述、理由、报告正文或 Markdown 小节名。"
+)
+
+
 def must_struct(schema: Dict[str, Any]) -> str:
     """结构化收尾要求 + 内联 schema。"""
     return (
         "\n\n【必须遵守】完成分析后,**必须只输出一个 ```json 代码块**作为最终结果,"
         "其内容是符合下面 JSON Schema 的对象;不要在代码块之外再写解释,也不要输出多个 JSON 块。"
         "如果没有发现任何条目,也要返回(数组字段为空数组的)合法结构。\n"
+        f"{OUTPUT_LANGUAGE_ZH}\n"
         "JSON Schema:\n```json\n" + json.dumps(schema, ensure_ascii=False) + "\n```"
     )
 
@@ -335,18 +342,19 @@ class PromptBuilder:
         }, ensure_ascii=False) if poc else "(未做动态 PoC,给出静态触发构造说明)"
         return (
             f"把下面这**一条**已确认漏洞写成中文 Markdown **正文**(不要写 YAML frontmatter,我会自己加)。\n"
+            f"{OUTPUT_LANGUAGE_ZH}\n"
             f"目标仓:{self.target}{self.scope_note};漏洞位置 {rec.get('file')}:{rec.get('line') or '?'} 函数 {rec.get('function')}。\n\n"
             "正文按以下小节(与方法库 00-methodology.md 的 7 段式一致):\n"
-            "① **Description** —— 为什么是漏洞:破坏了什么不变量、攻击者控制什么;\n"
-            "② **Code** —— 用 Read 取真实代码片段贴出(够上下文让 bug 一目了然),不要转述;\n"
-            "③ **Data flow** —— Source(不可信来源 path:line)/ Sink(危险点 path:line)/ Validation(中途有无校验、为何不足);\n"
-            "④ **Reachability trace** —— 从真实入口到 sink 的简短调用链;\n"
-            f"⑤ **Impact & 可利用性**(威胁模型 {self.threat}):{rec.get('exploitability') or '见验证结论'};\n"
-            "⑥ **Mitigations checked** —— canary / ASLR / FORTIFY / sanitizer / 类型上界 等 present/absent、可否绕过;\n"
+            "① **漏洞描述** —— 为什么是漏洞:破坏了什么不变量、攻击者控制什么;\n"
+            "② **相关代码** —— 用 Read 取真实代码片段贴出(够上下文让 bug 一目了然),不要转述;\n"
+            "③ **数据流** —— 来源(不可信来源 path:line)/危险点(sink path:line)/校验(中途有无校验、为何不足);\n"
+            "④ **可达性调用链** —— 从真实入口到 sink 的简短调用链;\n"
+            f"⑤ **影响与可利用性**(威胁模型 {self.threat}):{rec.get('exploitability') or '见验证结论'};\n"
+            "⑥ **已检查缓解** —— canary / ASLR / FORTIFY / sanitizer / 类型上界等是否存在、可否绕过;\n"
             f"⑦ **PoC / 验证结果**:{poc_brief};\n"
-            f"⑧ **Recommendation** —— 怎么修;⑨ 置信度={rec.get('confidence')}(说明依据)。\n"
+            f"⑧ **修复建议** —— 怎么修;⑨ 置信度={rec.get('confidence')}(说明依据)。\n"
             f"对抗性验证结论(供你参考,提炼进报告):{votes_brief}\n"
-            "**只输出报告正文 Markdown 本身**(从 ## ① Description 之类开始),不要任何额外说明、不要代码块包裹整篇。"
+            "**只输出报告正文 Markdown 本身**(从 ## ① 漏洞描述 之类开始),不要任何额外说明、不要代码块包裹整篇。"
         )
 
     # ── 汇总(INDEX.md 正文) ──
@@ -364,13 +372,14 @@ class PromptBuilder:
         conv = "已收敛" if converged else f"未收敛 —— {stop_reason},可重跑(resume 默认开)续审"
         return (
             "请输出一篇中文 **INDEX.md 正文**(纯 Markdown,我会直接保存为 INDEX.md;不要写 frontmatter,不要用代码块包裹整篇),结构:\n"
+            f"{OUTPUT_LANGUAGE_ZH}\n"
             f"① 摘要:目标 {self.target}{self.scope_note};威胁模型 {self.threat};方法库 {methods_note};"
             f"确认漏洞 {len(final_findings)} 条;候选去重池 {candidates};最高危等级 {top_sev};收敛情况:{conv};审计轮数 {rounds}。\n"
             f"② 按 bug_class 计数:{json.dumps(counts, ensure_ascii=False)}\n"
             f"③ 攻击面地图(精炼):{surf}\n"
             f"④ 仓库知识与历史模式提要:{knowledge}\n"
             f"⑤ 漏洞索引表(severity 从高到低,每行链接到 findings/<id>.md):{idx_rows}\n"
-            "⑥ 建议的 fuzz harness(针对最高优先级的解析/收包入口,给出 hook 哪个函数、如何用 libFuzzer/AFL++ 插桩编译)。\n"
+            "⑥ 建议的模糊测试桩(针对最高优先级的解析/收包入口,给出挂钩哪个函数、如何用 libFuzzer/AFL++ 插桩编译)。\n"
             "⑦ 下一步动态验证计划。\n"
             "直接输出 Markdown 正文。"
         )

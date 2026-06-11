@@ -8,6 +8,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from proto_vuln_hunt.config import Config, RecheckSpec, load_config
+from proto_vuln_hunt.common import item_key
 from proto_vuln_hunt.pipeline import Pipeline
 from proto_vuln_hunt.store import RunStore
 
@@ -61,6 +62,81 @@ class TestPriorityOrdering(unittest.TestCase):
             self.assertEqual(first["kind"], "variant")
             rest = [p._pop_priority()["kind"], p._pop_priority()["kind"]]
             self.assertEqual(rest, ["risk", "risk"])
+
+
+class TestAuditRetryQueue(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_audit_item_retries_past_max_rounds_until_success(self):
+        class DummyRunner:
+            def __init__(self):
+                self.calls = 0
+                self.agent_count = 0
+                self.usage_totals = {
+                    "calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "estimated_calls": 0,
+                }
+
+            async def run(self, *_args, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return None
+                return {"findings": [], "new_surfaces": [], "risk_notes": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(
+                target=tmp,
+                out_dir=os.path.join(tmp, "out"),
+                lenses=["memory"],
+                finders_per_lens=1,
+                max_rounds=1,
+                dry_rounds=1,
+                decompose=False,
+            )
+            store = RunStore(cfg.out_dir).ensure()
+            p = Pipeline(cfg, store=store)
+            runner = DummyRunner()
+            p.runner = runner
+            item = {"kind": "task", "region": "r", "objective": "o", "files": []}
+            p.queue.append(item)
+
+            stop_reason = await p.audit()
+
+            self.assertEqual(runner.calls, 2)
+            self.assertEqual(p.queue, [])
+            self.assertIn(item_key(item), p.completed_items)
+            self.assertNotIn("retry_after_failure", item)
+            self.assertIn("失败重试队列已补审完成", stop_reason)
+
+
+class TestRecheckRetryQueue(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_recheck_item_is_requeued_not_completed(self):
+        class DummyRunner:
+            agent_count = 0
+            usage_totals = {
+                "calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "estimated_calls": 0,
+            }
+
+            async def run(self, *_args, **_kwargs):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = _pipe(tmp)
+            p.runner = DummyRunner()
+            p.round = 1
+            item = {"kind": "variant", "pattern": "v1", "source": "c1", "files": [], "lens_hint": "memory"}
+
+            await p._run_recheck(item)
+
+            self.assertEqual(p.pq, [item])
+            self.assertEqual(item.get("retry_after_failure"), 1)
+            self.assertNotIn(item_key(item), p.completed_items)
+            self.assertEqual(p.ledger_rec(item)["status"], "incomplete")
 
 
 class TestAdjustSeverity(unittest.TestCase):

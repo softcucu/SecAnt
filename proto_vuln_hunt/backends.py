@@ -1029,9 +1029,12 @@ class AgentRunner:
         retries: Optional[int] = None,
         fallback: Any = None,
         use_global_gate: bool = True,
+        retry_forever: bool = False,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> Any:
         """schema 非空 → 返回解析后的 dict/list;schema 为空 → 返回 agent 最终文本。
         失败重试上限取 `retries`(未传则用 cfg.retry.max_attempts);耗尽后返回 fallback(跳过,靠续跑挽回)。
+        retry_forever=True 时忽略重试上限,一直重试到成功或 should_stop() 变真。
         use_global_gate=False:本次调用不再去抢全局 concurrency 名额(仅受 per-model 信号量约束)。
         仅供已通过 reserve_slots 预占好全局名额的独立阶段(如 git 历史挖掘)使用——名额已被预占持有、
         计入总并发,故这里直接复用、不重复申请;该阶段结束 release_slots 后名额归还,主流程回满。
@@ -1057,8 +1060,31 @@ class AgentRunner:
 
         emit_agent("queued", prompt_chars=len(prompt or ""), schema=bool(schema))
 
+        async def retry_sleep(wait_ms: int) -> bool:
+            if should_stop is None:
+                await asyncio.sleep(wait_ms / 1000.0)
+                return True
+            end = time.time() + wait_ms / 1000.0
+            while True:
+                if should_stop():
+                    return False
+                remain = end - time.time()
+                if remain <= 0:
+                    return True
+                await asyncio.sleep(min(1.0, remain))
+
         attempt = 0
         while True:
+            if should_stop is not None and should_stop():
+                msg = "用户请求停止"
+                self.log(f"⚠ {tag} CLI 任务停止重试: {msg}")
+                emit_agent(
+                    "failed",
+                    attempt=attempt,
+                    duration_ms=int((time.time() - agent_started) * 1000),
+                    error=msg,
+                )
+                return fallback
             model = self._next_model(role)
             await self.ensure_healthy(model)   # gate:调用前按需补一次健康探针(ttl 去重,不阻断)
             global_gate = self._semaphore() if use_global_gate else _NULL_ASYNC_CTX
@@ -1119,8 +1145,8 @@ class AgentRunner:
                         )
             # 退避/重试在信号量之外等待(不占用并发额度)
             attempt += 1
-            if attempt > max_attempts:
-                self.log(f"⚠ {tag} CLI 任务连续失败 {attempt} 次,放弃跳过(留待续跑): {msg[:120]}")
+            if (not retry_forever) and attempt > max_attempts:
+                self.log(f"⚠ {tag} CLI 任务连续失败 {attempt} 次,本组重试耗尽: {msg[:120]}")
                 emit_agent(
                     "failed",
                     model=model,
@@ -1131,7 +1157,11 @@ class AgentRunner:
                 return fallback
             wait_ms = self._backoff_ms(attempt, msg)
             limited = "(疑似限流,延长退避)" if looks_rate_limited(msg) else ""
-            self.log(f"⚠ {tag} CLI 任务失败(第 {attempt}/{max_attempts} 次重试{limited}),{wait_ms // 1000}s 后重试: {msg[:100]}")
+            if retry_forever:
+                retry_desc = f"第 {attempt} 次重试/不限次数{limited}"
+            else:
+                retry_desc = f"第 {attempt}/{max_attempts} 次重试{limited}"
+            self.log(f"⚠ {tag} CLI 任务失败({retry_desc}),{wait_ms // 1000}s 后重试: {msg[:100]}")
             emit_agent(
                 "retrying",
                 model=model,
@@ -1140,4 +1170,14 @@ class AgentRunner:
                 next_attempt=attempt + 1,
                 error=msg[:500],
             )
-            await asyncio.sleep(wait_ms / 1000.0)
+            if not await retry_sleep(wait_ms):
+                msg = "用户请求停止"
+                self.log(f"⚠ {tag} CLI 任务停止重试: {msg}")
+                emit_agent(
+                    "failed",
+                    model=model,
+                    attempt=attempt,
+                    duration_ms=int((time.time() - agent_started) * 1000),
+                    error=msg,
+                )
+                return fallback

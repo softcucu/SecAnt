@@ -62,13 +62,13 @@
 ## 四、Finding 写法(7 段式,与报告阶段一致)
 
 确认一条漏洞时,信息按这 7 段组织(报告阶段会据此成文):
-1. **Description** —— 为什么是漏洞:破坏了什么不变量、什么假设失效、攻击者控制什么。
-2. **Code** —— 从源码摘真实片段(够上下文让 bug 一目了然),不要转述。
-3. **Data flow** —— Source(不可信来源 path:line)/ Sink(危险点 path:line)/ Validation(中途有无校验,有则为何不足)。
-4. **Reachability trace** —— 从入口到 sink 的简短调用链。
-5. **Impact** —— 成功利用能达成什么(OOB 写 / 信息泄露 / 认证绕过 / RCE / DoS)。
-6. **Mitigations checked** —— canary / ASLR / FORTIFY / sanitizer / 类型上界 等,present/absent,可否绕过。
-7. **Recommendation** —— 怎么修。
+1. **漏洞描述** —— 为什么是漏洞:破坏了什么不变量、什么假设失效、攻击者控制什么。
+2. **相关代码** —— 从源码摘真实片段(够上下文让 bug 一目了然),不要转述。
+3. **数据流** —— 来源(不可信来源 path:line)/危险点(sink path:line)/校验(中途有无校验,有则为何不足)。
+4. **可达性调用链** —— 从入口到 sink 的简短调用链。
+5. **影响** —— 成功利用能达成什么(OOB 写 / 信息泄露 / 认证绕过 / RCE / DoS)。
+6. **已检查缓解** —— canary / ASLR / FORTIFY / sanitizer / 类型上界等是否存在、可否绕过。
+7. **修复建议** —— 怎么修。
 
 一个站点一条 finding;同一根因出现在多个函数则拆成多条(各自的 path:line)。
 

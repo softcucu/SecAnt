@@ -505,7 +505,11 @@ class Pipeline:
         if self.cfg.resume:
             self.log("未找到可用断点,从头开始侦察")
         surface = await self.runner.run(self.pb.recon(S.SURFACE_SCHEMA), role="recon", label="recon",
-                                        schema=S.SURFACE_SCHEMA, retries=2, fallback=None)
+                                        schema=S.SURFACE_SCHEMA, retry_forever=True, fallback=None,
+                                        should_stop=self.stop_requested)
+        if not surface and self.stop_requested():
+            self.log("侦察阶段收到停止请求,不再兜底继续")
+            return
         if not surface:
             self.log("⚠ 侦察失败,使用兜底攻击面继续审计")
             surface = {
@@ -531,6 +535,19 @@ class Pipeline:
                                   "build_hint": self.build_hint})
         self.persist_recon()
         self.checkpoint(0)
+
+    def _mark_retry_after_failure(self, item: Dict[str, Any]) -> int:
+        n = int(item.get("retry_after_failure") or 0) + 1
+        item["retry_after_failure"] = n
+        return n
+
+    @staticmethod
+    def _clear_retry_after_failure(item: Dict[str, Any]) -> None:
+        item.pop("retry_after_failure", None)
+
+    @staticmethod
+    def _queue_retry_only(queue: List[Dict[str, Any]]) -> bool:
+        return bool(queue) and all(bool(it.get("retry_after_failure")) for it in queue)
 
     # ──────── 并行阶段:git 历史问题模式挖掘(每条提交一个 agent,独立于侦察、不阻塞主流程)────────
     def _collect_commits(self) -> List[Dict[str, str]]:
@@ -653,6 +670,7 @@ class Pipeline:
         self.round = self.start_round
         dry_streak = 0
         max_passes = self.cfg.max_rounds
+        retrying_past_max_rounds = False
 
         if self.cfg.decompose:
             region_items = [it for it in self.queue if it.get("kind") == "region" and item_key(it) not in self.completed_items]
@@ -667,7 +685,15 @@ class Pipeline:
                 self.emit_coverage()
 
         while (self.queue or dry_streak < self.cfg.dry_rounds or self._history_active()) \
-                and self.round < self.cfg.max_rounds and not self.stop_requested():
+                and not self.stop_requested():
+            if self.round >= self.cfg.max_rounds:
+                if self._queue_retry_only(self.queue):
+                    if not retrying_past_max_rounds:
+                        retrying_past_max_rounds = True
+                        self.log(f"已达到 maxRounds({self.cfg.max_rounds}),但队列只剩瞬时失败重试项;"
+                                 "继续补审直到成功或用户停止")
+                else:
+                    break
             if not self.queue:
                 # 主队列暂空:只要 git 历史挖掘 / 优先排查队列还有活,就等它们(不空烧回合数、不提前收敛)
                 if self._history_active() or self.pq or self._recheck_inflight > 0:
@@ -682,6 +708,7 @@ class Pipeline:
             new_findings = 0
             new_surfaces = 0
             audit_tasks = []
+            retry_later: List[Dict[str, Any]] = []
 
             for item in batch:
                 if item_key(item) in self.completed_items:
@@ -712,18 +739,25 @@ class Pipeline:
                 if ik in self.completed_items:
                     continue
                 rec = self.ledger_map.get(ik)
-                if item.get("newThisRound", 0) > 0 and item["pass"] < max_passes:
+                failed = item.get("failedFinders", 0) > 0
+                if failed:
+                    self._mark_retry_after_failure(item)
+                    retry_later.append(item)
+                    if rec:
+                        rec["status"] = "incomplete"
+                elif item.get("newThisRound", 0) > 0 and item["pass"] < max_passes:
+                    self._clear_retry_after_failure(item)
                     self.queue.append(item)
                     if rec:
                         rec["status"] = "in-progress"
-                elif item.get("failedFinders", 0) > 0:
-                    self.queue.append(item)
-                    if rec:
-                        rec["status"] = "incomplete"
                 else:
+                    self._clear_retry_after_failure(item)
                     self.completed_items.add(ik)
                     if rec:
                         rec["status"] = "completed-findings" if rec.get("candidates", 0) > 0 else "completed-clean"
+            if retry_later:
+                self.queue.extend(retry_later)
+                self.log(f"本轮有 {len(retry_later)} 个审计项因 CLI/结构化输出连续失败被放回队尾,稍后继续重试")
 
             if new_findings == 0 and new_surfaces == 0:
                 dry_streak += 1
@@ -740,7 +774,10 @@ class Pipeline:
         if self.stop_requested():
             stop_reason = "用户请求停止"
         elif self.round >= self.cfg.max_rounds:
-            stop_reason = f"达到 maxRounds({self.cfg.max_rounds})"
+            if retrying_past_max_rounds and not self.queue:
+                stop_reason = f"达到 maxRounds({self.cfg.max_rounds});失败重试队列已补审完成"
+            else:
+                stop_reason = f"达到 maxRounds({self.cfg.max_rounds})"
         else:
             stop_reason = f"收敛(连续 {self.cfg.dry_rounds} 轮无新增)"
         # git 历史挖掘收尾:正常退出时它一般已结束;若因停止/达上限而仍在跑,则取消并回收
@@ -780,7 +817,8 @@ class Pipeline:
             self.pb.audit(item, lens_key, idx, S.FINDINGS_SCHEMA),
             role="audit",
             label=f"audit:{str(item.get('objective') or item.get('name') or item.get('pattern') or 'item')[:20]}:{lens_key}#{item['pass']}.{idx + 1}",
-            schema=S.FINDINGS_SCHEMA)
+            schema=S.FINDINGS_SCHEMA,
+            should_stop=self.stop_requested)
         if not res:
             item["failedFinders"] = item.get("failedFinders", 0) + 1
             return
@@ -905,7 +943,22 @@ class Pipeline:
         if lens_key not in rec["lenses"]:
             rec["lenses"].append(lens_key)
         res = await self.runner.run(prompt, role="recheck", label=label, schema=S.FINDINGS_SCHEMA,
-                                    use_global_gate=False)   # 名额已由 worker 预占,复用、不重复申请全局门
+                                    use_global_gate=False,
+                                    should_stop=self.stop_requested)   # 名额已由 worker 预占,复用、不重复申请全局门
+        if not res:
+            self._mark_retry_after_failure(item)
+            rec["status"] = "incomplete"
+            if kind == "risk" and rid in self.risk_by_id:
+                self.risk_by_id[rid]["recheck_status"] = "queued"
+                self.store.save_risk(self.risk_by_id[rid])
+            self.pq.append(item)
+            self.emit(EV.RECHECK_ENQUEUED, {"kind": kind, "id": rid, "pattern": item.get("pattern"),
+                                            "label": label, "retry": True})
+            self.checkpoint(self.round)
+            self.emit_coverage()
+            self.log(f"优先排查项 {label} 连续失败,已放回队尾稍后重试")
+            return
+        self._clear_retry_after_failure(item)
         if res:
             self._consume(res, item, rec, lens_key, from_recheck=True)
         self.completed_items.add(item_key(item))

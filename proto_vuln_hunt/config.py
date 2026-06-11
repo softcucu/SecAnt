@@ -114,6 +114,7 @@ class RetrySpec:
 
     说明:后端 CLI 内部已自行处理瞬时 API 抖动(限流/5xx 等)的重试;本工具这一层只在
     **CLI 任务整体失败**时重试——即子进程非零退出 / 超时 / 输出无法解析为所需结构化 JSON。
+    max_attempts 是单组重试上限;recon/audit 等阶段可在其外层选择不限组数或回队继续重试。
     """
     max_attempts: int = 4          # 失败后最多再重试几次(总尝试 = 1 + max_attempts)
     backoff_base_ms: int = 2000    # 退避基数(指数增长)

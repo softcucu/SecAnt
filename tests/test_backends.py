@@ -297,6 +297,52 @@ class ProcessDrainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stdout, "alphabeta")
         self.assertEqual(stderr, "warn")
 
+    async def test_retry_forever_continues_parse_failures_until_json(self):
+        script = (
+            "import json,sys\n"
+            "path=sys.argv[1]\n"
+            "try:\n"
+            "    n=int(open(path).read() or '0')\n"
+            "except Exception:\n"
+            "    n=0\n"
+            "open(path,'w').write(str(n+1))\n"
+            "print(json.dumps({'answer': 2}) if n >= 2 else 'not json')\n"
+        )
+        schema = {"type": "object", "required": ["answer"], "properties": {"answer": {"type": "integer"}}}
+        with tempfile.TemporaryDirectory() as d:
+            counter = os.path.join(d, "counter.txt")
+            cfg = Config(
+                target=d,
+                out_dir=os.path.join(d, "out"),
+                backend="dummy",
+                models={"default": ["unit-model"]},
+                backends={
+                    "dummy": BackendSpec(
+                        name="dummy",
+                        command=[sys.executable, "-c", script, counter],
+                        prompt_mode="stdin",
+                        parse="text",
+                    )
+                },
+            )
+            cfg.health.enabled = False
+            cfg.retry.max_attempts = 0
+            cfg.retry.backoff_base_ms = 1
+            cfg.retry.backoff_cap_ms = 1
+            runner = AgentRunner(cfg, logger=lambda *_args, **_kwargs: None)
+
+            parsed = await runner.run(
+                "prompt",
+                role="recon",
+                label="unit",
+                schema=schema,
+                retry_forever=True,
+            )
+
+            self.assertEqual(parsed, {"answer": 2})
+            with open(counter, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "3")
+
     async def test_legacy_opencode_prompt_file_config_sends_prompt_as_message(self):
         script = (
             "import json,sys;"
