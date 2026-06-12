@@ -133,7 +133,7 @@ def cmd_serve(args) -> int:
         print("启动 Web 控制台需要 fastapi 与 uvicorn:\n  pip install fastapi 'uvicorn[standard]'", file=sys.stderr)
         return 1
     from .server import create_app
-    app = create_app(cfg)
+    app = create_app(cfg, config_path=getattr(args, "config", None), overrides=_overrides_from_args(args))
     print(f"proto-vuln-hunt Web 控制台:http://{cfg.host}:{cfg.port}  (runs 目录: {cfg.runs_dir})")
     uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="info")
     return 0

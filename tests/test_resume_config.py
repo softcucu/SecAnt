@@ -7,9 +7,10 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from proto_vuln_hunt.config import Config
+from proto_vuln_hunt.config import Config, load_config
+from proto_vuln_hunt.pipeline import Pipeline
 from proto_vuln_hunt.server import RunManager
-from proto_vuln_hunt.store import RunRegistry
+from proto_vuln_hunt.store import RunRegistry, RunStore
 
 
 _ROLES = ["recon", "history", "recheck", "decompose", "audit", "verify", "report", "poc"]
@@ -31,17 +32,21 @@ class ResumeConfigTest(unittest.TestCase):
         registry = RunRegistry(base.runs_dir).ensure()
         return RunManager(base, registry), registry
 
+    def _stale_run(self, registry, tmp):
+        store = registry.create()
+        # 模拟该 run 首次创建时落盘的旧模型快照
+        store.init_manifest({
+            "target": tmp, "backend": "codex",
+            "models": _models("old-stale-model"),
+            "model_concurrency": {"old-stale-model": 9},
+            "max_rounds": 3,
+        })
+        return store
+
     def test_resume_uses_startup_model_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager, registry = self._manager(tmp, "new-startup-model")
-            store = registry.create()
-            # 模拟该 run 首次创建时落盘的旧模型快照
-            store.init_manifest({
-                "target": tmp, "backend": "codex",
-                "models": _models("old-stale-model"),
-                "model_concurrency": {"old-stale-model": 9},
-                "max_rounds": 3,
-            })
+            store = self._stale_run(registry, tmp)
 
             launched = {}
             manager._launch = lambda cfg, st: launched.setdefault("cfg", cfg) or st.id
@@ -58,6 +63,50 @@ class ResumeConfigTest(unittest.TestCase):
             # 续跑标志生效
             self.assertTrue(cfg.resume)
             self.assertFalse(cfg.fresh)
+
+    def test_resume_rereads_config_file(self):
+        """编辑配置文件后无需重启进程:续跑应读到文件里的最新模型。"""
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = os.path.join(tmp, "cfg.json")
+            # 服务启动时:配置文件里是 file-model-v1
+            with open(cfg_path, "w") as f:
+                _json.dump({"target": tmp, "runs_dir": os.path.join(tmp, "runs"),
+                            "models": _models("file-model-v1")}, f)
+            base = load_config(cfg_path)
+            registry = RunRegistry(base.runs_dir).ensure()
+            manager = RunManager(base, registry, config_path=cfg_path)
+            store = self._stale_run(registry, tmp)
+
+            # 用户在不重启进程的情况下编辑了配置文件 → file-model-v2
+            with open(cfg_path, "w") as f:
+                _json.dump({"target": tmp, "runs_dir": os.path.join(tmp, "runs"),
+                            "models": _models("file-model-v2")}, f)
+
+            launched = {}
+            manager._launch = lambda c, st: launched.setdefault("cfg", c) or st.id
+            self.assertTrue(manager.resume(store.id))
+
+            self.assertEqual(launched["cfg"].models["audit"], ["file-model-v2"])
+
+
+class HealthPruneTest(unittest.TestCase):
+    def test_reconcile_drops_stale_models(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(target=tmp, out_dir=os.path.join(tmp, "out"),
+                         models=_models("kept-model"))
+            store = RunStore(cfg.out_dir).ensure()
+            # 旧 health 快照里既有现配置的模型,也有已移除的旧模型
+            store.save_health({
+                "kept-model": {"model": "kept-model", "status": "ok"},
+                "removed-model": {"model": "removed-model", "status": "ok"},
+            })
+            pipe = Pipeline(cfg, store=store)
+            pipe._reconcile_health_models()
+
+            models = [r["model"] for r in store.load_health()["models"]]
+            self.assertIn("kept-model", models)
+            self.assertNotIn("removed-model", models)
 
 
 if __name__ == "__main__":

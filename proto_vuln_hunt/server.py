@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from . import exporters
 from .common import finalize_findings, slim_finding
-from .config import ALL_LENSES, DEFAULT_BACKENDS, ROLES, Config
+from .config import ALL_LENSES, DEFAULT_BACKENDS, ROLES, Config, load_config
 from .events import EventBus
 from .store import (RunRegistry, RunStore, STATUS_INTERRUPTED, STATUS_QUEUED, STATUS_RUNNING)
 
@@ -54,10 +54,24 @@ def build_run_config(base: Config, payload: Dict[str, Any]) -> Config:
 class RunManager:
     """管理并发运行的 run:每个 run 一个 asyncio.Task + EventBus + stop Event。"""
 
-    def __init__(self, base: Config, registry: RunRegistry):
+    def __init__(self, base: Config, registry: RunRegistry,
+                 config_path: Optional[str] = None, overrides: Optional[Dict[str, Any]] = None):
         self.base = base
         self.registry = registry
+        self.config_path = config_path          # 启动时的配置文件路径(用于续跑时重读最新配置)
+        self.overrides = overrides or {}        # 启动时的命令行覆盖(重读时一并套用)
         self.active: Dict[str, Dict[str, Any]] = {}   # run_id -> {task, pipeline, bus, stop}
+
+    def _fresh_base(self) -> Config:
+        """重新读取配置文件,拿磁盘上最新的配置(模型/后端等);失败则退回内存里的 base。
+        这样编辑配置文件后无需重启 Web 进程,续跑即可用上新模型。"""
+        if not self.config_path:
+            return self.base
+        try:
+            self.base = load_config(self.config_path, self.overrides)
+        except Exception:
+            pass
+        return self.base
 
     def get_bus(self, run_id: str) -> Optional[EventBus]:
         rec = self.active.get(run_id)
@@ -90,10 +104,11 @@ class RunManager:
         store = self.registry.get(run_id)
         if not store or self.is_running(run_id):
             return False
+        base = self._fresh_base()  # 重读配置文件,确保续跑用的是磁盘上最新的模型/后端配置
         m = store.load_manifest() or {}
-        # 后端/模型相关字段不从旧快照沿用,改由 self.base(本次启动的最新配置)提供。
+        # 后端/模型相关字段不从 run 旧快照沿用,改由最新基础配置 base 提供。
         saved = {k: v for k, v in (m.get("config") or {}).items() if k not in _RESUME_FROM_BASE_FIELDS}
-        cfg = build_run_config(self.base, {**saved, "resume": True, "fresh": False})
+        cfg = build_run_config(base, {**saved, "resume": True, "fresh": False})
         self._launch(cfg, store)
         return True
 
@@ -159,13 +174,13 @@ def _sse(ev: Dict[str, Any]) -> str:
     return f"id: {ev['seq']}\nevent: {ev['type']}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
 
 
-def create_app(cfg: Config):
+def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Optional[Dict[str, Any]] = None):
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
     from fastapi.staticfiles import StaticFiles
 
     registry = RunRegistry(cfg.runs_dir).ensure()
-    manager = RunManager(cfg, registry)
+    manager = RunManager(cfg, registry, config_path=config_path, overrides=overrides)
     app = FastAPI(title="proto-vuln-hunt", version="0.2.0")
 
     @app.on_event("startup")

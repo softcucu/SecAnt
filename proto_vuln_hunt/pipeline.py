@@ -125,6 +125,18 @@ class Pipeline:
         if not is_output:
             self.emit(EV.METRICS, self._summary_snapshot(self.round))
 
+    def _reconcile_health_models(self) -> None:
+        """把已落盘的 health 快照对齐到当前配置的模型集合:保留仍在用模型的既有健康记录,
+        剔除已从配置移除的旧模型——避免续跑/重启后「模型」页残留上次配置里的模型。"""
+        cur = set(self.cfg.all_models())
+        prior = (self.store.load_health() or {}).get("models", [])
+        self.health_state = {r["model"]: r for r in prior if r.get("model") in cur}
+        if len(self.health_state) != len([r for r in prior if r.get("model")]):
+            try:
+                self.store.save_health(self.health_state)
+            except Exception:
+                pass
+
     async def health_check_all(self) -> Dict[str, Any]:
         """运行前(或按需)对所有配置的模型各发一个 1+1 探针,实时反映健康度。"""
         models = self.cfg.all_models()
@@ -1303,6 +1315,7 @@ class Pipeline:
             if model_error:
                 raise ValueError(f"模型配置错误:{model_error}")
             resumed = self.restore_checkpoint()
+            self._reconcile_health_models()  # 续跑/重启:剔除旧 health 快照里已不在当前配置的模型
             if self.cfg.health.enabled and self.cfg.health.on_start and not self.stop_requested():
                 await self.health_check_all()
             if not resumed:
