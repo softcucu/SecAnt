@@ -8,6 +8,7 @@ import unittest
 from proto_vuln_hunt.backends import (
     AgentRunner,
     _drain_process,
+    _extract_usage,
     _extract_opencode_text,
     extract_json,
 )
@@ -83,6 +84,42 @@ class OpencodeEventParsingTests(unittest.TestCase):
         self.assertEqual(text, "I will read the file first.\n```json\n{\"answer\":\"2\"}\n```")
         self.assertEqual(session_id, "")
         self.assertEqual(usage, {"input_tokens": 10, "output_tokens": 3, "total_tokens": 13})
+
+    def test_usage_never_exposes_negative_token_counts(self):
+        usage = _extract_usage({"tokens": {"input": 10, "output": -4, "total": 13}})
+
+        self.assertEqual(usage, {"input_tokens": 10, "output_tokens": 3, "total_tokens": 13})
+
+    def test_record_usage_falls_back_when_backend_output_is_negative(self):
+        cfg = Config(
+            target=".",
+            out_dir=".",
+            backend="opencode",
+            models={"audit": ["m"]},
+            backends={
+                "opencode": BackendSpec(
+                    name="opencode", command=["x"], prompt_mode="arg", parse="text"
+                )
+            },
+        )
+        cfg.health.enabled = False
+        seen = []
+        runner = AgentRunner(cfg, logger=lambda *_a, **_k: None, usage_sink=seen.append)
+
+        runner._record_usage(
+            "abcd",
+            "abcdefgh",
+            role="audit",
+            label="unit",
+            model="m",
+            attempt=1,
+            backend_usage={"input_tokens": 5, "output_tokens": -2, "total_tokens": -1},
+        )
+
+        self.assertEqual(seen[0]["input_tokens"], 5)
+        self.assertEqual(seen[0]["output_tokens"], 2)
+        self.assertEqual(seen[0]["total_tokens"], 7)
+        self.assertEqual(runner.usage_totals["output_tokens"], 2)
 
     def test_keeps_available_text_when_tool_calls_is_last_event(self):
         stdout = _jsonl(

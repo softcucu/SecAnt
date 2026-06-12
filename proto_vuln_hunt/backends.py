@@ -72,6 +72,39 @@ def _as_int(v: Any) -> Optional[int]:
         return None
 
 
+def _token_int(v: Any) -> Optional[int]:
+    n = _as_int(v)
+    if n is None or n < 0:
+        return None
+    return n
+
+
+def _first_token_int(*values: Any) -> Optional[int]:
+    for v in values:
+        n = _token_int(v)
+        if n is not None:
+            return n
+    return None
+
+
+def _normalized_usage(inp: Optional[int], out: Optional[int],
+                      total: Optional[int]) -> Optional[Dict[str, int]]:
+    if inp is None and out is None and total is None:
+        return None
+    input_tokens = inp if inp is not None else 0
+    output_tokens = out if out is not None else (
+        max(0, total - input_tokens) if inp is not None and total is not None else 0
+    )
+    total_tokens = total if total is not None else input_tokens + output_tokens
+    if total_tokens < input_tokens + output_tokens:
+        total_tokens = input_tokens + output_tokens
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
 def _extract_usage(obj: Any) -> Optional[Dict[str, int]]:
     """从常见 CLI JSON 包装里提取真实 usage;拿不到则返回 None。"""
     if not isinstance(obj, dict):
@@ -81,20 +114,17 @@ def _extract_usage(obj: Any) -> Optional[Dict[str, int]]:
         if isinstance(obj.get(key), dict):
             candidates.insert(0, obj[key])
     for u in candidates:
-        inp = (_as_int(u.get("input_tokens")) or _as_int(u.get("prompt_tokens")) or
-               _as_int(u.get("input")) or _as_int(u.get("prompt")))
-        out = (_as_int(u.get("output_tokens")) or _as_int(u.get("completion_tokens")) or
-               _as_int(u.get("output")) or _as_int(u.get("completion")))
-        total = _as_int(u.get("total_tokens")) or _as_int(u.get("total"))
-        if inp is None and out is None and total is None:
-            continue
-        if total is None:
-            total = (inp or 0) + (out or 0)
-        return {
-            "input_tokens": inp or 0,
-            "output_tokens": out or 0,
-            "total_tokens": total,
-        }
+        rec = _normalized_usage(
+            _first_token_int(
+                u.get("input_tokens"), u.get("prompt_tokens"), u.get("input"), u.get("prompt")
+            ),
+            _first_token_int(
+                u.get("output_tokens"), u.get("completion_tokens"), u.get("output"), u.get("completion")
+            ),
+            _first_token_int(u.get("total_tokens"), u.get("total")),
+        )
+        if rec is not None:
+            return rec
     return None
 
 
@@ -965,9 +995,14 @@ class AgentRunner:
         est_in = estimate_tokens(prompt)
         est_out = estimate_tokens(output)
         usage = backend_usage or {}
-        input_tokens = int(usage.get("input_tokens") or est_in)
-        output_tokens = int(usage.get("output_tokens") or est_out)
-        total_tokens = int(usage.get("total_tokens") or (input_tokens + output_tokens))
+        input_tokens = _token_int(usage.get("input_tokens"))
+        output_tokens = _token_int(usage.get("output_tokens"))
+        total_tokens = _token_int(usage.get("total_tokens"))
+        input_tokens = est_in if input_tokens is None else input_tokens
+        output_tokens = est_out if output_tokens is None else output_tokens
+        total_tokens = input_tokens + output_tokens if total_tokens is None else total_tokens
+        if total_tokens < input_tokens + output_tokens:
+            total_tokens = input_tokens + output_tokens
         estimated = backend_usage is None
 
         self.usage_count += 1

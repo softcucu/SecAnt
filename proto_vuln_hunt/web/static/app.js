@@ -28,9 +28,13 @@ function fmtClock(t) { if (!t) return "—"; const d = new Date(t * 1000); retur
 function fmtMs(ms) { ms = Number(ms || 0); if (!ms) return "—"; return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`; }
 function sevPill(s) { return el("span", { class: "pill sev-" + (s || "none") }, s || "none"); }
 function stPill(s) { return el("span", { class: "pill st-" + (s || "queued") }, s || "queued"); }
-function fmtNum(n) { return Number(n || 0).toLocaleString(); }
+function tokenCount(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+function fmtNum(n) { return tokenCount(n).toLocaleString(); }
 function fmtTok(n) {
-  n = Number(n || 0);
+  n = tokenCount(n);
   if (n >= 1e6) return (n / 1e6).toFixed(n < 1e7 ? 2 : 1) + "M";
   if (n >= 1e4) return (n / 1e3).toFixed(n < 1e5 ? 1 : 0) + "K";
   return n.toLocaleString();
@@ -59,19 +63,27 @@ function parseKvInts(v) {
   return out;
 }
 function emptyUsage() { return { calls: 0, input_tokens: 0, output_tokens: 0, total_tokens: 0, estimated_calls: 0 }; }
+function cleanUsage(rec) {
+  const input = tokenCount(rec?.input_tokens);
+  const output = tokenCount(rec?.output_tokens);
+  const total = Math.max(tokenCount(rec?.total_tokens), input + output);
+  return Object.assign({}, rec || {}, { input_tokens: input, output_tokens: output, total_tokens: total });
+}
 function addUsage(total, rec) {
+  rec = cleanUsage(rec);
   total.calls += 1;
-  total.input_tokens += Number(rec.input_tokens || 0);
-  total.output_tokens += Number(rec.output_tokens || 0);
-  total.total_tokens += Number(rec.total_tokens || 0);
+  total.input_tokens += rec.input_tokens;
+  total.output_tokens += rec.output_tokens;
+  total.total_tokens += rec.total_tokens;
   if (rec.estimated) total.estimated_calls += 1;
 }
 function setUsage(total, src) {
-  total.calls = Number(src?.calls || 0);
-  total.input_tokens = Number(src?.input_tokens || 0);
-  total.output_tokens = Number(src?.output_tokens || 0);
-  total.total_tokens = Number(src?.total_tokens || 0);
-  total.estimated_calls = Number(src?.estimated_calls || 0);
+  const rec = cleanUsage(src);
+  total.calls = tokenCount(src?.calls);
+  total.input_tokens = rec.input_tokens;
+  total.output_tokens = rec.output_tokens;
+  total.total_tokens = rec.total_tokens;
+  total.estimated_calls = tokenCount(src?.estimated_calls);
 }
 
 // ──────────────────────── mini markdown ────────────────────────
@@ -1068,7 +1080,7 @@ function viewDashboard(runId) {
   }
 
   function renderUsage() {
-    const rows = [...S.usageRows].slice(-80).reverse();
+    const rows = [...S.usageRows].map(cleanUsage).slice(-80).reverse();
     if (!rows.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无 token 用量数据。")); return; }
     const tbl = el("table", {}, el("thead", {}, el("tr", {},
       el("th", {}, "#"), el("th", {}, "role"), el("th", {}, "模型"), el("th", {}, "输入"), el("th", {}, "输出"), el("th", {}, "总计"), el("th", {}, "来源"))));
@@ -1129,7 +1141,7 @@ function viewDashboard(runId) {
     switch (ev.type) {
       case "run_status": setRunStatus(d.status); renderHeader(); break;
       case "metrics": applyMetrics(d); renderHeader(); break;
-      case "usage": S.usageRows.push(d); addUsage(S.usage, d); renderHeader(); renderTabs(); if (activeTab === "usage") renderTab(); break;
+      case "usage": { const u = cleanUsage(d); S.usageRows.push(u); addUsage(S.usage, u); renderHeader(); renderTabs(); if (activeTab === "usage") renderTab(); break; }
       case "agent_update": applyAgentUpdate(d); renderHeader(); renderTabs(); if (activeTab === "agents") renderTab(); break;
       case "candidate_found": S.candidates++; upsertCandidate(d); renderHeader(); renderTabs(); if (activeTab === "candidates") renderTab(); break;
       case "finding_confirmed": {
