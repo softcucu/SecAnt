@@ -40,8 +40,11 @@ model_concurrency:
 # 都写在 $XDG_DATA_HOME/opencode(默认 ~/.local/share/opencode)。本工具一次跑会派成千上万个 agent,
 # 且 PoC 每次在独立临时目录里跑 → opencode 按 cwd 不断新建 snapshot 仓,临时目录删掉后这些 snapshot
 # 仍永久残留,几天就能吃掉几十 GB。
-# 开启后:每个 opencode 子进程用一个一次性 XDG_DATA_HOME 运行,跑完整目录删除;登录态(auth.json)自动
-# 复制进去,模型/LSP 缓存在 ~/.cache/opencode 不受影响,故无重复下载开销。默认开启。
+# 开启后:沿用共享的 opencode 数据目录(不每次重建,避免每次调用都付一次冷启动——DB 迁移 + 对整棵
+# target 全量重建快照,那会把健康探针/审计拖到超时),每次调用收尾时只把膨胀的 snapshot/repos 裸仓
+# 按"最近活跃时刻"滚动保留最近若干个:活跃 target 的快照基线一直在写、必然最新 → 必留;只淘汰 PoC
+# 临时 worktree 残留的旧孤儿快照。既不超时也不无上限膨胀。默认开启。
+# 设为 false:完全不回收,由你自行清理 ~/.local/share/opencode/snapshot 等。
 ephemeral_backend_data: true
 
 # ── 排查类临时产物滚动保留 ──

@@ -14,6 +14,29 @@ from proto_vuln_hunt.backends import (
 from proto_vuln_hunt.config import BackendSpec, Config
 
 
+_SAVED_XDG = None
+_XDG_TMP = None
+
+
+def setUpModule():
+    # 把 XDG_DATA_HOME 指向一个临时目录:opencode 后端的 _invoke 收尾会回收
+    # $XDG_DATA_HOME/opencode 下的 snapshot/repos,绝不能误碰开发机真实的 ~/.local/share/opencode。
+    global _SAVED_XDG, _XDG_TMP
+    _SAVED_XDG = os.environ.get("XDG_DATA_HOME")
+    _XDG_TMP = tempfile.mkdtemp(prefix="pvh-test-xdg-")
+    os.environ["XDG_DATA_HOME"] = _XDG_TMP
+
+
+def tearDownModule():
+    import shutil
+    if _SAVED_XDG is None:
+        os.environ.pop("XDG_DATA_HOME", None)
+    else:
+        os.environ["XDG_DATA_HOME"] = _SAVED_XDG
+    if _XDG_TMP:
+        shutil.rmtree(_XDG_TMP, ignore_errors=True)
+
+
 def _jsonl(*events):
     return "\n".join(json.dumps(ev, ensure_ascii=False) for ev in events)
 
@@ -277,14 +300,18 @@ class ArtifactRetainTests(unittest.TestCase):
             self.assertEqual(len(remaining), 6)              # 不清理,全部保留
 
 
-class EphemeralBackendDataTests(unittest.TestCase):
-    def _runner(self, out_dir, backend="opencode", ephemeral=True):
+class OpencodeReapTests(unittest.TestCase):
+    """ephemeral_backend_data=True 的新语义:共享热目录 + 滚动回收膨胀的 snapshot/repos 裸仓
+    (活跃 target 的快照基线必留,只淘汰旧孤儿),而不是每次清空重建数据目录。"""
+
+    def _runner(self, backend="opencode", ephemeral=True, concurrency=4):
         cfg = Config(
-            target=out_dir,
-            out_dir=out_dir,
+            target=".",
+            out_dir=".",
             backend=backend,
             models={"audit": ["m"]},
             ephemeral_backend_data=ephemeral,
+            concurrency=concurrency,
             backends={
                 backend: BackendSpec(
                     name=backend, command=["x"], prompt_mode="arg", parse="text"
@@ -294,52 +321,109 @@ class EphemeralBackendDataTests(unittest.TestCase):
         cfg.health.enabled = False
         return AgentRunner(cfg, logger=lambda *_a, **_k: None)
 
-    def test_opencode_run_uses_isolated_xdg_and_copies_auth(self):
+    def _make_leaf(self, root, proj, wt, mtime):
+        """伪造一个裸 git 快照仓:root/opencode/snapshot/<proj>/<wt>/HEAD,并设定 mtime。"""
+        leaf = os.path.join(root, "opencode", "snapshot", proj, wt)
+        os.makedirs(leaf, exist_ok=True)
+        head = os.path.join(leaf, "HEAD")
+        with open(head, "w") as f:
+            f.write("ref: refs/heads/main\n")
+        os.utime(head, (mtime, mtime))
+        os.utime(leaf, (mtime, mtime))
+        return leaf
+
+    def test_reaps_old_snapshot_leaves_and_keeps_recent(self):
         with tempfile.TemporaryDirectory() as home:
-            # 伪造一个 opencode 真实数据目录 + auth.json
-            real_data = os.path.join(home, ".local", "share", "opencode")
-            os.makedirs(real_data, exist_ok=True)
-            with open(os.path.join(real_data, "auth.json"), "w") as f:
-                f.write("{\"token\":\"secret\"}")
-            old_home = os.environ.get("HOME")
-            old_xdg = os.environ.pop("XDG_DATA_HOME", None)
-            os.environ["HOME"] = home
+            old_xdg = os.environ.get("XDG_DATA_HOME")
+            os.environ["XDG_DATA_HOME"] = home
             try:
-                runner = self._runner(home)
-                env = {}
-                root = runner._setup_ephemeral_data(env)
-                self.assertTrue(root and os.path.isdir(root))
-                # env 指向一次性目录,且不是真实数据目录
-                self.assertEqual(env["XDG_DATA_HOME"], root)
-                self.assertNotEqual(os.path.realpath(root), os.path.realpath(os.path.join(home, ".local", "share")))
-                # 登录态被复制进去
-                copied = os.path.join(root, "opencode", "auth.json")
-                self.assertTrue(os.path.isfile(copied))
-                with open(copied) as f:
-                    self.assertIn("secret", f.read())
-                # 模拟 _invoke 的 finally:整目录删除
-                import shutil
-                shutil.rmtree(root, ignore_errors=True)
-                self.assertFalse(os.path.exists(root))
+                runner = self._runner()
+                keep = max(32, runner.cfg.concurrency * 8)
+                extra = 8
+                # mtime 递增:wt000 最旧 … 最后一个最新
+                leaves = [self._make_leaf(home, "proj", f"wt{i:03d}", 1000 + i)
+                          for i in range(keep + extra)]
+                runner._reap_opencode_artifacts()
+                for p in leaves[:extra]:          # 最旧的 extra 个被淘汰
+                    self.assertFalse(os.path.exists(p), p)
+                for p in leaves[extra:]:          # 最近 keep 个保留
+                    self.assertTrue(os.path.exists(p), p)
             finally:
-                if old_home is not None:
-                    os.environ["HOME"] = old_home
-                if old_xdg is not None:
+                if old_xdg is None:
+                    os.environ.pop("XDG_DATA_HOME", None)
+                else:
                     os.environ["XDG_DATA_HOME"] = old_xdg
 
-    def test_disabled_returns_none_and_leaves_env(self):
-        with tempfile.TemporaryDirectory() as d:
-            runner = self._runner(d, ephemeral=False)
-            env = {}
-            self.assertIsNone(runner._setup_ephemeral_data(env))
-            self.assertNotIn("XDG_DATA_HOME", env)
+    def test_active_target_basis_is_always_preserved(self):
+        # 活跃 target 的快照仓持续在写 → mtime 最新,即使夹在大量孤儿里也必被保留
+        with tempfile.TemporaryDirectory() as home:
+            old_xdg = os.environ.get("XDG_DATA_HOME")
+            os.environ["XDG_DATA_HOME"] = home
+            try:
+                runner = self._runner()
+                keep = max(32, runner.cfg.concurrency * 8)
+                for i in range(keep + 20):        # 一堆旧孤儿
+                    self._make_leaf(home, "proj", f"orphan{i:03d}", 1000 + i)
+                active = self._make_leaf(home, "proj", "active", 9_000_000)  # 最新
+                runner._reap_opencode_artifacts()
+                self.assertTrue(os.path.exists(active))
+            finally:
+                if old_xdg is None:
+                    os.environ.pop("XDG_DATA_HOME", None)
+                else:
+                    os.environ["XDG_DATA_HOME"] = old_xdg
 
-    def test_non_opencode_backend_skips_isolation(self):
-        with tempfile.TemporaryDirectory() as d:
-            runner = self._runner(d, backend="claude")
-            env = {}
-            self.assertIsNone(runner._setup_ephemeral_data(env))
-            self.assertNotIn("XDG_DATA_HOME", env)
+    def test_under_keep_threshold_is_noop(self):
+        with tempfile.TemporaryDirectory() as home:
+            old_xdg = os.environ.get("XDG_DATA_HOME")
+            os.environ["XDG_DATA_HOME"] = home
+            try:
+                runner = self._runner()
+                leaves = [self._make_leaf(home, "proj", f"wt{i}", 1000 + i) for i in range(5)]
+                runner._reap_opencode_artifacts()
+                for p in leaves:
+                    self.assertTrue(os.path.exists(p), p)
+            finally:
+                if old_xdg is None:
+                    os.environ.pop("XDG_DATA_HOME", None)
+                else:
+                    os.environ["XDG_DATA_HOME"] = old_xdg
+
+    def test_disabled_does_not_reap(self):
+        with tempfile.TemporaryDirectory() as home:
+            old_xdg = os.environ.get("XDG_DATA_HOME")
+            os.environ["XDG_DATA_HOME"] = home
+            try:
+                runner = self._runner(ephemeral=False)
+                keep = max(32, runner.cfg.concurrency * 8)
+                leaves = [self._make_leaf(home, "proj", f"wt{i:03d}", 1000 + i)
+                          for i in range(keep + 8)]
+                runner._reap_opencode_artifacts()
+                for p in leaves:                  # 关闭时一律不动
+                    self.assertTrue(os.path.exists(p), p)
+            finally:
+                if old_xdg is None:
+                    os.environ.pop("XDG_DATA_HOME", None)
+                else:
+                    os.environ["XDG_DATA_HOME"] = old_xdg
+
+    def test_non_opencode_backend_does_not_reap(self):
+        with tempfile.TemporaryDirectory() as home:
+            old_xdg = os.environ.get("XDG_DATA_HOME")
+            os.environ["XDG_DATA_HOME"] = home
+            try:
+                runner = self._runner(backend="claude")
+                keep = max(32, runner.cfg.concurrency * 8)
+                leaves = [self._make_leaf(home, "proj", f"wt{i:03d}", 1000 + i)
+                          for i in range(keep + 8)]
+                runner._reap_opencode_artifacts()
+                for p in leaves:
+                    self.assertTrue(os.path.exists(p), p)
+            finally:
+                if old_xdg is None:
+                    os.environ.pop("XDG_DATA_HOME", None)
+                else:
+                    os.environ["XDG_DATA_HOME"] = old_xdg
 
 
 class ProcessDrainTests(unittest.IsolatedAsyncioTestCase):

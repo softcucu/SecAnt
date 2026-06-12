@@ -729,12 +729,17 @@ class AgentRunner:
         self._model_sems: Dict[str, DynamicSemaphore] = {}
         self._capacity_wait_s = 0.05
         self._live_prompt_files: set = set()  # 正在被子进程使用的 prompt 文件,滚动清理时必须保护
+        self._artifact_seq = 0  # 临时产物单调序号:写进文件名,让滚动清理按"创建序"确定性排序(mtime 同刻度也不抖)
 
     def _prune_recent(self, directory: str, primary_suffix: str, keep: int,
                       sidecar_suffixes: Tuple[str, ...] = (), protect: Optional[set] = None) -> None:
-        """滚动保留:只留 directory 下最近 keep 个 primary 文件(按 mtime),其余 primary 及其同名
-        sidecar 一并删除。protect 中的路径视为"在用",无论新旧都保留(避免删掉正被子进程读取的文件)。
-        keep<=0 表示不清理。所有文件操作都吞异常——清理失败绝不影响主流程。"""
+        """滚动保留:只留 directory 下最近 keep 个 primary 文件,其余 primary 及其同名 sidecar 一并删除。
+        protect 中的路径视为"在用",无论新旧都保留(避免删掉正被子进程读取的文件;故实际保留数 ≥ keep)。
+        keep<=0 表示不清理。所有文件操作都吞异常——清理失败绝不影响主流程。
+
+        排序键用 (mtime, 文件名),不只看 mtime:大量文件在同一 mtime 刻度内写入时,仅按 mtime 排序会
+        因同着而顺序不定 → 刚写的(受 protect 的)文件可能没落到最近 keep 内,被 protect 额外算成幸存者,
+        使保留数虚高、且不确定。文件名内嵌的单调序号(见 _write_prompt_file)保证同刻度也按创建序排。"""
         if keep is None or keep <= 0:
             return
         try:
@@ -745,7 +750,7 @@ class AgentRunner:
         if len(prims) <= keep:
             return
         try:
-            prims.sort(key=lambda p: os.path.getmtime(p))  # 旧 → 新
+            prims.sort(key=lambda p: (os.path.getmtime(p), os.path.basename(p)))  # 旧 → 新(同刻度按创建序)
         except OSError:
             return
         survivors = set(prims[-keep:]) | set(protect or ())
@@ -923,11 +928,13 @@ class AgentRunner:
     def _write_prompt_file(self, prompt: str) -> str:
         prompt_dir = os.path.join(self.cfg.out_dir, "prompts")
         os.makedirs(prompt_dir, exist_ok=True)
+        # 零填充单调序号做前缀:文件名按字典序即创建序,让 _prune_recent 在 mtime 同刻度时也确定性排序。
+        self._artifact_seq += 1
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
             suffix=".md",
-            prefix="agent_",
+            prefix=f"agent_{self._artifact_seq:09d}_",
             dir=prompt_dir,
             delete=False,
         ) as f:
@@ -976,35 +983,100 @@ class AgentRunner:
             except Exception:
                 pass
 
-    # ── opencode 运行产物隔离:一次性 XDG_DATA_HOME ──
+    # ── opencode 运行产物回收:共享热目录 + 滚动清理膨胀的 snapshot/repos ──
     def _opencode_data_root(self) -> str:
-        """opencode 真实数据目录($XDG_DATA_HOME/opencode,默认 ~/.local/share/opencode)。
-        仅用于定位 auth.json,以便把登录态带进一次性数据目录。"""
+        """opencode 数据目录($XDG_DATA_HOME/opencode,默认 ~/.local/share/opencode)。
+        用于定位待回收的 snapshot/repos 等运行产物。"""
         base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
         return os.path.join(base, "opencode")
 
-    def _setup_ephemeral_data(self, env: Dict[str, str]) -> Optional[str]:
-        """为本次 opencode 调用准备一次性数据目录并改写 env[XDG_DATA_HOME]。
+    @staticmethod
+    def _repo_recency(path: str) -> float:
+        """裸 git 快照仓的"最近活跃时刻":取仓目录与其 index/HEAD/packed-refs 的最大 mtime。
+        commit 会改写 index/refs,故比仅看目录 mtime 更准——避免误删仍在频繁写入的活跃 target 基线仓。"""
+        best = 0.0
+        for name in ("", "index", "HEAD", "packed-refs"):
+            p = os.path.join(path, name) if name else path
+            try:
+                m = os.path.getmtime(p)
+            except OSError:
+                continue
+            if m > best:
+                best = m
+        return best
 
-        opencode 把会话(storage)、快照(snapshot/ 裸 git 仓,每步提交整棵工作树)、sqlite 库都写在
-        $XDG_DATA_HOME/opencode 下;而 PoC 每次在独立临时 worktree 里跑,opencode 会按 cwd 新建一份
-        snapshot 仓,worktree 删掉后这些 snapshot 仍以孤儿形式永久残留 → 磁盘无上限膨胀。
-        这里把数据目录指向一个 tmp 目录,跑完由调用方整目录删除;模型/LSP 缓存在 $XDG_CACHE_HOME
-        (~/.cache/opencode)不受影响,故无重复下载开销。仅需把 auth.json 复制进去以保留登录态。
-        返回 tmp 根路径(供 finally 删除);失败或未启用则返回 None(回退共享目录,不影响功能)。"""
-        if self.cfg.backend != "opencode" or not getattr(self.cfg, "ephemeral_backend_data", True):
-            return None
+    def _opencode_repo_leaves(self, parent: str) -> List[str]:
+        """parent 下的裸 git 快照仓(含 HEAD 文件的目录),兼容 snapshot/<proj>/<worktree> 两级
+        与 repos/<...> 一级两种布局。父目录不存在则返回空列表。"""
+        leaves: List[str] = []
         try:
-            root = tempfile.mkdtemp(prefix="pvh-ocdata-")
-            data_dir = os.path.join(root, "opencode")
-            os.makedirs(data_dir, exist_ok=True)
-            src_auth = os.path.join(self._opencode_data_root(), "auth.json")
-            if os.path.isfile(src_auth):
-                shutil.copy2(src_auth, os.path.join(data_dir, "auth.json"))
-            env["XDG_DATA_HOME"] = root
-            return root
-        except Exception:  # noqa: BLE001 —— 准备失败就回退共享目录,绝不让清理逻辑拖垮主流程
-            return None
+            firsts = os.listdir(parent)
+        except OSError:
+            return leaves
+        for a in firsts:
+            ap = os.path.join(parent, a)
+            if not os.path.isdir(ap):
+                continue
+            if os.path.exists(os.path.join(ap, "HEAD")):
+                leaves.append(ap)
+                continue
+            try:
+                seconds = os.listdir(ap)
+            except OSError:
+                continue
+            for b in seconds:
+                bp = os.path.join(ap, b)
+                if os.path.isdir(bp) and os.path.exists(os.path.join(bp, "HEAD")):
+                    leaves.append(bp)
+        return leaves
+
+    @staticmethod
+    def _prune_empty_dirs(parent: str) -> None:
+        """回收叶子仓后,删掉 parent 下变空的中间目录(空 projectID 壳)。"""
+        try:
+            entries = os.listdir(parent)
+        except OSError:
+            return
+        for a in entries:
+            p = os.path.join(parent, a)
+            try:
+                if os.path.isdir(p) and not os.listdir(p):
+                    os.rmdir(p)
+            except OSError:
+                pass
+
+    def _reap_opencode_artifacts(self) -> None:
+        """每次 opencode 调用收尾时回收共享数据目录里膨胀的运行产物。
+
+        opencode 把快照(snapshot/ 裸 git 仓,每步提交整棵工作树)、storage、sqlite 库都写在
+        $XDG_DATA_HOME/opencode 下;PoC 每次在独立临时 worktree 里跑,opencode 会按 cwd 新建一份
+        snapshot 仓,worktree 删掉后这些 snapshot 仍以孤儿形式永久残留 → 磁盘无上限膨胀。
+
+        这里**不**每次重建数据目录(那会让每次调用都付一次冷启动:DB 迁移 + 对整棵 target 全量
+        重建快照 → 探针动辄超时),而是沿用共享热目录,只把膨胀的 snapshot/repos 裸仓按"最近活跃
+        时刻"滚动保留最近 keep 个:活跃 target 的快照基线一直在写、必然最新 → 必留;PoC 临时
+        worktree 残留的孤儿快照按旧→新淘汰。另顺带滚动清理旧 session_diff。
+
+        所有文件操作吞异常,绝不拖垮主流程。仅 backend=opencode 且 ephemeral_backend_data 开启时生效。"""
+        if self.cfg.backend != "opencode" or not getattr(self.cfg, "ephemeral_backend_data", True):
+            return
+        try:
+            root = self._opencode_data_root()
+            # keep 远大于同时在跑的 opencode 进程数(全局并发的若干倍),确保永不误删在用的快照仓
+            keep = max(32, self.cfg.concurrency * 8)
+            for sub in ("snapshot", "repos"):
+                parent = os.path.join(root, sub)
+                leaves = self._opencode_repo_leaves(parent)
+                if len(leaves) <= keep:
+                    continue
+                leaves.sort(key=self._repo_recency)        # 旧 → 新
+                for p in leaves[:-keep]:                    # 删最旧的孤儿,保留最近 keep 个
+                    shutil.rmtree(p, ignore_errors=True)
+                self._prune_empty_dirs(parent)
+            self._prune_recent(os.path.join(root, "storage", "session_diff"), ".json",
+                               max(self.cfg.artifact_retain, keep))
+        except Exception:  # noqa: BLE001 —— 回收失败绝不影响主流程
+            pass
 
     # ── 单次子进程调用(不含重试) ──
     async def _invoke(self, prompt: str, model: str, cwd: str,
@@ -1046,8 +1118,6 @@ class AgentRunner:
 
         env = dict(os.environ)
         env.update(self.spec.env or {})
-        # opencode:本次调用用一次性数据目录(隔离会话/快照),跑完整目录删除;其它后端 ephemeral_root=None。
-        ephemeral_root = self._setup_ephemeral_data(env)
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -1106,9 +1176,8 @@ class AgentRunner:
             # 子进程已结束:本次 prompt 文件不再"在用",解除保护(留待滚动窗口自然淘汰)
             if prompt_file:
                 self._live_prompt_files.discard(prompt_file)
-            # 无论成功/失败/超时,都清掉本次 opencode 一次性数据目录(snapshot/storage/db 等)
-            if ephemeral_root:
-                shutil.rmtree(ephemeral_root, ignore_errors=True)
+            # opencode:用完顺带回收共享数据目录里膨胀的 snapshot/repos 孤儿仓(保留最近若干个)
+            self._reap_opencode_artifacts()
 
     def _dump_failed_output(self, role: str, label: str, model: str, attempt: int, text: str,
                             dump_candidate: bool = False) -> str:

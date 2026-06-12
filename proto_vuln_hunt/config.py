@@ -167,8 +167,13 @@ class Config:
     models: Dict[str, List[str]] = field(default_factory=dict)
     model_concurrency: Dict[str, int] = field(default_factory=dict)
     concurrency: int = 4
-    # 每次 opencode 子进程用一次性 XDG_DATA_HOME 跑,跑完整目录删除——回收 opencode 的
-    # 会话/快照(snapshot)等运行产物,避免 ~/.local/share/opencode 无上限膨胀。
+    # backend=opencode 专用的运行产物回收开关。
+    # opencode 把快照(snapshot/ 裸 git 仓,每步提交整棵工作树)等写在 ~/.local/share/opencode;
+    # PoC 每次在独立临时 worktree 里跑会不断新建 snapshot 仓,孤儿残留 → 磁盘无上限膨胀。
+    # True:沿用共享热数据目录(不每次重建,避免冷启动 DB 迁移+整树重建快照拖到探针超时),
+    #      每次调用收尾时把膨胀的 snapshot/repos 裸仓按最近活跃时刻滚动保留最近若干个,
+    #      活跃 target 的快照基线必留、只淘汰旧孤儿——既不超时也不膨胀。
+    # False:完全不回收(由你自行清理 ~/.local/share/opencode/snapshot 等)。
     # 仅对 backend=opencode 生效;claude/codex 不受影响。
     ephemeral_backend_data: bool = True
     # 排查类临时产物的滚动保留数:提示词临时文件(out_dir/prompts/agent_*.md)与解析失败转储
