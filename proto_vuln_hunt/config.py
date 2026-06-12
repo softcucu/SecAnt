@@ -152,6 +152,9 @@ class RecheckSpec:
     concurrency: int = 1            # 该角色并发上限(默认 1:逐条串行排查)
     risk_min_severity: str = "medium"  # 风险点自动入排查队列的最低 severity_hint(high/medium/low/info)
     poll_interval_s: int = 3        # 优先队列空时的轮询等待间隔(秒)
+    max_retries: int = 2            # 单个排查项连续失败的重排上限;超过即放弃该项(不再回灌优先队列)。
+                                    # 防止某条复查的后端调用持续失败时无限重排,拖住整条管线的收敛、
+                                    # 占住唯一的 recheck 名额,导致其它 agent 看似“全停”。
 
 
 @dataclass
@@ -469,6 +472,7 @@ def load_config(path: Optional[str], overrides: Optional[Dict[str, Any]] = None)
         concurrency=max(1, int(rc_data.get("concurrency", _rc_default.concurrency))),
         risk_min_severity=str(rc_data.get("risk_min_severity", _rc_default.risk_min_severity) or _rc_default.risk_min_severity),
         poll_interval_s=max(1, int(rc_data.get("poll_interval_s", _rc_default.poll_interval_s))),
+        max_retries=max(0, int(rc_data.get("max_retries", _rc_default.max_retries))),
     )
 
     if overrides:

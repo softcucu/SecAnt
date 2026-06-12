@@ -93,6 +93,9 @@ recheck:
   concurrency: 1                # 该角色并发上限(默认 1:逐条串行排查)
   risk_min_severity: medium     # 风险点自动入排查队列的最低 severity_hint(high/medium/low/info)
   poll_interval_s: 3            # 优先队列空时的轮询等待间隔(秒)
+  max_retries: 2                # 单个排查项连续失败的重排上限;超过即放弃该项(不再回灌优先队列)。
+                                # 防止某条复查的后端调用持续失败时无限重排,拖住整条管线的收敛、
+                                # 占住唯一的 recheck 名额,导致其它 agent 看似“全停”。设 0 = 失败即放弃。
 
 # ── 方法库目录(.md 审计方法,agent 运行时会 Read) ──
 # 默认使用项目自带的 proto_vuln_hunt/methods/(随项目分发,无需任何外部依赖)。

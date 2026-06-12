@@ -53,10 +53,7 @@ class Pipeline:
         # ── 专用优先排查通道(历史变体 + 风险点复查) ──
         self.pq: List[Dict[str, Any]] = []           # 优先排查队列(kind ∈ {variant, risk};variant 优先)
         self.risk_by_id: Dict[str, Dict[str, Any]] = {}  # rid -> 风险记录(便于人工调级时联动入队/出队)
-        self._recheck_task: Optional[asyncio.Task] = None
         self._recheck_inflight = 0                   # 正在排查 + 已 pop 待起的项数(收敛判据)
-        self._recheck_stop: Optional[asyncio.Event] = None
-        self._audit_done = False                     # 主审计循环是否已收敛(供 recheck_loop 收尾)
         self._restored_checkpoint = False
         self.build_hint: str = ""
         self.seq = 0
@@ -988,7 +985,8 @@ class Pipeline:
                 self._active_roles[role] = max(0, self._active_roles.get(role, 0) - 1)
 
     async def _run_scheduler(self, *, stop_when: Optional[Callable[[], bool]] = None,
-                             stop_when_idle: bool = True) -> None:
+                             stop_when_idle: bool = True,
+                             extra_pending: Optional[Callable[[], bool]] = None) -> None:
         """统一调度循环。
 
         stop_when 用于 recon 并行窗口:条件满足后不再启动新工作,但会等待已启动工作收尾;
@@ -1029,7 +1027,8 @@ class Pipeline:
             if stop_when is not None and stop_when():
                 break
 
-            has_pending = bool(self.queue or self.pq or self._audit_passes or self._recheck_inflight)
+            has_pending = bool(self.queue or self.pq or self._audit_passes or self._recheck_inflight
+                               or (extra_pending is not None and extra_pending()))
             if has_pending:
                 await asyncio.sleep(min(self.cfg.history.poll_interval_s, self.cfg.recheck.poll_interval_s, 1))
                 continue
@@ -1057,7 +1056,7 @@ class Pipeline:
         if self._decompose_total and self.cfg.decompose:
             self.log(f"区域拆解已入统一队列:{self._decompose_total} 个 region 将按优先级逐步拆解,拆出即审")
 
-        await self._run_scheduler(stop_when_idle=True)
+        await self._run_scheduler(stop_when_idle=True, extra_pending=self._history_active)
         if not self.queue and not self.pq and not self._audit_passes and not self._recheck_inflight:
             self.log(f"轮 {self.round}: 队列已空且无新攻击面回灌,提前收敛")
 
@@ -1067,18 +1066,8 @@ class Pipeline:
             stop_reason = f"达到 maxRounds({self.cfg.max_rounds});失败重试队列已补审完成"
         else:
             stop_reason = f"收敛(连续 {self.cfg.dry_rounds} 轮无新增)"
-        self._audit_done = True
-        if self._recheck_task is not None:
-            if self._recheck_stop is not None:
-                self._recheck_stop.set()
-            if not self._recheck_task.done() and self.stop_requested():
-                self._recheck_task.cancel()
-            if self.pq or self._recheck_inflight > 0:
-                self.log(f"等待优先排查通道排空:队列 {len(self.pq)} 项、在途 {self._recheck_inflight} 项…")
-            try:
-                await self._recheck_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
+        # 优先排查通道已统一并入主调度器(_run_scheduler):上面的 stop_when_idle 收敛时
+        # pq 与在途复查必然已排空(失败项有上限重排后会终结),无需再单独等待专用 recheck 任务。
         self.log(f"审计循环结束:{stop_reason}。等待 {len(self.in_flight)} 条流水线(验证/PoC/报告)排空…")
         await asyncio.gather(*self.in_flight, return_exceptions=True)
         self.checkpoint(self.round)
@@ -1136,9 +1125,6 @@ class Pipeline:
                 rec["risks"] = rec.get("risks", 0) + 1
 
     # ──────── 专用优先排查:历史变体 + 风险点复查(统一调度队列中的最高优先级)────────
-    def _recheck_active(self) -> bool:
-        return self._recheck_task is not None and not self._recheck_task.done()
-
     def _enqueue_variant(self, entry: Dict[str, Any]) -> None:
         """git 历史挖掘提炼出的问题模式 → 进优先排查队列(同类变体排查)。"""
         self.pq.append({"kind": "variant", "pattern": entry["pattern"], "source": entry["source"],
@@ -1156,45 +1142,50 @@ class Pipeline:
             return it
         return None
 
-    def _start_recheck(self) -> None:
-        if not self.cfg.recheck.enabled or self._recheck_task is not None:
+    def _handle_recheck_failure(self, item: Dict[str, Any], rec: Dict[str, Any],
+                                kind: Optional[str], rid: Optional[str], label: str) -> None:
+        """一条优先排查项的 agent 失败后的处理:有上限地重排,超限则放弃。
+
+        关键不变量:无论后端怎么持续失败,这一项都会在有限次后**终结**(完成或放弃),
+        从而 `pq`/`_recheck_inflight` 必然清零、管线必然收敛,失败的复查不会拖住其它 agent。
+        用户请求停止导致的失败不计入重试上限——保留排队态,留待续跑。
+        """
+        if self.stop_requested():
+            rec["status"] = "incomplete"
+            if kind == "risk" and rid in self.risk_by_id:
+                self.risk_by_id[rid]["recheck_status"] = "queued"
+                self.store.save_risk(self.risk_by_id[rid])
+            self.pq.append(item)
             return
-        self._recheck_stop = asyncio.Event()
-        self._recheck_task = asyncio.create_task(self.recheck_loop())
 
-    async def recheck_loop(self) -> None:
-        """专用排查 agent:从优先队列取项排查。并发上限 = cfg.recheck.concurrency(默认 1);
-        懒占全局并发名额——有活才占、用完即还,队列空时不占用主池。"""
-        sem = asyncio.Semaphore(max(1, self.cfg.recheck.concurrency))
-        inflight: List[asyncio.Task] = []
-        self.log(f"🔁 优先排查通道就绪(并发上限 {self.cfg.recheck.concurrency},"
-                 f"风险点入队阈值 ≥{self.cfg.recheck.risk_min_severity};历史变体与风险点复查优先处理)")
+        attempts = self._mark_retry_after_failure(item)
+        if attempts <= max(0, self.cfg.recheck.max_retries):
+            rec["status"] = "incomplete"
+            if kind == "risk" and rid in self.risk_by_id:
+                self.risk_by_id[rid]["recheck_status"] = "queued"
+                self.store.save_risk(self.risk_by_id[rid])
+            self.pq.append(item)
+            self.emit(EV.RECHECK_ENQUEUED, {"kind": kind, "id": rid, "pattern": item.get("pattern"),
+                                            "label": label, "retry": True, "attempt": attempts})
+            self.checkpoint(self.round)
+            self.emit_coverage()
+            self.log(f"优先排查项 {label} 第 {attempts} 次失败,放回队尾稍后重试"
+                     f"(上限 {self.cfg.recheck.max_retries})")
+            return
 
-        async def worker(it: Dict[str, Any]) -> None:
-            try:
-                async with sem:
-                    if self.stop_requested():
-                        return
-                    got = await self.runner.reserve_slots(1)   # 懒占:用时才占 1 个全局名额
-                    try:
-                        await self._run_recheck(it, use_global_gate=False)
-                    finally:
-                        self.runner.release_slots(got)          # 用完即还,主池回满
-            finally:
-                self._recheck_inflight -= 1
-
-        while not self.stop_requested():
-            inflight = [t for t in inflight if not t.done()]
-            it = self._pop_priority()
-            if it is None:
-                if (self._recheck_stop and self._recheck_stop.is_set()
-                        and self._recheck_inflight == 0 and not inflight):
-                    break
-                await asyncio.sleep(self.cfg.recheck.poll_interval_s)
-                continue
-            self._recheck_inflight += 1                          # pop 与计数之间无 await,原子
-            inflight.append(asyncio.create_task(worker(it)))
-        await asyncio.gather(*inflight, return_exceptions=True)
+        # 超过重排上限 → 放弃该项:标记完成(后续不再回灌/重排),让管线得以收敛。
+        self._clear_retry_after_failure(item)
+        self.completed_items.add(item_key(item))
+        rec["status"] = "abandoned"
+        if kind == "risk" and rid in self.risk_by_id:
+            self.risk_by_id[rid]["recheck_status"] = "failed"
+            self.store.save_risk(self.risk_by_id[rid])
+        self.emit(EV.RECHECK_DONE, {"kind": kind, "id": rid, "pattern": item.get("pattern"),
+                                    "label": label, "abandoned": True, "attempts": attempts})
+        self.log(f"⚠ 优先排查项 {label} 连续失败 {attempts} 次(超过上限 "
+                 f"{self.cfg.recheck.max_retries}),放弃该项以免拖住流水线(其余审计不受影响)")
+        self.checkpoint(self.round)
+        self.emit_coverage()
 
     async def _run_recheck(self, item: Dict[str, Any], *, use_global_gate: bool = True) -> None:
         if self.stop_requested():
@@ -1221,21 +1212,14 @@ class Pipeline:
             label = f"recheck:risk:{str(item.get('area') or rid or '')[:24]}"
         if lens_key not in rec["lenses"]:
             rec["lenses"].append(lens_key)
+        # recheck 用「快速失败」模式跑:单次调用不在 runner 内部做长退避(retries=0),
+        # 失败后的重试改由优先队列层面**有上限地**重排(见下)。这样一条卡住/失败的复查
+        # 既不会在退避期间一直占着唯一的 recheck 名额、拖慢其它 agent,也不会无限重排导致管线永不收敛。
         res = await self.runner.run(prompt, role="recheck", label=label, schema=S.FINDINGS_SCHEMA,
-                                    use_global_gate=use_global_gate,
+                                    retries=0, use_global_gate=use_global_gate,
                                     should_stop=self.stop_requested)
         if not res:
-            self._mark_retry_after_failure(item)
-            rec["status"] = "incomplete"
-            if kind == "risk" and rid in self.risk_by_id:
-                self.risk_by_id[rid]["recheck_status"] = "queued"
-                self.store.save_risk(self.risk_by_id[rid])
-            self.pq.append(item)
-            self.emit(EV.RECHECK_ENQUEUED, {"kind": kind, "id": rid, "pattern": item.get("pattern"),
-                                            "label": label, "retry": True})
-            self.checkpoint(self.round)
-            self.emit_coverage()
-            self.log(f"优先排查项 {label} 连续失败,已放回队尾稍后重试")
+            self._handle_recheck_failure(item, rec, kind, rid, label)
             return
         self._clear_retry_after_failure(item)
         if res:
@@ -1310,6 +1294,7 @@ class Pipeline:
                  f"resume={self.cfg.resume} 威胁模型={self.cfg.threat_model}")
         self.log(f"启用 lens: {', '.join(self.cfg.lenses)} | run 目录: {self.store.dir} | "
                  f"方法库: {self.cfg.methods_abs} ({'就绪' if self.cfg.methods_ok() else '不可用→内联兜底'})")
+        history_sched: Optional[asyncio.Task] = None
         try:
             model_error = self.cfg.model_config_error()
             if model_error:
@@ -1325,15 +1310,28 @@ class Pipeline:
                 history_sched = asyncio.create_task(
                     self._run_scheduler(stop_when=lambda: recon_task.done(), stop_when_idle=False)
                 )
+                self._history_task = history_sched
                 try:
                     await recon_task
-                finally:
-                    await history_sched
+                except Exception:
+                    if not history_sched.done():
+                        history_sched.cancel()
+                    await asyncio.gather(history_sched, return_exceptions=True)
+                    raise
             stop_reason = await self.audit()
+            if history_sched is not None:
+                await history_sched
+                if self._history_task is history_sched:
+                    self._history_task = None
             result = self.synthesis(stop_reason)
             self.emit(EV.RUN_STATUS, {"status": result["status"]})
             return result
         except Exception as e:  # noqa: BLE001
+            if history_sched is not None and not history_sched.done():
+                history_sched.cancel()
+                await asyncio.gather(history_sched, return_exceptions=True)
+                if self._history_task is history_sched:
+                    self._history_task = None
             self.log(f"⚠ run 异常: {str(e)[:200]}")
             self.store.set_status(STATUS_ERROR)
             self.emit(EV.ERROR, {"message": str(e)[:500]})

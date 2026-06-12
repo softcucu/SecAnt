@@ -139,6 +139,77 @@ class TestRecheckRetryQueue(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(p.ledger_rec(item)["status"], "incomplete")
 
 
+class TestRecheckGivesUp(unittest.IsolatedAsyncioTestCase):
+    """持续失败的优先排查项必须在 max_retries 次后放弃,而不是无限回灌优先队列。
+    这是修复“跑完 recon 后只剩 1 个 recheck、其它 agent 全停”死循环的关键不变量。"""
+
+    class _FailRunner:
+        agent_count = 0
+        usage_totals = {"calls": 0, "input_tokens": 0, "output_tokens": 0,
+                        "total_tokens": 0, "estimated_calls": 0}
+
+        async def run(self, *_args, **_kwargs):
+            return None  # 后端持续失败
+
+    async def test_recheck_abandoned_after_exceeding_max_retries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = _pipe(tmp, enabled=True, max_retries=2)
+            p.runner = self._FailRunner()
+            p.round = 1
+            item = {"kind": "variant", "pattern": "v1", "source": "c1", "files": [], "lens_hint": "memory"}
+
+            # 前 max_retries 次失败 → 仍回灌重排
+            for expected in (1, 2):
+                p.pq.clear()
+                await p._run_recheck(item)
+                self.assertEqual(p.pq, [item])
+                self.assertEqual(item["retry_after_failure"], expected)
+                self.assertNotIn(item_key(item), p.completed_items)
+
+            # 第 max_retries+1 次失败 → 放弃:不再回灌、标记完成、状态 abandoned
+            p.pq.clear()
+            await p._run_recheck(item)
+            self.assertEqual(p.pq, [])
+            self.assertIn(item_key(item), p.completed_items)
+            self.assertEqual(p.ledger_rec(item)["status"], "abandoned")
+
+    async def test_persistently_failing_recheck_does_not_hang_audit(self):
+        """端到端:audit() 在 recheck 永久失败时仍必须收敛(不再死循环),
+        且普通 audit 工作照常完成——recheck 失败不拖住其它 agent。"""
+        class MixedRunner:
+            agent_count = 0
+            usage_totals = {"calls": 0, "input_tokens": 0, "output_tokens": 0,
+                            "total_tokens": 0, "estimated_calls": 0}
+
+            def __init__(self):
+                self.audit_calls = 0
+
+            async def run(self, *_args, **kwargs):
+                if kwargs.get("role") == "recheck":
+                    return None  # 复查永久失败
+                self.audit_calls += 1
+                return {"findings": [], "new_surfaces": [], "risk_notes": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(target=tmp, out_dir=os.path.join(tmp, "out"), lenses=["memory"],
+                         finders_per_lens=1, max_rounds=1, dry_rounds=1, decompose=False)
+            cfg.recheck = RecheckSpec(enabled=True, max_retries=1)
+            store = RunStore(cfg.out_dir).ensure()
+            p = Pipeline(cfg, store=store)
+            p.runner = MixedRunner()
+            p._enqueue_variant({"pattern": "v1", "source": "c1", "files": [], "lens_hint": "memory"})
+            p.queue.append({"kind": "task", "region": "r", "objective": "o", "files": []})
+
+            import asyncio
+            # 修复前这里会永久挂起;加超时把回归坐死。
+            await asyncio.wait_for(p.audit(), timeout=10)
+
+            self.assertEqual(p.pq, [])
+            self.assertEqual(p._recheck_inflight, 0)
+            self.assertIn("variant:v1", p.completed_items)   # 失败的复查被放弃
+            self.assertGreaterEqual(p.runner.audit_calls, 1)  # 普通审计照常完成
+
+
 class TestAdjustSeverity(unittest.TestCase):
     def test_upgrade_enqueues(self):
         with tempfile.TemporaryDirectory() as tmp:
