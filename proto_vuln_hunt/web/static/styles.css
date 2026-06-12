@@ -67,6 +67,9 @@ tr:hover td{background:var(--panel2)}
 .health-checking{background:var(--run)} .health-unknown{background:var(--info)}
 .agent-running{background:var(--run)} .agent-queued{background:var(--info)} .agent-retrying{background:var(--warn)}
 .agent-failed-attempt{background:var(--warn)} .agent-done{background:var(--ok)} .agent-failed{background:var(--crit)}
+.cand-pending{background:var(--run)} .cand-confirmed{background:var(--ok)} .cand-rejected{background:var(--info)}
+.cand-table tr.cand-rejected{opacity:.55}
+.cand-table tr.cand-confirmed td:first-child{font-weight:600}
 
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px}
 .stat{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
@@ -102,6 +105,9 @@ tr:hover td{background:var(--panel2)}
 .agent-group-key{color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
 .agent-group-summary{margin-left:auto;color:var(--muted);font-size:12px}
 .agent-group-body{padding:10px 0 2px}
+.agent-group.idle .agent-group-head{opacity:.72}
+.agent-group.has-active .agent-group-title{color:var(--ok,#16a34a)}
+.agent-group-empty{padding:4px 2px;font-size:12px}
 .agent-card{background:var(--panel);border:1px solid var(--border);border-radius:8px;margin-bottom:12px;overflow:hidden}
 .agent-card.active{border-color:rgba(59,130,246,.65)}
 .agent-head{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:10px 12px;border-bottom:1px solid var(--border);background:var(--panel)}

@@ -233,7 +233,7 @@ async function viewNew() {
 // ──────────────────────── view: dashboard ────────────────────────
 function viewDashboard(runId) {
   app.innerHTML = "";
-  const S = { findings: new Map(), risks: new Map(), health: new Map(), agentMap: new Map(), coverage: null, recon: null, log: [], usageRows: [], usage: emptyUsage(), manifest: null, meta: null, candidates: 0, status: "queued", round: 0, dry: 0, agents: 0, elapsed: 0 };
+  const S = { findings: new Map(), risks: new Map(), health: new Map(), agentMap: new Map(), candidateMap: new Map(), coverage: null, recon: null, log: [], usageRows: [], usage: emptyUsage(), manifest: null, meta: null, candidates: 0, status: "queued", round: 0, dry: 0, agents: 0, elapsed: 0 };
   let activeTab = "findings";
   let agentOutputMode = localStorage.getItem("pvh.agentOutputMode") === "raw" ? "raw" : "pretty";
   const agentGroupStoreKey = `pvh.agentGroupsCollapsed:${runId}`;
@@ -315,11 +315,11 @@ function viewDashboard(runId) {
     header.append(stats);
   }
 
-  const TABS = [["findings", "漏洞"], ["agents", "Agent"], ["health", "模型"], ["coverage", "攻击面覆盖"], ["history", "历史问题"], ["risks", "潜在风险点"], ["usage", "历史任务"], ["recon", "侦察"], ["activity", "活动"], ["exports", "导出"]];
+  const TABS = [["findings", "漏洞"], ["candidates", "候选"], ["agents", "实时Agent"], ["health", "模型"], ["coverage", "攻击面覆盖"], ["history", "历史问题"], ["risks", "潜在风险点"], ["usage", "历史任务"], ["recon", "侦察"], ["activity", "活动"], ["exports", "导出"]];
   function renderTabs() {
     tabsBar.innerHTML = "";
     const activeAgents = [...S.agentMap.values()].filter(isAgentActive).length;
-    const counts = { findings: S.findings.size, risks: S.risks.size, usage: S.usageRows.length, health: S.health.size, agents: activeAgents || S.agentMap.size, history: (S.recon?.history || []).length };
+    const counts = { findings: S.findings.size, candidates: S.candidateMap.size, risks: S.risks.size, usage: S.usageRows.length, health: S.health.size, agents: activeAgents, history: (S.recon?.history || []).length };
     for (const [key, label] of TABS) {
       const t = el("div", { class: "tab" + (key === activeTab ? " active" : "") }, label);
       if (counts[key]) t.append(el("span", { class: "tabcount" }, String(counts[key])));
@@ -331,6 +331,7 @@ function viewDashboard(runId) {
   function renderTab() {
     tabBody.innerHTML = "";
     if (activeTab === "findings") return renderFindings();
+    if (activeTab === "candidates") return renderCandidates();
     if (activeTab === "agents") return renderAgents();
     if (activeTab === "health") return renderModels();
     if (activeTab === "coverage") return renderCoverage();
@@ -366,6 +367,62 @@ function viewDashboard(runId) {
       });
       tabBody.append(card);
     }
+  }
+
+  const CAND_STATUS_TXT = { pending: "验证中", confirmed: "已确认", rejected: "已否决" };
+  function candPill(s) { return el("span", { class: "pill cand-" + cssKey(s) }, CAND_STATUS_TXT[s] || s || "?"); }
+  function candKeyOf(d) {
+    return d.key || `${(d.file || "").trim()}::${d.line || 0}::${(d.bug_class || "").trim().toLowerCase()}`;
+  }
+  function upsertCandidate(d) {
+    const k = candKeyOf(d);
+    const ex = S.candidateMap.get(k);
+    if (ex) {
+      // 仅补全字段,不覆盖已有状态(confirmed/rejected 优先级高于 pending)
+      ex.title = d.title || ex.title; ex.bug_class = d.bug_class || ex.bug_class;
+      ex.file = d.file || ex.file; ex.line = d.line || ex.line;
+      ex.lens = d.lens || ex.lens; ex.severity = d.severity || ex.severity;
+      ex.function = d.function || ex.function;
+      return ex;
+    }
+    const c = { key: k, status: "pending", title: d.title, bug_class: d.bug_class,
+      file: d.file, line: d.line, lens: d.lens, severity: d.severity, function: d.function || "", seq: S.candidateMap.size };
+    S.candidateMap.set(k, c);
+    return c;
+  }
+  function renderCandidates() {
+    const list = [...S.candidateMap.values()];
+    const pending = list.filter(c => c.status === "pending").length;
+    const confirmed = list.filter(c => c.status === "confirmed").length;
+    const rejected = list.filter(c => c.status === "rejected").length;
+    tabBody.append(el("div", { class: "panel" },
+      el("div", { class: "row", style: "justify-content:space-between" },
+        el("strong", {}, "漏洞候选点"),
+        el("span", { class: "muted" }, `共 ${list.length} · 验证中 ${pending} · 已确认 ${confirmed} · 已否决 ${rejected}`)),
+      el("p", { class: "muted", style: "margin:6px 0 0;font-size:12px" },
+        "候选点 = 审计/复查 agent 报出、正在多票验证流水线中的疑点;验证通过后升级为「漏洞」,未过则标为已否决。")));
+    if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无候选点(审计开始后会实时出现)。")); return; }
+    const rank = { pending: 0, confirmed: 1, rejected: 2 };
+    list.sort((a, b) =>
+      (rank[a.status] ?? 9) - (rank[b.status] ?? 9) ||
+      (SEVS.indexOf(a.severity) - SEVS.indexOf(b.severity)) ||
+      ((a.seq || 0) - (b.seq || 0)));
+    const tbl = el("table", { class: "cand-table" }, el("thead", {}, el("tr", {},
+      el("th", {}, "状态"), el("th", {}, "严重度"), el("th", {}, "类别"), el("th", {}, "标题"),
+      el("th", {}, "位置"), el("th", {}, "lens"), el("th", {}, "确认编号"))));
+    const tb = el("tbody");
+    for (const c of list) {
+      tb.append(el("tr", { class: "cand-row cand-" + cssKey(c.status) },
+        el("td", {}, candPill(c.status)),
+        el("td", {}, sevPill(c.severity || "none")),
+        el("td", {}, c.bug_class || ""),
+        el("td", {}, c.title || ""),
+        el("td", { class: "loc" }, `${c.file || ""}:${c.line || 0}${c.function ? " · " + c.function : ""}`),
+        el("td", {}, c.lens || ""),
+        el("td", {}, c.id || "—")));
+    }
+    tbl.append(tb);
+    tabBody.append(el("div", { class: "panel" }, tbl));
   }
 
   const HEALTH_TXT = { ok: "✅ 正常", down: "⛔ 不可达", degraded: "⚠️ 异常", checking: "⏳ 检查中", unknown: "· 未检查" };
@@ -471,6 +528,8 @@ function viewDashboard(runId) {
     agent: "Agent",
   };
   const AGENT_ROLE_ORDER = ["recheck", "recon", "history", "decompose", "audit", "verify", "report", "poc", "synthesis", "util", "agent"];
+  // 始终常驻显示的 8 个角色分组(与 pipeline 实际拉起的 role 一一对应),无论当前是否有在跑的 agent。
+  const AGENT_REAL_ROLES = ["recon", "decompose", "history", "audit", "verify", "recheck", "report", "poc"];
   function isAgentActive(a) { return ["queued", "running", "retrying", "failed_attempt"].includes(a.status); }
   function agentPill(s) { return el("span", { class: "pill agent-" + cssKey(s) }, AGENT_TXT[s] || s || "unknown"); }
   function agentOrderValue(a) {
@@ -506,16 +565,6 @@ function viewDashboard(runId) {
   function agentGroupOrder(key) {
     const i = AGENT_ROLE_ORDER.indexOf(key);
     return i >= 0 ? i : AGENT_ROLE_ORDER.length;
-  }
-  function agentGroups(agents) {
-    const map = new Map();
-    for (const a of agents) {
-      const key = agentCategory(a);
-      if (!map.has(key)) map.set(key, { key, agents: [] });
-      map.get(key).agents.push(a);
-    }
-    return [...map.values()].sort((a, b) =>
-      agentGroupOrder(a.key) - agentGroupOrder(b.key) || a.key.localeCompare(b.key));
   }
   function agentRawOutput(a) {
     return (a.chunks || []).length ? a.chunks.map(c => c.chunk).join("") : (a.output || "");
@@ -769,14 +818,14 @@ function viewDashboard(runId) {
     return card;
   }
   function renderAgentGroup(group) {
-    const active = group.agents.filter(isAgentActive).length;
-    const failed = group.agents.filter(a => a.status === "failed" || a.status === "failed_attempt").length;
-    const done = group.agents.length - active;
+    const running = group.agents.filter(isAgentActive);
+    const active = running.length;
+    const done = group.agents.length - active;          // 已结束(完成 + 失败)
+    const failed = group.agents.filter(a => a.status === "failed").length;
     const collapsed = collapsedAgentGroups.has(group.key);
     const summary = [
-      `共 ${group.agents.length}`,
-      active ? `运行中 ${active}` : "",
-      done ? `已结束 ${done}` : "",
+      `运行中 ${active}`,
+      `已结束 ${done}`,
       failed ? `异常 ${failed}` : "",
     ].filter(Boolean).join(" · ");
     const head = el("button", {
@@ -789,23 +838,36 @@ function viewDashboard(runId) {
       el("span", { class: "agent-group-key" }, group.key),
       el("span", { class: "agent-group-summary" }, summary));
     head.addEventListener("click", () => toggleLocalSet(collapsedAgentGroups, group.key, agentGroupStoreKey));
-    return el("section", { class: "agent-group " + (collapsed ? "collapsed" : "open") },
+    const cards = active
+      ? running.map(renderAgentCard)
+      : [el("div", { class: "muted agent-group-empty" }, "暂无运行中 agent")];
+    return el("section", { class: "agent-group " + (collapsed ? "collapsed" : "open") + (active ? " has-active" : " idle") },
       head,
-      collapsed ? null : el("div", { class: "agent-group-body" }, ...group.agents.map(renderAgentCard)));
+      collapsed ? null : el("div", { class: "agent-group-body" }, ...cards));
   }
   function renderAgents() {
+    // 8 个角色分组常驻显示(无论当前是否有在跑的 agent),组头显示运行中/已结束数量;
+    // 组体只列正在运行的 agent 卡片,跑完的不再展示。出现未知角色时追加其分组,确保不遗漏。
     const all = [...S.agentMap.values()].sort(agentSort);
     const running = all.filter(isAgentActive);
     const done = all.length - running.length;
     tabBody.append(el("div", { class: "panel agent-summary" },
       el("div", { class: "row", style: "justify-content:space-between" },
-        el("strong", {}, "Agent 实时输出"),
+        el("strong", {}, "实时 Agent"),
         el("div", { class: "row" },
           el("span", { class: "muted" }, `运行中 ${running.length} · 已结束 ${done}`),
           agentModeSwitch()))));
-    if (!all.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无 agent 输出。运行开始后这里会出现每个 agent 的实时 stdout/stderr。")); return; }
-    const shown = all.slice(Math.max(0, all.length - 80));
-    for (const group of agentGroups(shown)) tabBody.append(renderAgentGroup(group));
+    const byRole = new Map();
+    for (const a of all) {
+      const k = agentCategory(a);
+      if (!byRole.has(k)) byRole.set(k, []);
+      byRole.get(k).push(a);
+    }
+    const roles = [...AGENT_REAL_ROLES];
+    for (const k of byRole.keys()) if (!roles.includes(k)) roles.push(k);
+    for (const key of roles) {
+      tabBody.append(renderAgentGroup({ key, agents: (byRole.get(key) || []).sort(agentSort) }));
+    }
   }
 
   function subtaskRow(t) {
@@ -1069,11 +1131,19 @@ function viewDashboard(runId) {
       case "metrics": applyMetrics(d); renderHeader(); break;
       case "usage": S.usageRows.push(d); addUsage(S.usage, d); renderHeader(); renderTabs(); if (activeTab === "usage") renderTab(); break;
       case "agent_update": applyAgentUpdate(d); renderHeader(); renderTabs(); if (activeTab === "agents") renderTab(); break;
-      case "candidate_found": S.candidates++; renderHeader(); break;
-      case "finding_confirmed":
+      case "candidate_found": S.candidates++; upsertCandidate(d); renderHeader(); renderTabs(); if (activeTab === "candidates") renderTab(); break;
+      case "finding_confirmed": {
         if (d.id && !S.findings.has(d.id)) { S.findings.set(d.id, d); flash("✔ 疑似漏洞 " + d.id + " [" + d.corrected_severity + "]"); }
         else if (d.id) S.findings.set(d.id, d);
-        renderHeader(); renderTabs(); if (activeTab === "findings") renderTab(); break;
+        const cc = S.candidateMap.get(candKeyOf(d)) || upsertCandidate(d);
+        cc.status = "confirmed"; cc.id = d.id; cc.severity = d.corrected_severity || cc.severity;
+        renderHeader(); renderTabs(); if (activeTab === "findings" || activeTab === "candidates") renderTab(); break;
+      }
+      case "finding_rejected": {
+        const cr = S.candidateMap.get(candKeyOf(d));
+        if (cr) cr.status = "rejected";
+        renderTabs(); if (activeTab === "candidates") renderTab(); break;
+      }
       case "risk_added": { const k = (d.area || "") + "::" + (d.file || ""); S.risks.set(k, d); renderHeader(); renderTabs(); if (activeTab === "risks") renderTab(); break; }
       case "recheck_enqueued": case "recheck_done": case "risk_severity_changed":
         fetchRisks(); fetchCoverage(); break;
@@ -1120,7 +1190,7 @@ function viewDashboard(runId) {
     // SSE:从 seq 0 重放历史事件(重建 findings/coverage/risks/log)再接实时;EventSource 断线自动带 Last-Event-ID 续传
     const es = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events`);
     window._es = es;
-    const TYPES = ["run_status", "metrics", "usage", "agent_update", "candidate_found", "finding_confirmed", "risk_added", "recheck_enqueued", "recheck_done", "risk_severity_changed", "surface_added", "coverage_update", "round_start", "round_done", "recon_done", "history_added", "run_done", "log", "decompose_done", "poc_done", "error", "model_health", "health_check_start", "health_check_done", "config_updated"];
+    const TYPES = ["run_status", "metrics", "usage", "agent_update", "candidate_found", "finding_confirmed", "finding_rejected", "risk_added", "recheck_enqueued", "recheck_done", "risk_severity_changed", "surface_added", "coverage_update", "round_start", "round_done", "recon_done", "history_added", "run_done", "log", "decompose_done", "poc_done", "error", "model_health", "health_check_start", "health_check_done", "config_updated"];
     for (const t of TYPES) es.addEventListener(t, (e) => { try { applyEvent(JSON.parse(e.data)); } catch (_) {} });
     es.onerror = () => { /* EventSource 自动重连 */ };
   }

@@ -1103,7 +1103,8 @@ class Pipeline:
             rec["candidates"] = rec.get("candidates", 0) + 1
             self.pending_findings[fk] = f
             self.emit(EV.CANDIDATE_FOUND, {"key": fk, "title": f.get("title"), "bug_class": f.get("bug_class"),
-                                           "file": f.get("file"), "line": f.get("line"), "lens": lens_key})
+                                           "file": f.get("file"), "line": f.get("line"), "lens": lens_key,
+                                           "severity": f.get("severity"), "function": f.get("function") or ""})
             self._enqueue_finding(f)
         for s in (res.get("new_surfaces") or []):
             sk = (s.get("name") or "").strip().lower()
