@@ -210,6 +210,138 @@ class DumpFailedOutputTests(unittest.TestCase):
             self.assertFalse(os.path.exists(path[:-len(".txt")] + ".jsonload.json"))
 
 
+class ArtifactRetainTests(unittest.TestCase):
+    def _runner(self, out_dir, retain=10):
+        cfg = Config(
+            target=out_dir,
+            out_dir=out_dir,
+            backend="opencode",
+            models={"audit": ["m"]},
+            artifact_retain=retain,
+            backends={
+                "opencode": BackendSpec(
+                    name="opencode", command=["x"], prompt_mode="arg", parse="text"
+                )
+            },
+        )
+        cfg.health.enabled = False
+        return AgentRunner(cfg, logger=lambda *_a, **_k: None)
+
+    def test_prompt_files_roll_to_recent_n(self):
+        with tempfile.TemporaryDirectory() as d:
+            runner = self._runner(d, retain=3)
+            paths = [runner._write_prompt_file(f"p{i}") for i in range(8)]
+            # 子进程结束后会解除保护;这里手动模拟"都已用完"
+            runner._live_prompt_files.clear()
+            # 再写一个触发清理
+            paths.append(runner._write_prompt_file("p8"))
+            remaining = [f for f in os.listdir(os.path.join(d, "prompts")) if f.endswith(".md")]
+            self.assertEqual(len(remaining), 3)              # 只剩最近 3 个
+            self.assertTrue(os.path.exists(paths[-1]))       # 最新的在
+            self.assertFalse(os.path.exists(paths[0]))       # 最旧的已删
+
+    def test_in_flight_prompt_file_is_protected(self):
+        with tempfile.TemporaryDirectory() as d:
+            runner = self._runner(d, retain=2)
+            old = runner._write_prompt_file("oldest")        # 保持"在用"(不解除保护)
+            for i in range(5):
+                runner._live_prompt_files.discard(
+                    runner._write_prompt_file(f"x{i}")        # 这些用完即解除保护
+                )
+            # old 仍在 live 集合里 → 即使最旧也不能被删
+            self.assertTrue(os.path.exists(old))
+
+    def test_debug_dumps_roll_with_sidecar(self):
+        with tempfile.TemporaryDirectory() as d:
+            runner = self._runner(d, retain=2)
+            for i in range(5):
+                runner._dump_failed_output(
+                    "audit", f"u{i}", "m", 1,
+                    f"<think>{i}</think>\n```json\n{{\"findings\": [}}\n```",
+                    dump_candidate=True,
+                )
+            dbg = os.path.join(d, "debug")
+            txts = [f for f in os.listdir(dbg) if f.endswith(".txt")]
+            jsons = [f for f in os.listdir(dbg) if f.endswith(".jsonload.json")]
+            self.assertEqual(len(txts), 2)                   # 只剩最近 2 组
+            self.assertEqual(len(jsons), 2)                  # sidecar 同步被裁
+
+    def test_retain_zero_disables_pruning(self):
+        with tempfile.TemporaryDirectory() as d:
+            runner = self._runner(d, retain=0)
+            runner._live_prompt_files.clear()
+            for i in range(6):
+                runner._write_prompt_file(f"p{i}")
+                runner._live_prompt_files.clear()
+            remaining = [f for f in os.listdir(os.path.join(d, "prompts")) if f.endswith(".md")]
+            self.assertEqual(len(remaining), 6)              # 不清理,全部保留
+
+
+class EphemeralBackendDataTests(unittest.TestCase):
+    def _runner(self, out_dir, backend="opencode", ephemeral=True):
+        cfg = Config(
+            target=out_dir,
+            out_dir=out_dir,
+            backend=backend,
+            models={"audit": ["m"]},
+            ephemeral_backend_data=ephemeral,
+            backends={
+                backend: BackendSpec(
+                    name=backend, command=["x"], prompt_mode="arg", parse="text"
+                )
+            },
+        )
+        cfg.health.enabled = False
+        return AgentRunner(cfg, logger=lambda *_a, **_k: None)
+
+    def test_opencode_run_uses_isolated_xdg_and_copies_auth(self):
+        with tempfile.TemporaryDirectory() as home:
+            # 伪造一个 opencode 真实数据目录 + auth.json
+            real_data = os.path.join(home, ".local", "share", "opencode")
+            os.makedirs(real_data, exist_ok=True)
+            with open(os.path.join(real_data, "auth.json"), "w") as f:
+                f.write("{\"token\":\"secret\"}")
+            old_home = os.environ.get("HOME")
+            old_xdg = os.environ.pop("XDG_DATA_HOME", None)
+            os.environ["HOME"] = home
+            try:
+                runner = self._runner(home)
+                env = {}
+                root = runner._setup_ephemeral_data(env)
+                self.assertTrue(root and os.path.isdir(root))
+                # env 指向一次性目录,且不是真实数据目录
+                self.assertEqual(env["XDG_DATA_HOME"], root)
+                self.assertNotEqual(os.path.realpath(root), os.path.realpath(os.path.join(home, ".local", "share")))
+                # 登录态被复制进去
+                copied = os.path.join(root, "opencode", "auth.json")
+                self.assertTrue(os.path.isfile(copied))
+                with open(copied) as f:
+                    self.assertIn("secret", f.read())
+                # 模拟 _invoke 的 finally:整目录删除
+                import shutil
+                shutil.rmtree(root, ignore_errors=True)
+                self.assertFalse(os.path.exists(root))
+            finally:
+                if old_home is not None:
+                    os.environ["HOME"] = old_home
+                if old_xdg is not None:
+                    os.environ["XDG_DATA_HOME"] = old_xdg
+
+    def test_disabled_returns_none_and_leaves_env(self):
+        with tempfile.TemporaryDirectory() as d:
+            runner = self._runner(d, ephemeral=False)
+            env = {}
+            self.assertIsNone(runner._setup_ephemeral_data(env))
+            self.assertNotIn("XDG_DATA_HOME", env)
+
+    def test_non_opencode_backend_skips_isolation(self):
+        with tempfile.TemporaryDirectory() as d:
+            runner = self._runner(d, backend="claude")
+            env = {}
+            self.assertIsNone(runner._setup_ephemeral_data(env))
+            self.assertNotIn("XDG_DATA_HOME", env)
+
+
 class ProcessDrainTests(unittest.IsolatedAsyncioTestCase):
     async def test_drain_process_waits_for_stdout_and_stderr_eof(self):
         code = (

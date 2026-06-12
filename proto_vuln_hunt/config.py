@@ -167,6 +167,13 @@ class Config:
     models: Dict[str, List[str]] = field(default_factory=dict)
     model_concurrency: Dict[str, int] = field(default_factory=dict)
     concurrency: int = 4
+    # 每次 opencode 子进程用一次性 XDG_DATA_HOME 跑,跑完整目录删除——回收 opencode 的
+    # 会话/快照(snapshot)等运行产物,避免 ~/.local/share/opencode 无上限膨胀。
+    # 仅对 backend=opencode 生效;claude/codex 不受影响。
+    ephemeral_backend_data: bool = True
+    # 排查类临时产物的滚动保留数:提示词临时文件(out_dir/prompts/agent_*.md)与解析失败转储
+    # (out_dir/debug/parsefail_*)各只保留最近 N 次,旧的自动删除。<=0 表示不清理(保留全部)。
+    artifact_retain: int = 10
 
     # 流水线参数(对齐 proto-vuln-hunt)
     finders_per_lens: int = 2

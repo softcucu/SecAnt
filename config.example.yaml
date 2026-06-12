@@ -35,6 +35,21 @@ model_concurrency:
   claude-sonnet-4-6: 2
   claude-opus-4-8: 1
 
+# ── opencode 运行产物自动回收(仅 backend=opencode 生效) ──
+# opencode 会把会话(storage)、快照(snapshot,每步把整棵工作树提交进一个裸 git 仓)、sqlite 库
+# 都写在 $XDG_DATA_HOME/opencode(默认 ~/.local/share/opencode)。本工具一次跑会派成千上万个 agent,
+# 且 PoC 每次在独立临时目录里跑 → opencode 按 cwd 不断新建 snapshot 仓,临时目录删掉后这些 snapshot
+# 仍永久残留,几天就能吃掉几十 GB。
+# 开启后:每个 opencode 子进程用一个一次性 XDG_DATA_HOME 运行,跑完整目录删除;登录态(auth.json)自动
+# 复制进去,模型/LSP 缓存在 ~/.cache/opencode 不受影响,故无重复下载开销。默认开启。
+ephemeral_backend_data: true
+
+# ── 排查类临时产物滚动保留 ──
+# 提示词临时文件(<out_dir>/prompts/agent_*.md)与解析失败转储(<out_dir>/debug/parsefail_*)
+# 各只保留最近 N 次,旧的自动删除,避免长跑时这两个目录无上限堆积。
+# 提示词文件正被子进程使用时受保护、不会被误删(实际保留数 ≥ N)。<=0 表示不清理、保留全部。
+artifact_retain: 10
+
 # ── 流水线参数(全部可选,下面是默认值) ──
 params:
   finders_per_lens: 2           # 每个攻击面每个 lens 每轮派几个 finder

@@ -12,6 +12,7 @@ import math
 import json
 import os
 import re
+import shutil
 import tempfile
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -727,6 +728,36 @@ class AgentRunner:
         self._model_cursor: Dict[str, int] = {}
         self._model_sems: Dict[str, DynamicSemaphore] = {}
         self._capacity_wait_s = 0.05
+        self._live_prompt_files: set = set()  # 正在被子进程使用的 prompt 文件,滚动清理时必须保护
+
+    def _prune_recent(self, directory: str, primary_suffix: str, keep: int,
+                      sidecar_suffixes: Tuple[str, ...] = (), protect: Optional[set] = None) -> None:
+        """滚动保留:只留 directory 下最近 keep 个 primary 文件(按 mtime),其余 primary 及其同名
+        sidecar 一并删除。protect 中的路径视为"在用",无论新旧都保留(避免删掉正被子进程读取的文件)。
+        keep<=0 表示不清理。所有文件操作都吞异常——清理失败绝不影响主流程。"""
+        if keep is None or keep <= 0:
+            return
+        try:
+            prims = [os.path.join(directory, fn) for fn in os.listdir(directory)
+                     if fn.endswith(primary_suffix)]
+        except OSError:
+            return
+        if len(prims) <= keep:
+            return
+        try:
+            prims.sort(key=lambda p: os.path.getmtime(p))  # 旧 → 新
+        except OSError:
+            return
+        survivors = set(prims[-keep:]) | set(protect or ())
+        for p in prims:
+            if p in survivors:
+                continue
+            base = p[:-len(primary_suffix)]
+            for sc in (primary_suffix,) + tuple(sidecar_suffixes):
+                try:
+                    os.remove(base + sc)
+                except OSError:
+                    pass
 
     def _emit_agent(self, rec: Dict[str, Any]) -> None:
         if not self.agent_sink:
@@ -901,7 +932,12 @@ class AgentRunner:
             delete=False,
         ) as f:
             f.write(prompt)
-            return f.name
+            path = f.name
+        # 标记为"在用",并滚动清理旧文件——保护在用文件,避免删掉正被并发子进程读取的 prompt。
+        self._live_prompt_files.add(path)
+        self._prune_recent(prompt_dir, ".md", self.cfg.artifact_retain,
+                           protect=self._live_prompt_files)
+        return path
 
     def _record_usage(self, prompt: str, output: str, *, role: str, label: str,
                       model: str, attempt: int, backend_usage: Optional[Dict[str, int]]) -> None:
@@ -939,6 +975,36 @@ class AgentRunner:
                 self.usage_sink(rec)
             except Exception:
                 pass
+
+    # ── opencode 运行产物隔离:一次性 XDG_DATA_HOME ──
+    def _opencode_data_root(self) -> str:
+        """opencode 真实数据目录($XDG_DATA_HOME/opencode,默认 ~/.local/share/opencode)。
+        仅用于定位 auth.json,以便把登录态带进一次性数据目录。"""
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+        return os.path.join(base, "opencode")
+
+    def _setup_ephemeral_data(self, env: Dict[str, str]) -> Optional[str]:
+        """为本次 opencode 调用准备一次性数据目录并改写 env[XDG_DATA_HOME]。
+
+        opencode 把会话(storage)、快照(snapshot/ 裸 git 仓,每步提交整棵工作树)、sqlite 库都写在
+        $XDG_DATA_HOME/opencode 下;而 PoC 每次在独立临时 worktree 里跑,opencode 会按 cwd 新建一份
+        snapshot 仓,worktree 删掉后这些 snapshot 仍以孤儿形式永久残留 → 磁盘无上限膨胀。
+        这里把数据目录指向一个 tmp 目录,跑完由调用方整目录删除;模型/LSP 缓存在 $XDG_CACHE_HOME
+        (~/.cache/opencode)不受影响,故无重复下载开销。仅需把 auth.json 复制进去以保留登录态。
+        返回 tmp 根路径(供 finally 删除);失败或未启用则返回 None(回退共享目录,不影响功能)。"""
+        if self.cfg.backend != "opencode" or not getattr(self.cfg, "ephemeral_backend_data", True):
+            return None
+        try:
+            root = tempfile.mkdtemp(prefix="pvh-ocdata-")
+            data_dir = os.path.join(root, "opencode")
+            os.makedirs(data_dir, exist_ok=True)
+            src_auth = os.path.join(self._opencode_data_root(), "auth.json")
+            if os.path.isfile(src_auth):
+                shutil.copy2(src_auth, os.path.join(data_dir, "auth.json"))
+            env["XDG_DATA_HOME"] = root
+            return root
+        except Exception:  # noqa: BLE001 —— 准备失败就回退共享目录,绝不让清理逻辑拖垮主流程
+            return None
 
     # ── 单次子进程调用(不含重试) ──
     async def _invoke(self, prompt: str, model: str, cwd: str,
@@ -980,59 +1046,69 @@ class AgentRunner:
 
         env = dict(os.environ)
         env.update(self.spec.env or {})
+        # opencode:本次调用用一次性数据目录(隔离会话/快照),跑完整目录删除;其它后端 ephemeral_root=None。
+        ephemeral_root = self._setup_ephemeral_data(env)
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE if stdin_data is not None else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-            env=env,
-            limit=16 * 1024 * 1024,
-        )
-        if timeout_s is None:
-            timeout_s = max(1, self.cfg.retry.timeout_ms / 1000.0)
         try:
-            out_b, err_b = await _drain_process(proc, stdin_data, timeout_s, on_output)
-        except asyncio.TimeoutError:
-            raise RuntimeError(f"timed out after {int(timeout_s)}s")
-
-        stdout = (out_b or b"").decode("utf-8", "replace")
-        stderr = (err_b or b"").decode("utf-8", "replace")
-        if proc.returncode != 0:
-            # 把 stderr/stdout 一起带上,供退避决策判别(限流信号常出现在 stderr)
-            raise RuntimeError(f"exit={proc.returncode} :: {stderr.strip() or stdout.strip()}"[:600])
-
-        if self.spec.parse == "claude_json":
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE if stdin_data is not None else asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+                env=env,
+                limit=16 * 1024 * 1024,
+            )
+            if timeout_s is None:
+                timeout_s = max(1, self.cfg.retry.timeout_ms / 1000.0)
             try:
-                obj = json.loads(stdout)
-            except Exception:
-                # 某些情况下 claude 直接输出文本而非 JSON,降级当文本用
-                return stdout, None
-            usage = _extract_usage(obj)
-            if isinstance(obj, dict):
-                if obj.get("is_error"):
-                    raise RuntimeError(f"claude error: {str(obj.get('result'))[:300]}")
-                return str(obj.get("result", "") or ""), usage
-            return stdout, usage
-        # opencode `--format json` 事件流:把所有 text 块拼成 assistant 正文(自动识别,兼容旧配置)。
-        # 不再按"是否见到终止 step_finish"硬判完整(会误杀完整答案与健康探针);完整性交给下游:
-        # 结构化任务看 extract_json 能否解析,健康探针看 expect 是否命中,解析不出再重试。
-        oc = _extract_opencode_text(stdout)
-        if oc is not None:
-            text, oc_usage, _session_id = oc
-            if not text.strip():
-                raise BackendOutputError(
-                    "opencode 只输出了工具调用前/工具调用中的中间文本,未在 stdout 中看到最终 assistant 文本",
-                    strip_ansi(stdout),
-                )
-            return strip_ansi(text), oc_usage
-        usage = None
-        try:
-            usage = _extract_usage(json.loads(stdout))
-        except Exception:
+                out_b, err_b = await _drain_process(proc, stdin_data, timeout_s, on_output)
+            except asyncio.TimeoutError:
+                raise RuntimeError(f"timed out after {int(timeout_s)}s")
+
+            stdout = (out_b or b"").decode("utf-8", "replace")
+            stderr = (err_b or b"").decode("utf-8", "replace")
+            if proc.returncode != 0:
+                # 把 stderr/stdout 一起带上,供退避决策判别(限流信号常出现在 stderr)
+                raise RuntimeError(f"exit={proc.returncode} :: {stderr.strip() or stdout.strip()}"[:600])
+
+            if self.spec.parse == "claude_json":
+                try:
+                    obj = json.loads(stdout)
+                except Exception:
+                    # 某些情况下 claude 直接输出文本而非 JSON,降级当文本用
+                    return stdout, None
+                usage = _extract_usage(obj)
+                if isinstance(obj, dict):
+                    if obj.get("is_error"):
+                        raise RuntimeError(f"claude error: {str(obj.get('result'))[:300]}")
+                    return str(obj.get("result", "") or ""), usage
+                return stdout, usage
+            # opencode `--format json` 事件流:把所有 text 块拼成 assistant 正文(自动识别,兼容旧配置)。
+            # 不再按"是否见到终止 step_finish"硬判完整(会误杀完整答案与健康探针);完整性交给下游:
+            # 结构化任务看 extract_json 能否解析,健康探针看 expect 是否命中,解析不出再重试。
+            oc = _extract_opencode_text(stdout)
+            if oc is not None:
+                text, oc_usage, _session_id = oc
+                if not text.strip():
+                    raise BackendOutputError(
+                        "opencode 只输出了工具调用前/工具调用中的中间文本,未在 stdout 中看到最终 assistant 文本",
+                        strip_ansi(stdout),
+                    )
+                return strip_ansi(text), oc_usage
             usage = None
-        return strip_ansi(stdout), usage
+            try:
+                usage = _extract_usage(json.loads(stdout))
+            except Exception:
+                usage = None
+            return strip_ansi(stdout), usage
+        finally:
+            # 子进程已结束:本次 prompt 文件不再"在用",解除保护(留待滚动窗口自然淘汰)
+            if prompt_file:
+                self._live_prompt_files.discard(prompt_file)
+            # 无论成功/失败/超时,都清掉本次 opencode 一次性数据目录(snapshot/storage/db 等)
+            if ephemeral_root:
+                shutil.rmtree(ephemeral_root, ignore_errors=True)
 
     def _dump_failed_output(self, role: str, label: str, model: str, attempt: int, text: str,
                             dump_candidate: bool = False) -> str:
@@ -1058,6 +1134,9 @@ class AgentRunner:
                         f.write(best_json_candidate(text))
                 except Exception:
                     pass
+            # 滚动清理:只保留最近 N 组转储(.txt 为锚,连同其 .jsonload.json 一起删)
+            self._prune_recent(dbg_dir, ".txt", self.cfg.artifact_retain,
+                               sidecar_suffixes=(".jsonload.json",))
             return path
         except Exception:
             return ""

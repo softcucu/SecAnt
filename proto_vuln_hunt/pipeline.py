@@ -26,7 +26,7 @@ from .prompts import VERIFY_LENSES, PromptBuilder
 from .store import RunStore, STATUS_DONE, STATUS_ERROR, STATUS_RUNNING, STATUS_STOPPED
 
 
-def _noop_emit(etype: str, data: Optional[Dict[str, Any]] = None) -> None:
+def _noop_emit(etype: str, data: Optional[Dict[str, Any]] = None, persist: bool = True) -> None:
     return None
 
 
@@ -91,9 +91,9 @@ class Pipeline:
         print(f"[{ts}] {msg}", flush=True)
         self.emit(EV.LOG, {"message": msg})
 
-    def emit(self, etype: str, data: Optional[Dict[str, Any]] = None) -> None:
+    def emit(self, etype: str, data: Optional[Dict[str, Any]] = None, persist: bool = True) -> None:
         try:
-            self._emit_cb(etype, data or {})
+            self._emit_cb(etype, data or {}, persist)
         except Exception:
             pass
 
@@ -117,9 +117,12 @@ class Pipeline:
         self.emit(EV.MODEL_HEALTH, rec)
 
     def record_agent(self, rec: Dict[str, Any]) -> None:
-        """agent 子进程状态与 stdout/stderr chunk:经 SSE 推给 Web「Agent」页。"""
-        self.emit(EV.AGENT_UPDATE, rec)
-        if rec.get("status") != "output":
+        """agent 子进程状态与 stdout/stderr chunk:经 SSE 推给 Web「Agent」页。
+        status=="output" 是逐字符输出流(高频大体积),只实时推、不落盘也不进内存 backlog,
+        避免 events.jsonl/内存随 agent 数量无上限膨胀;其它状态事件照常持久化。"""
+        is_output = rec.get("status") == "output"
+        self.emit(EV.AGENT_UPDATE, rec, persist=not is_output)
+        if not is_output:
             self.emit(EV.METRICS, self._summary_snapshot(self.round))
 
     async def health_check_all(self) -> Dict[str, Any]:

@@ -57,15 +57,21 @@ class EventBus:
     def last_seq(self) -> int:
         return self._seq
 
-    def emit(self, etype: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def emit(self, etype: str, data: Optional[Dict[str, Any]] = None,
+             persist: bool = True) -> Dict[str, Any]:
+        # persist=False:仅实时推给当前订阅者,不写 events.jsonl、不进内存 backlog。
+        # 用于 agent 子进程的逐字符 stdout/stderr 流(高频、大体积):避免 events.jsonl 与
+        # EventBus.events 随 agent 数量无上限膨胀(几千 agent × opencode 冗长输出 → GB 级)。
+        # 代价:刷新/服务重启后看不到历史输出流;结构化事件(状态/metrics/findings)仍照常持久化。
         self._seq += 1
         ev = {"seq": self._seq, "ts": now_ms(), "type": etype, "data": data or {}}
-        self.events.append(ev)
-        if self._sink:
-            try:
-                self._sink(ev)
-            except Exception:
-                pass  # 持久化失败不影响运行
+        if persist:
+            self.events.append(ev)
+            if self._sink:
+                try:
+                    self._sink(ev)
+                except Exception:
+                    pass  # 持久化失败不影响运行
         for q in list(self._subscribers):
             try:
                 q.put_nowait(ev)
