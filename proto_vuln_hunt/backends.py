@@ -842,23 +842,36 @@ class AgentRunner:
         self._model_cursor[role] = i + 1
         return models[i % len(models)]
 
-    def _ready_model(self, role: str, *, advance: bool) -> str:
+    def _ready_model(self, role: str, *, advance: bool, avoid_model: Optional[str] = None) -> str:
         """按加权轮换顺序选择一个当前有空闲 per-model 名额的模型。
 
         这里使用 semaphore 的即时容量做调度提示;真正执行前仍会 acquire,因此即使容量在
         同一事件循环 tick 内变化也不会越过并发上限。
+        avoid_model 用于同一 agent 失败后的重试:若其它模型有即时容量,优先换模型;否则回退
+        到该模型,避免单模型配置或其它模型满载时无法推进。
         """
         models = self.cfg.model_slots_for(role)
         if not models:
             return ""
         start = self._model_cursor.get(role, 0)
+        fallback = ""
+        fallback_idx = 0
         for off in range(len(models)):
             idx = (start + off) % len(models)
             model = models[idx]
             if self._sem_capacity(self._model_semaphore(model)) > 0:
+                if avoid_model and model == avoid_model:
+                    if not fallback:
+                        fallback = model
+                        fallback_idx = idx
+                    continue
                 if advance:
                     self._model_cursor[role] = idx + 1
                 return model
+        if fallback:
+            if advance:
+                self._model_cursor[role] = fallback_idx + 1
+            return fallback
         return ""
 
     def role_has_capacity(self, role: str, *, use_global_gate: bool = True) -> bool:
@@ -890,6 +903,7 @@ class AgentRunner:
         *,
         use_global_gate: bool,
         should_stop: Optional[Callable[[], bool]],
+        avoid_model: Optional[str] = None,
     ) -> tuple[str, bool]:
         """同时取得全局名额和一个可用模型名额。
 
@@ -909,7 +923,7 @@ class AgentRunner:
                 await global_sem.acquire()
                 acquired_global = True
 
-            model = self._ready_model(role, advance=True)
+            model = self._ready_model(role, advance=True, avoid_model=avoid_model)
             if model:
                 await self._model_semaphore(model).acquire()
                 return model, acquired_global
@@ -1409,6 +1423,7 @@ class AgentRunner:
                 await asyncio.sleep(min(1.0, remain))
 
         attempt = 0
+        last_failed_model = ""
         while True:
             if should_stop is not None and should_stop():
                 msg = "用户请求停止"
@@ -1420,7 +1435,7 @@ class AgentRunner:
                     error=msg,
                 )
                 return fallback
-            health_model = self._ready_model(role, advance=False)
+            health_model = self._ready_model(role, advance=False, avoid_model=last_failed_model)
             while not health_model:
                 if not await self._wait_capacity_tick(should_stop):
                     msg = "用户请求停止"
@@ -1432,12 +1447,13 @@ class AgentRunner:
                         error=msg,
                     )
                     return fallback
-                health_model = self._ready_model(role, advance=False)
+                health_model = self._ready_model(role, advance=False, avoid_model=last_failed_model)
             await self.ensure_healthy(health_model)   # gate:调用前按需补一次健康探针(ttl 去重,不阻断)
             model, acquired_global = await self._acquire_run_capacity(
                 role,
                 use_global_gate=use_global_gate,
                 should_stop=should_stop,
+                avoid_model=last_failed_model,
             )
             if not model:
                 msg = "用户请求停止"
@@ -1495,6 +1511,7 @@ class AgentRunner:
                     if path:
                         msg = f"{msg}(完整 stdout 已存 {path})"
                 self._note_call(model, False, msg)
+                last_failed_model = model
                 emit_agent(
                     "failed_attempt",
                     model=model,

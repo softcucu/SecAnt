@@ -625,6 +625,73 @@ class ProcessDrainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(text), {"argv": ["--model", "unused-model", prompt]})
 
 
+class RetryModelSelectionTests(unittest.IsolatedAsyncioTestCase):
+    def _runner(self, out_dir):
+        cfg = Config(
+            target=out_dir,
+            out_dir=os.path.join(out_dir, "out"),
+            backend="dummy",
+            concurrency=1,
+            models={"audit": ["m1", "m2"]},
+            backends={
+                "dummy": BackendSpec(
+                    name="dummy",
+                    command=["unused"],
+                    prompt_mode="stdin",
+                    parse="text",
+                )
+            },
+        )
+        cfg.health.enabled = False
+        cfg.retry.max_attempts = 1
+        cfg.retry.backoff_base_ms = 1
+        cfg.retry.backoff_cap_ms = 1
+        return AgentRunner(cfg, logger=lambda *_args, **_kwargs: None)
+
+    async def test_retry_prefers_different_ready_model_after_failure(self):
+        schema = {"type": "object"}
+        seen = []
+
+        with tempfile.TemporaryDirectory() as d:
+            runner = self._runner(d)
+
+            async def fake_invoke(_prompt, model, _cwd, **_kwargs):
+                seen.append(model)
+                if len(seen) == 1:
+                    raise RuntimeError("boom")
+                return "{}", None
+
+            runner._invoke = fake_invoke
+
+            parsed = await runner.run("prompt", role="audit", label="unit", schema=schema)
+
+        self.assertEqual(parsed, {})
+        self.assertEqual(seen, ["m1", "m2"])
+
+    async def test_retry_reuses_failed_model_when_alternative_has_no_capacity(self):
+        schema = {"type": "object"}
+        seen = []
+
+        with tempfile.TemporaryDirectory() as d:
+            runner = self._runner(d)
+            await runner._model_semaphore("m2").acquire()
+            try:
+                async def fake_invoke(_prompt, model, _cwd, **_kwargs):
+                    seen.append(model)
+                    if len(seen) == 1:
+                        raise RuntimeError("boom")
+                    return "{}", None
+
+                runner._invoke = fake_invoke
+
+                parsed = await runner.run("prompt", role="audit", label="unit", schema=schema)
+            finally:
+                runner._model_semaphore("m2").release()
+
+        self.assertEqual(parsed, {})
+        self.assertEqual(seen, ["m1", "m1"])
+
+
 class HealthStateTests(unittest.TestCase):
     def test_real_call_error_does_not_replace_probe_answer(self):
         cfg = Config(
