@@ -27,6 +27,10 @@ _RUN_FIELDS = {
     "enable_poc", "decompose", "methods_dir", "models", "model_concurrency", "resume", "fresh",
 }
 
+# 续跑历史任务时,这些"后端/模型"字段改用本次启动的基础配置(self.base,随服务重启读取最新
+# 配置文件刷新),而不沿用 run 首次创建时落盘的旧快照——避免改了配置文件重启后续跑仍用老模型。
+_RESUME_FROM_BASE_FIELDS = {"backend", "models", "model_concurrency"}
+
 
 def _meta_from_manifest(m: Dict[str, Any]) -> Dict[str, Any]:
     cfg = (m or {}).get("config") or {}
@@ -87,7 +91,8 @@ class RunManager:
         if not store or self.is_running(run_id):
             return False
         m = store.load_manifest() or {}
-        saved = m.get("config") or {}
+        # 后端/模型相关字段不从旧快照沿用,改由 self.base(本次启动的最新配置)提供。
+        saved = {k: v for k, v in (m.get("config") or {}).items() if k not in _RESUME_FROM_BASE_FIELDS}
         cfg = build_run_config(self.base, {**saved, "resume": True, "fresh": False})
         self._launch(cfg, store)
         return True
