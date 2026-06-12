@@ -174,6 +174,74 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
             self.assertLess(runner.events.index("recon-end"), runner.events.index("decompose-start"))
             self.assertLess(runner.events.index("decompose-start"), runner.events.index("history-end"))
 
+    async def test_recheck_spawned_when_history_finishes_during_decompose(self):
+        class DummyRunner:
+            def __init__(self):
+                self.events = []
+                self.agent_count = 0
+                self.usage_totals = {
+                    "calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "estimated_calls": 0,
+                }
+
+            async def run(self, *_args, **kwargs):
+                role = kwargs.get("role")
+                if role == "recon":
+                    self.events.append("recon-start")
+                    await asyncio.sleep(0.02)
+                    self.events.append("recon-end")
+                    return {
+                        "regions": [{"name": "r1", "priority": "high", "files": []}],
+                        "history": [],
+                        "build_hint": "",
+                        "repo_knowledge": "",
+                    }
+                if role == "history":
+                    self.events.append("history-start")
+                    await asyncio.sleep(0.08)
+                    self.events.append("history-end")
+                    return {
+                        "security_related": True,
+                        "pattern": "missing bounds check",
+                        "lens_hint": "memory",
+                        "files": [],
+                        "rationale": "unit",
+                    }
+                if role == "decompose":
+                    self.events.append("decompose-start")
+                    await asyncio.sleep(0.35)
+                    self.events.append("decompose-end")
+                    return {"subtasks": [{"objective": "audit-r1", "files": []}]}
+                if role == "recheck":
+                    self.events.append("recheck-start")
+                    return {"findings": [], "new_surfaces": [], "risk_notes": []}
+                if role == "audit":
+                    self.events.append("audit")
+                return {"findings": [], "new_surfaces": [], "risk_notes": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = _pipe(
+                tmp,
+                concurrency=3,
+                decompose=True,
+                enable_poc=False,
+                history=HistorySpec(enabled=True),
+                recheck=RecheckSpec(enabled=True),
+            )
+            p.cfg.health.enabled = False
+            p._collect_commits = lambda: [{"hash": "abc123", "subject": "security fix"}]
+            runner = DummyRunner()
+            p.runner = runner
+
+            await p.run()
+
+            self.assertLess(runner.events.index("decompose-start"), runner.events.index("history-end"))
+            self.assertLess(runner.events.index("history-end"), runner.events.index("recheck-start"))
+            self.assertLess(runner.events.index("recheck-start"), runner.events.index("decompose-end"))
+
 
 class TestSchedulerPriority(unittest.TestCase):
     def test_recheck_work_is_selected_before_audit_queue(self):

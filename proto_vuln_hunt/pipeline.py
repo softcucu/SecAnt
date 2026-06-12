@@ -72,6 +72,7 @@ class Pipeline:
         self._history_enqueued = False
         self._retrying_past_max_rounds = False
         self._active_roles: Dict[str, int] = {}
+        self._scheduler_wake: Optional[asyncio.Event] = None
         self.surface_log: List[Dict[str, Any]] = []
         self.risk_notes: List[Dict[str, Any]] = []
         self.risk_keys = set()
@@ -285,6 +286,53 @@ class Pipeline:
         self._queue_seq += 1
         item["_queue_seq"] = self._queue_seq
         self.queue.append(item)
+        self._notify_scheduler()
+
+    def _notify_scheduler(self) -> None:
+        if self._scheduler_wake is not None:
+            self._scheduler_wake.set()
+
+    def _scheduler_wake_event(self) -> asyncio.Event:
+        if self._scheduler_wake is None:
+            self._scheduler_wake = asyncio.Event()
+        return self._scheduler_wake
+
+    async def _sleep_or_wake(self, delay_s: float) -> None:
+        wake = self._scheduler_wake_event()
+        if wake.is_set():
+            wake.clear()
+            return
+        try:
+            await asyncio.wait_for(wake.wait(), timeout=delay_s)
+        except asyncio.TimeoutError:
+            pass
+        if wake.is_set():
+            wake.clear()
+
+    async def _wait_active_or_wake(self, active: List[asyncio.Task], *, may_start: bool,
+                                   timeout_s: Optional[float] = None) -> None:
+        if not active:
+            if timeout_s is not None:
+                await self._sleep_or_wake(timeout_s)
+            return
+        if not may_start:
+            await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+            return
+
+        wake = self._scheduler_wake_event()
+        if wake.is_set():
+            wake.clear()
+            return
+        wake_task = asyncio.create_task(wake.wait())
+        try:
+            await asyncio.wait([*active, wake_task], timeout=timeout_s,
+                               return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            if wake.is_set():
+                wake.clear()
+            if not wake_task.done():
+                wake_task.cancel()
+                await asyncio.gather(wake_task, return_exceptions=True)
 
     def _refresh_enqueue_order(self, item: Dict[str, Any]) -> None:
         self._queue_seq += 1
@@ -366,6 +414,7 @@ class Pipeline:
         self.pq.append({"kind": "risk", "id": note["id"], "area": note.get("area"),
                         "note": note.get("note"), "file": note.get("file"),
                         "severity_hint": note.get("severity_hint"), "lens": note.get("lens")})
+        self._notify_scheduler()
         self.emit(EV.RECHECK_ENQUEUED, {"kind": "risk", "id": note["id"], "area": note.get("area"),
                                         "severity_hint": note.get("severity_hint")})
 
@@ -393,6 +442,7 @@ class Pipeline:
             self.pq.append({"kind": "risk", "id": note["id"], "area": note.get("area"),
                             "note": note.get("note"), "file": note.get("file"),
                             "severity_hint": note.get("severity_hint"), "lens": note.get("lens")})
+            self._notify_scheduler()
             self.emit(EV.RECHECK_ENQUEUED, {"kind": "risk", "id": note["id"], "area": note.get("area"),
                                             "severity_hint": note.get("severity_hint")})
         return True
@@ -1018,10 +1068,8 @@ class Pipeline:
                 may_start = stop_when is None or not stop_when()
 
             if active:
-                if not made_progress and may_start and (self.queue or self.pq):
-                    await asyncio.wait(active, timeout=0.25, return_when=asyncio.FIRST_COMPLETED)
-                else:
-                    await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+                timeout = 0.25 if may_start and (len(active) < self.cfg.concurrency or self.queue or self.pq) else None
+                await self._wait_active_or_wake(active, may_start=may_start, timeout_s=timeout)
                 continue
 
             if stop_when is not None and stop_when():
@@ -1030,7 +1078,7 @@ class Pipeline:
             has_pending = bool(self.queue or self.pq or self._audit_passes or self._recheck_inflight
                                or (extra_pending is not None and extra_pending()))
             if has_pending:
-                await asyncio.sleep(min(self.cfg.history.poll_interval_s, self.cfg.recheck.poll_interval_s, 1))
+                await self._sleep_or_wake(min(self.cfg.history.poll_interval_s, self.cfg.recheck.poll_interval_s, 1))
                 continue
             if stop_when_idle:
                 break
@@ -1129,6 +1177,7 @@ class Pipeline:
         """git 历史挖掘提炼出的问题模式 → 进优先排查队列(同类变体排查)。"""
         self.pq.append({"kind": "variant", "pattern": entry["pattern"], "source": entry["source"],
                         "files": entry["files"], "lens_hint": entry["lens_hint"]})
+        self._notify_scheduler()
         self.emit(EV.RECHECK_ENQUEUED, {"kind": "variant", "pattern": entry["pattern"],
                                         "lens_hint": entry["lens_hint"]})
 
@@ -1156,6 +1205,7 @@ class Pipeline:
                 self.risk_by_id[rid]["recheck_status"] = "queued"
                 self.store.save_risk(self.risk_by_id[rid])
             self.pq.append(item)
+            self._notify_scheduler()
             return
 
         attempts = self._mark_retry_after_failure(item)
@@ -1165,6 +1215,7 @@ class Pipeline:
                 self.risk_by_id[rid]["recheck_status"] = "queued"
                 self.store.save_risk(self.risk_by_id[rid])
             self.pq.append(item)
+            self._notify_scheduler()
             self.emit(EV.RECHECK_ENQUEUED, {"kind": kind, "id": rid, "pattern": item.get("pattern"),
                                             "label": label, "retry": True, "attempt": attempts})
             self.checkpoint(self.round)
