@@ -1406,8 +1406,10 @@ class AgentRunner:
         use_global_gate: bool = True,
         retry_forever: bool = False,
         should_stop: Optional[Callable[[], bool]] = None,
+        meta: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """schema 非空 → 返回解析后的 dict/list;schema 为空 → 返回 agent 最终文本。
+        meta(可选,传入一个 dict)在成功返回前回填 {"model", "attempt"},供上层把模型归因到结果。
         失败重试上限取 `retries`(未传则用 cfg.retry.max_attempts);耗尽后返回 fallback(跳过,靠续跑挽回)。
         retry_forever=True 时忽略重试上限,一直重试到成功或 should_stop() 变真。
         use_global_gate=False:本次调用不再去抢全局 concurrency 名额(仅受 per-model 信号量约束)。
@@ -1512,6 +1514,9 @@ class AgentRunner:
                 self._record_usage(prompt, text, role=role, label=tag, model=model,
                                    attempt=attempt_no, backend_usage=usage)
                 self._note_call(model, True)
+                if meta is not None:
+                    meta["model"] = model
+                    meta["attempt"] = attempt_no
                 if schema is None:
                     emit_agent(
                         "done",

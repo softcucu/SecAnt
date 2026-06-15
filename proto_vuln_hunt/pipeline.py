@@ -700,11 +700,19 @@ class Pipeline:
             self.dedup_keys.add(k)
 
             lenses = [VERIFY_LENSES[i % len(VERIFY_LENSES)] for i in range(self.cfg.verify_votes)]
+            vote_metas = [{} for _ in lenses]
             vote_tasks = [self.runner.run(self.pb.verify(f, lens, S.VERDICT_SCHEMA),
                                           role="verify", label=f"verify:{(f.get('title') or '')[:24]}#{i + 1}",
-                                          schema=S.VERDICT_SCHEMA)
+                                          schema=S.VERDICT_SCHEMA, meta=vote_metas[i])
                           for i, lens in enumerate(lenses)]
-            votes = [v for v in await asyncio.gather(*vote_tasks) if v]
+            raw_votes = await asyncio.gather(*vote_tasks)
+            votes = []
+            for i, v in enumerate(raw_votes):
+                if not v:
+                    continue
+                if vote_metas[i].get("model"):
+                    v["model"] = vote_metas[i]["model"]
+                votes.append(v)
             required_votes = max(1, -(-self.cfg.verify_votes // 2))
             if len(votes) < required_votes:
                 self._handle_candidate_verify_failure(f, f"有效验证票不足({len(votes)}/{self.cfg.verify_votes})")
@@ -725,7 +733,9 @@ class Pipeline:
             exploit = next((v.get("exploitability") for v in votes if v.get("exploitability")), "")
             self.seq += 1
             fid = f"{class_code(f.get('bug_class'))}-{pad3(self.seq)}"
-            rec = {**f, "id": fid, "corrected_severity": corrected, "exploitability": exploit, "votes": votes}
+            verify_models = sorted({v["model"] for v in votes if v.get("model")})
+            rec = {**f, "id": fid, "corrected_severity": corrected, "exploitability": exploit,
+                   "votes": votes, "verify_models": verify_models}
 
             poc = None
             if self.cfg.enable_poc and corrected in ("critical", "high"):
@@ -1252,26 +1262,30 @@ class Pipeline:
         if self.stop_requested():
             item["failedFinders"] = item.get("failedFinders", 0) + 1
             return
+        meta: Dict[str, Any] = {}
         res = await self.runner.run(
             self.pb.audit(item, lens_key, idx, S.FINDINGS_SCHEMA),
             role="audit",
             label=f"audit:{str(item.get('objective') or item.get('name') or item.get('pattern') or 'item')[:20]}:{lens_key}#{item['pass']}.{idx + 1}",
             schema=S.FINDINGS_SCHEMA,
-            should_stop=self.stop_requested)
+            should_stop=self.stop_requested, meta=meta)
         if not res:
             item["failedFinders"] = item.get("failedFinders", 0) + 1
             return
-        self._consume(res, item, rec, lens_key)
+        self._consume(res, item, rec, lens_key, audit_model=meta.get("model"))
 
     def _consume(self, res: Dict[str, Any], item: Dict[str, Any], rec: Dict[str, Any],
-                 lens_key: str, from_recheck: bool = False) -> None:
+                 lens_key: str, from_recheck: bool = False, audit_model: Optional[str] = None) -> None:
         """消化一次审计 / 复查 agent 的结果:findings→验证流水线、new_surfaces→主队列、risk_notes→登记。
-        from_recheck=True 时,产出的 risk_notes 不再二次回灌优先队列(防自激)。"""
+        from_recheck=True 时,产出的 risk_notes 不再二次回灌优先队列(防自激)。
+        audit_model:产出该批 finding 的模型,归因到候选(随候选流转到验证/确认/报告)。"""
         for f in (res.get("findings") or []):
             fk = finding_key(f)
             if fk in self.dedup_keys:
                 continue
             self.dedup_keys.add(fk)
+            if audit_model:
+                f["audit_model"] = audit_model
             item["newThisRound"] = item.get("newThisRound", 0) + 1
             rec["candidates"] = rec.get("candidates", 0) + 1
             self.pending_findings[fk] = f
@@ -1467,15 +1481,16 @@ class Pipeline:
         # recheck 用「快速失败」模式跑:单次调用不在 runner 内部做长退避(retries=0),
         # 失败后的重试改由优先队列层面**有上限地**重排(见下)。这样一条卡住/失败的复查
         # 既不会在退避期间一直占着唯一的 recheck 名额、拖慢其它 agent,也不会无限重排导致管线永不收敛。
+        meta: Dict[str, Any] = {}
         res = await self.runner.run(prompt, role="recheck", label=label, schema=S.FINDINGS_SCHEMA,
                                     retries=0, use_global_gate=use_global_gate,
-                                    should_stop=self.stop_requested)
+                                    should_stop=self.stop_requested, meta=meta)
         if not res:
             self._handle_recheck_failure(item, rec, kind, rid, label)
             return
         self._clear_retry_after_failure(item)
         if res:
-            self._consume(res, item, rec, lens_key, from_recheck=True)
+            self._consume(res, item, rec, lens_key, from_recheck=True, audit_model=meta.get("model"))
         self.completed_items.add(item_key(item))
         rec["status"] = "completed-findings" if rec.get("candidates", 0) > 0 else "completed-clean"
         if kind == "risk" and rid in self.risk_by_id:

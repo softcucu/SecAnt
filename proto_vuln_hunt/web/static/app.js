@@ -317,7 +317,7 @@ function viewDashboard(runId) {
       el("div", { class: "muted" }, `轮 ${S.round}/${cfg.max_rounds ?? "?"} · dry ${S.dry} · 用时 ${elapsed}s`)));
     const stats = el("div", { class: "stats" },
       el("div", { class: "stat" }, el("div", { class: "n" }, String(S.findings.size)), el("div", { class: "l" }, "疑似漏洞")),
-      ...SEVS.map(s => el("div", { class: "stat" }, el("div", { class: "n sev-" + s, style: "color:var(--" + (s === "critical" ? "crit" : s === "high" ? "high" : s === "medium" ? "med" : s === "low" ? "low" : "info") + ")" }, String(bySev[s] || 0)), el("div", { class: "l" }, s))),
+      ...SEVS.map(s => el("div", { class: "stat" }, el("div", { class: "n", style: "color:var(--" + (s === "critical" ? "crit" : s === "high" ? "high" : s === "medium" ? "med" : s === "low" ? "low" : "info") + ")" }, String(bySev[s] || 0)), el("div", { class: "l" }, s))),
       el("div", { class: "stat" }, el("div", { class: "n" }, String(S.candidates)), el("div", { class: "l" }, "候选")),
       el("div", { class: "stat" }, el("div", { class: "n" }, String(S.risks.size)), el("div", { class: "l" }, "风险登记")),
       el("div", { class: "stat" }, el("div", { class: "n" }, String(agentCount)), el("div", { class: "l" }, "agent 调用")),
@@ -359,10 +359,15 @@ function viewDashboard(runId) {
     const list = [...S.findings.values()].sort((a, b) => SEVS.indexOf(a.corrected_severity) - SEVS.indexOf(b.corrected_severity));
     if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无疑似漏洞(审计进行中会实时出现)。")); return; }
     for (const f of list) {
+      const vmodels = Array.isArray(f.verify_models) ? f.verify_models : [];
+      const modelBits = [];
+      if (f.audit_model) modelBits.push("审计 " + f.audit_model);
+      if (vmodels.length) modelBits.push("验证 " + vmodels.join("/"));
       const head = el("div", { class: "head" }, sevPill(f.corrected_severity),
         el("span", { class: "title" }, f.title || f.id),
         el("span", { class: "muted" }, f.bug_class || ""),
-        el("span", { class: "loc" }, `${f.file || ""}:${f.line || 0}`));
+        el("span", { class: "loc" }, `${f.file || ""}:${f.line || 0}`),
+        modelBits.length ? el("span", { class: "muted model-attr" }, "🧠 " + modelBits.join(" · ")) : null);
       const body = el("div", { class: "body md" }, el("div", { class: "muted" }, "加载详情…"));
       const card = el("div", { class: "finding" }, head, body);
       head.addEventListener("click", async () => {
@@ -372,6 +377,13 @@ function viewDashboard(runId) {
             const full = await api("GET", `/api/runs/${encodeURIComponent(runId)}/findings/${encodeURIComponent(f.id)}`);
             body.dataset.loaded = "1";
             body.innerHTML = mdToHtml(full.report_body || "(无正文)");
+            const votes = Array.isArray(full.votes) ? full.votes : [];
+            const voteTxt = votes.map(v => `${v.model || "?"}${v.is_real ? "✓" : "✗"}`).join("、");
+            const attrBits = [];
+            if (full.audit_model) attrBits.push("<strong>审计模型:</strong> " + esc(full.audit_model));
+            if (voteTxt) attrBits.push("<strong>验证模型(" + votes.length + "票):</strong> " + esc(voteTxt));
+            else if ((full.verify_models || []).length) attrBits.push("<strong>验证模型:</strong> " + esc(full.verify_models.join("、")));
+            if (attrBits.length) body.prepend(el("p", { class: "model-attr", html: "🧠 " + attrBits.join("　|　") }));
             if (full.exploitability) body.prepend(el("p", { html: "<strong>可利用性:</strong> " + esc(full.exploitability) }));
             body.append(el("p", { style: "margin-top:10px" }, el("a", { href: `/api/runs/${encodeURIComponent(runId)}/export/finding/${encodeURIComponent(f.id)}.md`, target: "_blank" }, "下载该条报告 .md")));
           } catch (e) { body.innerHTML = "加载失败: " + esc(e.message); }
