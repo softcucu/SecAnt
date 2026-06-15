@@ -47,9 +47,12 @@ class EventBus:
     """单个 run 的事件总线。线程模型:全部在该 run 的事件循环里运行,无需加锁。"""
 
     def __init__(self, sink: Optional[Callable[[Dict[str, Any]], None]] = None,
-                 backlog: Optional[List[Dict[str, Any]]] = None):
+                 backlog: Optional[List[Dict[str, Any]]] = None,
+                 start_seq: int = 0):
+        # start_seq:续跑时让 seq 从磁盘已落盘的最大 seq 续接,避免重号(否则 SSE 的
+        # `seq>sent` 过滤会把续跑后的所有事件丢弃,且 events.jsonl 被追加重号事件)。
         self.events: List[Dict[str, Any]] = list(backlog or [])
-        self._seq = self.events[-1]["seq"] if self.events else 0
+        self._seq = max(start_seq, self.events[-1]["seq"] if self.events else 0)
         self._subscribers: List[asyncio.Queue] = []
         self._sink = sink           # 持久化回调:store.append_event(event)
         self.closed = False

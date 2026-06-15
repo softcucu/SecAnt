@@ -83,7 +83,8 @@ class RunManager:
 
     def _launch(self, cfg: Config, store: RunStore) -> str:
         from .pipeline import Pipeline  # 惰性,避免循环 import
-        bus = EventBus(sink=store.append_event)
+        # 续跑/重启:seq 必须从已落盘的最大 seq 续接,否则新事件重号会被 SSE 过滤掉(显示不更新)。
+        bus = EventBus(sink=store.append_event, start_seq=store.last_event_seq())
         stop = asyncio.Event()
         pipe = Pipeline(cfg, store=store, emitter=bus.emit, stop_event=stop)
         task = asyncio.create_task(pipe.run())

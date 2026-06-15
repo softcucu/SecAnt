@@ -28,6 +28,19 @@ class EventBusPersistTests(unittest.TestCase):
         # 但 seq 仍递增(实时推送可用)
         self.assertEqual(bus.last_seq, 1)
 
+    def test_start_seq_continues_monotonically_on_resume(self):
+        # 续跑:bus 必须从磁盘已落盘的最大 seq 续接,否则重号会被 SSE 的 seq>sent 过滤掉。
+        bus = EventBus(sink=lambda ev: None, start_seq=5000)
+        ev = bus.emit(EV.ROUND_START, {"round": 9})
+        self.assertEqual(ev["seq"], 5001)
+        self.assertGreater(bus.last_seq, 5000)
+
+    def test_start_seq_respects_higher_backlog_tail(self):
+        # start_seq 与 backlog 尾部取较大者,二者都给时不回退。
+        backlog = [{"seq": 42, "ts": 0, "type": EV.LOG, "data": {}}]
+        bus = EventBus(backlog=backlog, start_seq=10)
+        self.assertEqual(bus.emit(EV.LOG)["seq"], 43)
+
     def test_non_persisted_event_still_reaches_live_subscriber(self):
         async def run():
             bus, _sunk = self._bus()

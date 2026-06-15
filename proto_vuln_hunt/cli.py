@@ -106,7 +106,8 @@ def cmd_run(args) -> int:
     from .pipeline import Pipeline
 
     store = RunStore(cfg.out_dir).ensure()
-    bus = EventBus(sink=store.append_event)
+    # 续跑:seq 从已落盘最大 seq 续接,避免 events.jsonl 重号(否则 web 重放会丢弃续跑后的事件)。
+    bus = EventBus(sink=store.append_event, start_seq=store.last_event_seq() if cfg.resume else 0)
     pipe = Pipeline(cfg, store=store, emitter=bus.emit)
     try:
         result = asyncio.run(pipe.run())

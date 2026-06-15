@@ -956,14 +956,38 @@ function viewDashboard(runId) {
       tabBody.append(el("div", { class: "panel" }, vt));
     }
 
-    // 审计中动态新增的攻击面
+    // 审计中动态新增的攻击面 —— 每个都会作为新审计单元重新入队、扇出 finder 再审计,
+    // 这里把发现信息(surface_log)与台账记录(kind=surface:状态/pass/候选/风险/lens)join 起来,
+    // 体现“动态扩面 → 进一步处理”的闭环,而非只登记一行。
     if ((c.surfaces || []).length) {
-      tabBody.append(el("h3", { class: "section-title" }, "审计中动态新增的攻击面"));
-      const st = el("table", {}, el("thead", {}, el("tr", {}, el("th", {}, "轮"), el("th", {}, "动态新增攻击面"), el("th", {}, "来自"), el("th", {}, "为何可疑"))));
+      const surfaceRecs = new Map();
+      for (const r of ledger) if (r.kind === "surface") surfaceRecs.set(r.name, r);
+      const audited = c.surfaces.filter(s => {
+        const r = surfaceRecs.get(s.name);
+        return r && r.status && r.status !== "pending";
+      }).length;
+      tabBody.append(el("h3", { class: "section-title" },
+        `审计中动态新增的攻击面 · ${c.surfaces.length} 个(已再审 ${audited})`));
+      const st = el("table", {}, el("thead", {}, el("tr", {},
+        el("th", {}, "状态"), el("th", {}, "动态新增攻击面"), el("th", {}, "来自"),
+        el("th", {}, "发现轮"), el("th", {}, "pass"), el("th", {}, "候选"),
+        el("th", {}, "风险"), el("th", {}, "lens"), el("th", {}, "为何可疑"))));
       const stb = el("tbody");
-      for (const s of c.surfaces) stb.append(el("tr", {}, el("td", {}, "r" + (s.round || "?")), el("td", {}, s.name || ""), el("td", {}, s.from || ""), el("td", {}, s.why || "")));
+      for (const s of c.surfaces) {
+        const r = surfaceRecs.get(s.name) || {};
+        stb.append(el("tr", {},
+          el("td", {}, statusBadge(r.status || "pending")),
+          el("td", {}, s.name || ""),
+          el("td", {}, s.from || ""),
+          el("td", {}, "r" + (s.round || "?")),
+          el("td", {}, String(r.passes || 0)),
+          el("td", {}, String(r.candidates || 0)),
+          el("td", {}, String(r.risks || 0)),
+          el("td", {}, (r.lenses || []).join(", ") || (s.lens_hint || "")),
+          el("td", {}, s.why || "")));
+      }
       st.append(stb);
-      tabBody.append(el("div", { class: "panel" }, st));
+      tabBody.append(el("div", { class: "panel" }, el("div", { class: "table-wrap" }, st)));
     }
   }
   const STATUS_TXT = { "decomposed": "🧩 已拆解", "completed-clean": "✅ 未发现", "completed-findings": "⚠️ 有候选", "in-progress": "🔄 进行中", "incomplete": "⛔ 未审完", "abandoned": "⛔ 复查失败", "pending": "⏳ 待审" };

@@ -304,6 +304,25 @@ class RunStore:
         with open(self.events_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(ev, ensure_ascii=False) + "\n")
 
+    def last_event_seq(self) -> int:
+        """已落盘事件里的最大 seq(0 表示无)。续跑时用来让 EventBus 的 seq 单调续接,
+        避免重号导致 SSE `seq>sent` 把续跑后的所有事件过滤掉。"""
+        last = 0
+        if not os.path.isfile(self.events_path):
+            return last
+        with open(self.events_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    seq = int(json.loads(line).get("seq", 0))
+                except Exception:
+                    continue
+                if seq > last:
+                    last = seq
+        return last
+
     def read_events(self, after_seq: int = 0) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         if not os.path.isfile(self.events_path):
