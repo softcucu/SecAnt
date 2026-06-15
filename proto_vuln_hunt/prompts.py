@@ -281,6 +281,9 @@ class PromptBuilder:
             "- 用 rg / semgrep / tree-sitter 脚本 / CodeQL(免编译)把**全仓所有调用 B 的站点**枚举出来(广度优先,别漏);\n"
             "- 逐一精读每个调用点:核实 B 保持安全所依赖的前提 / 不变量(长度已夹紧、指针非空、已认证等)在该调用点是否真的成立;\n"
             "- 对**不满足前提**的调用点,回溯 source→sink 并判可控性 / 可达性;坐实为漏洞的报成 finding;\n"
+            "- **正面对照(必填)**:坐实的 finding 里,从你枚举到的调用点中挑**一处对同一 B 把校验做对了**的站点,"
+            "填进该 finding 的 `good_validation_ref`(path:line + 一句话:它正确地校验/夹紧了什么不变量),"
+            "用来对比说明本漏洞点缺了哪一步;\n"
             "- 仍可疑但未坐实的继续放进 risk_notes(写清新的待核实点);新的可疑数据流 / 入口放进 new_surfaces。\n"
             f"{PROTO_EXTRA}\n\n"
             "要求:看真实代码、回溯数据流,不要臆测;**宁缺毋滥**——没有可信外部输入路径、或已被上游夹紧的不要报。\n"
@@ -340,6 +343,21 @@ class PromptBuilder:
             "exploitability": poc.get("exploitability"), "notes": poc.get("notes"),
             "harness_code": poc.get("harness_code"),
         }, ensure_ascii=False) if poc else "(未做动态 PoC,给出静态触发构造说明)"
+        # 按发现来源附加两类对照小节:历史问题排查命中 → 类似哪个历史问题;
+        # 潜在风险点排查命中 → 哪一处其他代码把校验做对了(正面对照)。
+        extras = ""
+        variant_of = (rec.get("variant_of") or "").strip()
+        if variant_of:
+            extras += (
+                f"⑩ **与历史问题的关联** —— 本漏洞由历史问题模式的同类变体排查命中,说明它**和哪个历史问题类似**"
+                f"(历史问题模式 / 出处:{variant_of}):同样的根因 / 缺陷类型是什么、此处如何复现了同类缺陷;\n"
+            )
+        good_ref = (rec.get("good_validation_ref") or "").strip()
+        if good_ref:
+            extras += (
+                f"⑪ **正面对照:其他调用点的正确校验** —— 本漏洞由潜在风险点排查命中,贴出**哪一处其他代码把校验做对了**"
+                f"({good_ref}):它正确地校验 / 夹紧了哪个不变量,对比说明本漏洞点缺了这一步、应照其补齐;\n"
+            )
         return (
             f"把下面这**一条**已确认漏洞写成中文 Markdown **正文**(不要写 YAML frontmatter,我会自己加)。\n"
             f"{OUTPUT_LANGUAGE_ZH}\n"
@@ -353,6 +371,7 @@ class PromptBuilder:
             "⑥ **已检查缓解** —— canary / ASLR / FORTIFY / sanitizer / 类型上界等是否存在、可否绕过;\n"
             f"⑦ **PoC / 验证结果**:{poc_brief};\n"
             f"⑧ **修复建议** —— 怎么修;⑨ 置信度={rec.get('confidence')}(说明依据)。\n"
+            f"{extras}"
             f"对抗性验证结论(供你参考,提炼进报告):{votes_brief}\n"
             "**只输出报告正文 Markdown 本身**(从 ## ① 漏洞描述 之类开始),不要任何额外说明、不要代码块包裹整篇。"
         )

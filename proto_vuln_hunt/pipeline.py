@@ -1286,6 +1286,10 @@ class Pipeline:
             self.dedup_keys.add(fk)
             if audit_model:
                 f["audit_model"] = audit_model
+            # 历史问题变体排查命中:回填它"和哪个历史问题类似"(agent 未填则用模式/出处兜底)
+            if from_recheck and item.get("kind") == "variant" and not (f.get("variant_of") or "").strip():
+                src = (item.get("source") or "").strip()
+                f["variant_of"] = (item.get("pattern") or "").strip() + (f"(出处:{src})" if src else "")
             item["newThisRound"] = item.get("newThisRound", 0) + 1
             rec["candidates"] = rec.get("candidates", 0) + 1
             self.pending_findings[fk] = f
