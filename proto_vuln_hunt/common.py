@@ -10,6 +10,7 @@ LEDGER_STATUS = {
     "decomposed": "🧩 已拆解为子任务", "completed-clean": "✅ 已完成(未发现)",
     "completed-findings": "⚠️ 已完成(有候选)", "in-progress": "🔄 进行中(将续审)",
     "incomplete": "⛔ 未审完(agent故障,待重审)", "pending": "⏳ 待审",
+    "abandoned": "⛔ 复查失败(未覆盖)",
 }
 
 

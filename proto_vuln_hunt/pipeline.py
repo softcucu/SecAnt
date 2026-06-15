@@ -23,7 +23,7 @@ from .common import (class_code, finalize_findings, finding_key, item_key,
                      most_severe, pad3, slim_finding)
 from .config import Config, normalize_models
 from .prompts import VERIFY_LENSES, PromptBuilder
-from .store import RunStore, STATUS_DONE, STATUS_ERROR, STATUS_RUNNING, STATUS_STOPPED
+from .store import RunStore, STATUS_DONE, STATUS_ERROR, STATUS_INCOMPLETE, STATUS_RUNNING, STATUS_STOPPED
 
 
 def _noop_emit(etype: str, data: Optional[Dict[str, Any]] = None, persist: bool = True) -> None:
@@ -71,6 +71,8 @@ class Pipeline:
         self._decompose_done = 0
         self._history_enqueued = False
         self._retrying_past_max_rounds = False
+        self._final_failed_sweep_done = False
+        self._in_final_failed_sweep = False
         self._active_roles: Dict[str, int] = {}
         self._scheduler_wake: Optional[asyncio.Event] = None
         self.surface_log: List[Dict[str, Any]] = []
@@ -227,7 +229,51 @@ class Pipeline:
             "by_severity": by_sev, "risks": len(self.risk_notes), "surfaces": len(self.surface_log),
             "agents_spawned": self.runner.agent_count, "elapsed_s": round(time.time() - self._started, 1),
             "token_usage": dict(self.runner.usage_totals),
+            "pending_findings": self._active_pending_candidate_count(),
+            "failed_candidates": self._failed_candidate_count(),
+            "failed_rechecks": self._failed_recheck_count(),
+            "pending_queue": len(self._checkpoint_queue()),
+            "pending_priority_queue": len(self.pq),
         }
+
+    @staticmethod
+    def _is_candidate_failed(f: Dict[str, Any]) -> bool:
+        return f.get("verify_status") == "verify_failed"
+
+    def _failed_candidate_count(self) -> int:
+        return sum(1 for f in self.pending_findings.values() if self._is_candidate_failed(f))
+
+    def _active_pending_candidate_count(self) -> int:
+        return sum(1 for f in self.pending_findings.values() if not self._is_candidate_failed(f))
+
+    def _failed_recheck_keys(self) -> set:
+        keys = set()
+        for r in self.risk_notes:
+            rid = r.get("id")
+            if rid and r.get("recheck_status") == "failed":
+                keys.add(f"risk:{rid}")
+        for rec in self.ledger_arr:
+            if rec.get("status") == "abandoned" and rec.get("kind") in ("risk", "variant"):
+                k = rec.get("key")
+                if k:
+                    keys.add(k)
+        return keys
+
+    def _failed_recheck_count(self) -> int:
+        return len(self._failed_recheck_keys())
+
+    def _incomplete_counts(self) -> Dict[str, int]:
+        return {
+            "pending_findings": self._active_pending_candidate_count(),
+            "failed_candidates": self._failed_candidate_count(),
+            "failed_rechecks": self._failed_recheck_count(),
+            "pending_queue": len(self._checkpoint_queue()),
+            "pending_priority_queue": len(self.pq),
+        }
+
+    @staticmethod
+    def _has_incomplete_counts(counts: Dict[str, int]) -> bool:
+        return any(int(v or 0) > 0 for v in counts.values())
 
     def persist_recon(self) -> None:
         try:
@@ -607,12 +653,50 @@ class Pipeline:
         return len(tasks)
 
     # ──────────────────────── 逐发现流水线:验证→(PoC)→报告正文 ────────────────────────
+    def _candidate_failed_payload(self, f: Dict[str, Any], reason: str) -> Dict[str, Any]:
+        return {
+            "key": finding_key(f), "title": f.get("title"), "bug_class": f.get("bug_class"),
+            "file": f.get("file"), "line": f.get("line"), "lens": f.get("lens"),
+            "severity": f.get("severity"), "function": f.get("function") or "",
+            "reason": reason, "attempts": int(f.get("verify_attempts") or 0),
+            "final_sweep": self._in_final_failed_sweep,
+        }
+
+    @staticmethod
+    def _reset_candidate_for_retry(f: Dict[str, Any]) -> None:
+        f["verify_status"] = "pending"
+        f["verify_attempts"] = 0
+        f.pop("verify_failure_reason", None)
+
+    def _handle_candidate_verify_failure(self, f: Dict[str, Any], reason: str) -> None:
+        k = finding_key(f)
+        self.pending_findings[k] = f
+        self.dedup_keys.add(k)
+        attempts = int(f.get("verify_attempts") or 0) + 1
+        f["verify_attempts"] = attempts
+        f["verify_failure_reason"] = reason
+
+        if not self._in_final_failed_sweep and attempts <= max(0, int(self.cfg.retry.max_attempts)):
+            f["verify_status"] = "pending"
+            self._enqueue_finding(f)
+            self.log(f"候选 {k} 验证失败({reason}),第 {attempts} 次失败后放回验证队列"
+                     f"(重试上限 {self.cfg.retry.max_attempts})")
+            self.checkpoint(self.round)
+            return
+
+        f["verify_status"] = "verify_failed"
+        self.emit(EV.CANDIDATE_FAILED, self._candidate_failed_payload(f, reason))
+        self.log(f"候选 {k} 验证失败({reason}),标记为 verify_failed"
+                 f"{'(最终补跑)' if self._in_final_failed_sweep else ''}")
+        self.checkpoint(self.round)
+
     async def process_finding(self, f: Dict[str, Any]) -> None:
         k = finding_key(f)
         try:
             if k in self.processed_keys:
                 self.pending_findings.pop(k, None)
                 return
+            f["verify_status"] = "pending"
             self.dedup_keys.add(k)
 
             lenses = [VERIFY_LENSES[i % len(VERIFY_LENSES)] for i in range(self.cfg.verify_votes)]
@@ -621,10 +705,17 @@ class Pipeline:
                                           schema=S.VERDICT_SCHEMA)
                           for i, lens in enumerate(lenses)]
             votes = [v for v in await asyncio.gather(*vote_tasks) if v]
-            if not votes:
-                return  # 全验证失败 → 留在 pending,续跑重做
+            required_votes = max(1, -(-self.cfg.verify_votes // 2))
+            if len(votes) < required_votes:
+                self._handle_candidate_verify_failure(f, f"有效验证票不足({len(votes)}/{self.cfg.verify_votes})")
+                return
             real = sum(1 for v in votes if v.get("is_real"))
-            if real < -(-len(votes) // 2):  # ceil
+            false = len(votes) - real
+            majority = len(votes) // 2 + 1
+            if real < majority:
+                if false < majority:
+                    self._handle_candidate_verify_failure(f, "验证票未形成多数")
+                    return
                 self.processed_keys.add(k)
                 self.pending_findings.pop(k, None)
                 self.emit(EV.FINDING_REJECTED, {"key": k, "title": f.get("title"), "bug_class": f.get("bug_class")})
@@ -654,7 +745,11 @@ class Pipeline:
             self.emit(EV.FINDING_CONFIRMED, slim_finding(rec))
             self.log(f"✔ 确认漏洞 {fid} [{corrected}] {rec.get('title')} (累计 {len(self.confirmed)})")
         except Exception as e:  # noqa: BLE001
-            self.log(f"⚠ process_finding 异常,留待续跑重做: {str(e)[:140]}")
+            self.log(f"⚠ process_finding 异常,候选验证稍后重试: {str(e)[:140]}")
+            try:
+                self._handle_candidate_verify_failure(f, f"验证流水线异常:{str(e)[:120]}")
+            except Exception:
+                pass
 
     # ──────────────────────── PoC(隔离工作目录副本) ────────────────────────
     async def run_poc(self, rec: Dict[str, Any]) -> Any:
@@ -723,9 +818,10 @@ class Pipeline:
                 rid = r.get("id")
                 if rid:
                     self.risk_by_id[rid] = r
-                # 中断时正在排查 / 排队但未落进 pq 的风险点 → 重新入队补排
+                # 中断时正在排查 / 排队 / 上次失败但未落进 pq 的风险点 → 重新入队补排
                 st = r.get("recheck_status")
-                if rid and st in ("queued", "running") and rid not in pq_risk_ids and self._risk_sev_ok(r.get("severity_hint")):
+                if rid and st in ("queued", "running", "failed") and rid not in pq_risk_ids and self._risk_sev_ok(r.get("severity_hint")):
+                    self.completed_items.discard(f"risk:{rid}")
                     self._enqueue_risk(r)
                     self.store.save_risk(r)
             for f in (ckpt.get("pendingFindings") or []):
@@ -737,6 +833,7 @@ class Pipeline:
             for h in self.history:
                 self.history_keys.add((h.get("pattern") or "").strip().lower())
             self.history_done.update(ckpt.get("historyDone") or [])
+            self._enqueue_failed_rechecks()
             self.build_hint = self.surface_data.get("build_hint") or ""
             self.log(f"♻ 从断点恢复:已完成 {self.start_round} 轮,确认 {len(self.confirmed)} 条,待审队列 {len(self.queue)} 项,"
                      f"在途候选 {len(self.pending_findings)} 条,已处理 {len(self.processed_keys)} 个,已完成攻击面 {len(self.completed_items)} 个")
@@ -1093,6 +1190,8 @@ class Pipeline:
     # ──────────────────────── 阶段 ② 审计循环 ────────────────────────
     async def audit(self) -> str:
         for f in list(self.pending_findings.values()):
+            if self._is_candidate_failed(f):
+                self._reset_candidate_for_retry(f)
             self._enqueue_finding(f)
         if self.pending_findings:
             self.log(f"续跑:重注入 {len(self.pending_findings)} 条在途候选到验证/报告流水线")
@@ -1105,15 +1204,41 @@ class Pipeline:
             self.log(f"区域拆解已入统一队列:{self._decompose_total} 个 region 将按优先级逐步拆解,拆出即审")
 
         await self._run_scheduler(stop_when_idle=True, extra_pending=self._history_active)
+        final_sweep_enqueued = 0
+        if not self.stop_requested():
+            final_sweep_enqueued = self._enqueue_final_failed_sweep()
+            self._final_failed_sweep_done = True
+            if final_sweep_enqueued:
+                self.log(f"最终补跑:重新入队 {final_sweep_enqueued} 个失败候选/复查项")
+                self._in_final_failed_sweep = True
+                try:
+                    await self._run_scheduler(stop_when_idle=True, extra_pending=self._history_active)
+                finally:
+                    self._in_final_failed_sweep = False
+        else:
+            self._final_failed_sweep_done = True
         if not self.queue and not self.pq and not self._audit_passes and not self._recheck_inflight:
-            self.log(f"轮 {self.round}: 队列已空且无新攻击面回灌,提前收敛")
+            self.log(f"轮 {self.round}: 工作队列已空且无新攻击面回灌")
 
+        incomplete = self._incomplete_counts()
         if self.stop_requested():
             stop_reason = "用户请求停止"
+        elif self._has_incomplete_counts(incomplete):
+            bits = []
+            if incomplete["failed_candidates"]:
+                bits.append(f"候选验证失败 {incomplete['failed_candidates']} 条")
+            if incomplete["pending_findings"]:
+                bits.append(f"候选仍待验证 {incomplete['pending_findings']} 条")
+            if incomplete["failed_rechecks"]:
+                bits.append(f"复查失败 {incomplete['failed_rechecks']} 项")
+            if incomplete["pending_queue"] or incomplete["pending_priority_queue"]:
+                bits.append(f"队列残留 {incomplete['pending_queue'] + incomplete['pending_priority_queue']} 项")
+            stop_reason = "未完整覆盖:" + "、".join(bits)
         elif self._retrying_past_max_rounds and not self.queue:
             stop_reason = f"达到 maxRounds({self.cfg.max_rounds});失败重试队列已补审完成"
         else:
-            stop_reason = f"收敛(连续 {self.cfg.dry_rounds} 轮无新增)"
+            suffix = ";失败项最终补跑完成" if final_sweep_enqueued else ""
+            stop_reason = f"工作队列排空{suffix}"
         # 优先排查通道已统一并入主调度器(_run_scheduler):上面的 stop_when_idle 收敛时
         # pq 与在途复查必然已排空(失败项有上限重排后会终结),无需再单独等待专用 recheck 任务。
         self.log(f"审计循环结束:{stop_reason}。等待 {len(self.in_flight)} 条流水线(验证/PoC/报告)排空…")
@@ -1181,6 +1306,67 @@ class Pipeline:
         self.emit(EV.RECHECK_ENQUEUED, {"kind": "variant", "pattern": entry["pattern"],
                                         "lens_hint": entry["lens_hint"]})
 
+    def _variant_item_for_ledger(self, rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        pattern = (rec.get("name") or str(rec.get("key") or "").replace("variant:", "", 1)).strip()
+        if not pattern:
+            return None
+        hist = next((h for h in self.history
+                     if (h.get("pattern") or "").strip().lower() == pattern.lower()), None)
+        return {
+            "kind": "variant",
+            "pattern": pattern,
+            "source": (hist or {}).get("source") or rec.get("source") or "",
+            "files": (hist or {}).get("files") or [],
+            "lens_hint": (hist or {}).get("lens_hint") or (rec.get("lenses") or ["memory"])[0],
+        }
+
+    def _enqueue_failed_rechecks(self) -> int:
+        enqueued = 0
+        pq_keys = {item_key(it) for it in self.pq}
+        for r in self.risk_notes:
+            rid = r.get("id")
+            if not rid or r.get("recheck_status") != "failed" or not self._risk_sev_ok(r.get("severity_hint")):
+                continue
+            key = f"risk:{rid}"
+            if key in pq_keys:
+                continue
+            self.completed_items.discard(key)
+            self._enqueue_risk(r)
+            self.store.save_risk(r)
+            pq_keys.add(key)
+            enqueued += 1
+        for rec in self.ledger_arr:
+            if rec.get("kind") != "variant" or rec.get("status") != "abandoned":
+                continue
+            item = self._variant_item_for_ledger(rec)
+            if not item:
+                continue
+            key = item_key(item)
+            if key in pq_keys:
+                continue
+            self.completed_items.discard(key)
+            rec["status"] = "pending"
+            self._enqueue_variant(item)
+            pq_keys.add(key)
+            enqueued += 1
+        return enqueued
+
+    def _enqueue_final_failed_sweep(self) -> int:
+        if self._final_failed_sweep_done or self.stop_requested():
+            return 0
+        enqueued = 0
+        for f in list(self.pending_findings.values()):
+            if not self._is_candidate_failed(f):
+                continue
+            self._reset_candidate_for_retry(f)
+            self._enqueue_finding(f)
+            enqueued += 1
+        enqueued += self._enqueue_failed_rechecks()
+        if enqueued:
+            self.checkpoint(self.round)
+            self.emit_coverage()
+        return enqueued
+
     def _pop_priority(self) -> Optional[Dict[str, Any]]:
         """取下一个优先项:历史变体(variant)优先于风险点(risk);跳过已完成的。"""
         while self.pq:
@@ -1208,6 +1394,12 @@ class Pipeline:
             self._notify_scheduler()
             return
 
+        if self._in_final_failed_sweep:
+            attempts = self._mark_retry_after_failure(item)
+            self._abandon_recheck_item(item, rec, kind, rid, label, attempts,
+                                       reason="最终补跑仍失败")
+            return
+
         attempts = self._mark_retry_after_failure(item)
         if attempts <= max(0, self.cfg.recheck.max_retries):
             rec["status"] = "incomplete"
@@ -1224,7 +1416,13 @@ class Pipeline:
                      f"(上限 {self.cfg.recheck.max_retries})")
             return
 
-        # 超过重排上限 → 放弃该项:标记完成(后续不再回灌/重排),让管线得以收敛。
+        # 超过重排上限 → 放弃该项:标记完成(后续由 final sweep 或显式续跑再补排)。
+        self._abandon_recheck_item(item, rec, kind, rid, label, attempts,
+                                   reason=f"超过重试上限 {self.cfg.recheck.max_retries}")
+
+    def _abandon_recheck_item(self, item: Dict[str, Any], rec: Dict[str, Any],
+                              kind: Optional[str], rid: Optional[str], label: str,
+                              attempts: int, *, reason: str) -> None:
         self._clear_retry_after_failure(item)
         self.completed_items.add(item_key(item))
         rec["status"] = "abandoned"
@@ -1232,9 +1430,10 @@ class Pipeline:
             self.risk_by_id[rid]["recheck_status"] = "failed"
             self.store.save_risk(self.risk_by_id[rid])
         self.emit(EV.RECHECK_DONE, {"kind": kind, "id": rid, "pattern": item.get("pattern"),
-                                    "label": label, "abandoned": True, "attempts": attempts})
-        self.log(f"⚠ 优先排查项 {label} 连续失败 {attempts} 次(超过上限 "
-                 f"{self.cfg.recheck.max_retries}),放弃该项以免拖住流水线(其余审计不受影响)")
+                                    "label": label, "abandoned": True, "attempts": attempts,
+                                    "reason": reason})
+        self.log(f"⚠ 优先排查项 {label} 连续失败 {attempts} 次({reason}),"
+                 "标记为未覆盖失败项")
         self.checkpoint(self.round)
         self.emit_coverage()
 
@@ -1292,14 +1491,16 @@ class Pipeline:
         for c in final:
             counts[c.get("bug_class")] = counts.get(c.get("bug_class"), 0) + 1
         top_sev = (final[0].get("corrected_severity") or final[0].get("severity")) if final else "none"
-        converged = self.round < self.cfg.max_rounds and not self.stop_requested()
+        incomplete_counts = self._incomplete_counts()
+        has_incomplete = self._has_incomplete_counts(incomplete_counts)
+        status = STATUS_STOPPED if self.stop_requested() else (STATUS_INCOMPLETE if has_incomplete else STATUS_DONE)
+        converged = status == STATUS_DONE and self.round < self.cfg.max_rounds
 
         summary = {
             **self._summary_snapshot(self.round),
             "converged": converged, "stop_reason": stop_reason, "by_class": counts, "top_severity": top_sev,
-            "confirmed": len(final),
+            "confirmed": len(final), "status": status, **incomplete_counts,
         }
-        status = STATUS_STOPPED if self.stop_requested() else STATUS_DONE
         # 收尾:刷机制态 + 攻击面/覆盖快照(漏洞/风险已各自即时落盘),并写最终汇总+状态
         self.store.save_checkpoint(self.build_checkpoint(self.round))
         self.store.save_attack_surface(self.build_attack_surface(self.round))
@@ -1315,7 +1516,10 @@ class Pipeline:
             "converged": converged, "stop_reason": stop_reason, "candidates": len(self.dedup_keys),
             "subtasks_total": sum(1 for r in self.ledger_arr if r.get("kind") == "task"),
             "regions_decomposed": sum(1 for r in self.ledger_arr if r.get("status") == "decomposed"),
-            "pending_findings": len(self.pending_findings), "agents_spawned": self.runner.agent_count,
+            "pending_findings": incomplete_counts["pending_findings"],
+            "failed_candidates": incomplete_counts["failed_candidates"],
+            "failed_rechecks": incomplete_counts["failed_rechecks"],
+            "agents_spawned": self.runner.agent_count,
             "token_usage": dict(self.runner.usage_totals),
             "confirmed": len(final), "by_class": counts, "status": status,
             "top_findings": [{"id": c.get("id"), "severity": c.get("corrected_severity") or c.get("severity"),

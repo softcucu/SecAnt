@@ -381,7 +381,7 @@ function viewDashboard(runId) {
     }
   }
 
-  const CAND_STATUS_TXT = { pending: "验证中", confirmed: "已确认", rejected: "已否决" };
+  const CAND_STATUS_TXT = { pending: "验证中", confirmed: "已确认", rejected: "已否决", verify_failed: "验证失败" };
   function candPill(s) { return el("span", { class: "pill cand-" + cssKey(s) }, CAND_STATUS_TXT[s] || s || "?"); }
   function candKeyOf(d) {
     return d.key || `${(d.file || "").trim()}::${d.line || 0}::${(d.bug_class || "").trim().toLowerCase()}`;
@@ -407,14 +407,15 @@ function viewDashboard(runId) {
     const pending = list.filter(c => c.status === "pending").length;
     const confirmed = list.filter(c => c.status === "confirmed").length;
     const rejected = list.filter(c => c.status === "rejected").length;
+    const failed = list.filter(c => c.status === "verify_failed").length;
     tabBody.append(el("div", { class: "panel" },
       el("div", { class: "row", style: "justify-content:space-between" },
         el("strong", {}, "漏洞候选点"),
-        el("span", { class: "muted" }, `共 ${list.length} · 验证中 ${pending} · 已确认 ${confirmed} · 已否决 ${rejected}`)),
+        el("span", { class: "muted" }, `共 ${list.length} · 验证中 ${pending} · 已确认 ${confirmed} · 已否决 ${rejected} · 验证失败 ${failed}`)),
       el("p", { class: "muted", style: "margin:6px 0 0;font-size:12px" },
         "候选点 = 审计/复查 agent 报出、正在多票验证流水线中的疑点;验证通过后升级为「漏洞」,未过则标为已否决。")));
     if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无候选点(审计开始后会实时出现)。")); return; }
-    const rank = { pending: 0, confirmed: 1, rejected: 2 };
+    const rank = { pending: 0, verify_failed: 1, confirmed: 2, rejected: 3 };
     list.sort((a, b) =>
       (rank[a.status] ?? 9) - (rank[b.status] ?? 9) ||
       (SEVS.indexOf(a.severity) - SEVS.indexOf(b.severity)) ||
@@ -965,10 +966,10 @@ function viewDashboard(runId) {
       tabBody.append(el("div", { class: "panel" }, st));
     }
   }
-  const STATUS_TXT = { "decomposed": "🧩 已拆解", "completed-clean": "✅ 未发现", "completed-findings": "⚠️ 有候选", "in-progress": "🔄 进行中", "incomplete": "⛔ 未审完", "pending": "⏳ 待审" };
+  const STATUS_TXT = { "decomposed": "🧩 已拆解", "completed-clean": "✅ 未发现", "completed-findings": "⚠️ 有候选", "in-progress": "🔄 进行中", "incomplete": "⛔ 未审完", "abandoned": "⛔ 复查失败", "pending": "⏳ 待审" };
   function statusBadge(s) { return el("span", {}, STATUS_TXT[s] || s || "?"); }
 
-  const RECHECK_TXT = { none: "—", queued: "排队中", running: "排查中", done: "已排查" };
+  const RECHECK_TXT = { none: "—", queued: "排队中", running: "排查中", done: "已排查", failed: "排查失败" };
 
   function severitySelect(r) {
     const sel = el("select", { class: "sevsel" });
@@ -1049,6 +1050,7 @@ function viewDashboard(runId) {
     if (status === "completed-clean" || status === "completed-findings") return "是";
     if (status === "in-progress") return "否(排查中)";
     if (status === "incomplete") return "否(未审完)";
+    if (status === "abandoned") return "否(复查失败)";
     if (status === "pending") return "否(待排查)";
     return "否";
   }
@@ -1156,6 +1158,11 @@ function viewDashboard(runId) {
         if (cr) cr.status = "rejected";
         renderTabs(); if (activeTab === "candidates") renderTab(); break;
       }
+      case "candidate_failed": {
+        const cf = S.candidateMap.get(candKeyOf(d)) || upsertCandidate(d);
+        cf.status = "verify_failed"; cf.reason = d.reason || ""; cf.attempts = d.attempts || cf.attempts;
+        renderHeader(); renderTabs(); if (activeTab === "candidates") renderTab(); break;
+      }
       case "risk_added": { const k = (d.area || "") + "::" + (d.file || ""); S.risks.set(k, d); renderHeader(); renderTabs(); if (activeTab === "risks") renderTab(); break; }
       case "recheck_enqueued": case "recheck_done": case "risk_severity_changed":
         fetchRisks(); fetchCoverage(); break;
@@ -1202,7 +1209,7 @@ function viewDashboard(runId) {
     // SSE:从 seq 0 重放历史事件(重建 findings/coverage/risks/log)再接实时;EventSource 断线自动带 Last-Event-ID 续传
     const es = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events`);
     window._es = es;
-    const TYPES = ["run_status", "metrics", "usage", "agent_update", "candidate_found", "finding_confirmed", "finding_rejected", "risk_added", "recheck_enqueued", "recheck_done", "risk_severity_changed", "surface_added", "coverage_update", "round_start", "round_done", "recon_done", "history_added", "run_done", "log", "decompose_done", "poc_done", "error", "model_health", "health_check_start", "health_check_done", "config_updated"];
+    const TYPES = ["run_status", "metrics", "usage", "agent_update", "candidate_found", "finding_confirmed", "finding_rejected", "candidate_failed", "risk_added", "recheck_enqueued", "recheck_done", "risk_severity_changed", "surface_added", "coverage_update", "round_start", "round_done", "recon_done", "history_added", "run_done", "log", "decompose_done", "poc_done", "error", "model_health", "health_check_start", "health_check_done", "config_updated"];
     for (const t of TYPES) es.addEventListener(t, (e) => { try { applyEvent(JSON.parse(e.data)); } catch (_) {} });
     es.onerror = () => { /* EventSource 自动重连 */ };
   }

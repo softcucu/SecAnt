@@ -63,12 +63,15 @@ tr:hover td{background:var(--panel2)}
 .sev-low{background:var(--low)} .sev-info{background:var(--info)} .sev-none{background:var(--info)}
 .st-running{background:var(--run)} .st-done{background:var(--ok)} .st-stopped{background:var(--warn)}
 .st-error{background:var(--crit)} .st-queued{background:var(--info)} .st-interrupted{background:var(--warn)}
+.st-incomplete{background:var(--warn)}
 .health-ok{background:var(--ok)} .health-down{background:var(--crit)} .health-degraded{background:var(--warn)}
 .health-checking{background:var(--run)} .health-unknown{background:var(--info)}
 .agent-running{background:var(--run)} .agent-queued{background:var(--info)} .agent-retrying{background:var(--warn)}
 .agent-failed-attempt{background:var(--warn)} .agent-done{background:var(--ok)} .agent-failed{background:var(--crit)}
 .cand-pending{background:var(--run)} .cand-confirmed{background:var(--ok)} .cand-rejected{background:var(--info)}
+.cand-verify-failed{background:var(--crit)}
 .cand-table tr.cand-rejected{opacity:.55}
+.cand-table tr.cand-verify-failed td:first-child{font-weight:600}
 .cand-table tr.cand-confirmed td:first-child{font-weight:600}
 
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px}

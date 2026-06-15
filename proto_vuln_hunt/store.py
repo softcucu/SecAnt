@@ -26,6 +26,7 @@ STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
 STATUS_DONE = "done"
 STATUS_STOPPED = "stopped"
+STATUS_INCOMPLETE = "incomplete"
 STATUS_ERROR = "error"
 STATUS_INTERRUPTED = "interrupted"   # 服务重启时发现"running 但任务已不在"
 

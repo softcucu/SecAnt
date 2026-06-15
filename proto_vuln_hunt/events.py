@@ -20,6 +20,7 @@ ROUND_DONE = "round_done"          # {round, new_findings, new_surfaces, queue_l
 CANDIDATE_FOUND = "candidate_found"    # {key, title, bug_class, file, line, lens, severity, function}
 FINDING_CONFIRMED = "finding_confirmed"  # {finding ...}
 FINDING_REJECTED = "finding_rejected"    # {key, title}
+CANDIDATE_FAILED = "candidate_failed"    # {key, title, reason, attempts}
 SURFACE_ADDED = "surface_added"    # {name, why, files, lens_hint, round, from}
 RISK_ADDED = "risk_added"          # {area, note, file, severity_hint, lens, round}
 RECHECK_ENQUEUED = "recheck_enqueued"  # {kind: variant|risk, id?, pattern?, area?, severity_hint?, lens_hint?}

@@ -123,7 +123,7 @@ def render_risks_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
     rows_data = sorted(state.get("riskNotes") or [], key=lambda r: SEV_RANK.get(r.get("severity_hint"), 9))
     if rows_data:
         rows = ["| 风险高低 | 主题 | 位置 | 说明 | lens | 轮次 | 排查 |", "|---|---|---|---|---|---|---|"]
-        _rc_label = {"none": "—", "queued": "排队中", "running": "排查中", "done": "已排查"}
+        _rc_label = {"none": "—", "queued": "排队中", "running": "排查中", "done": "已排查", "failed": "排查失败"}
         for r in rows_data:
             rc = _rc_label.get(r.get("recheck_status") or "none", r.get("recheck_status") or "—")
             rows.append(f"| {r.get('severity_hint') or 'info'} | {r.get('area') or ''} | {r.get('file') or '—'} | "
@@ -158,6 +158,22 @@ def render_finding_md(finding: Dict[str, Any]) -> str:
 
 
 # ──────────────────────── INDEX.md(确定性,无需 agent) ────────────────────────
+def _index_status_line(summary: Dict[str, Any]) -> str:
+    status = summary.get("status") or ("done" if summary.get("converged") else "incomplete")
+    if status != "incomplete":
+        label = {"done": "✅ 完整完成", "stopped": "⏹ 用户停止"}.get(status, status)
+        return f"- 运行状态: {label}"
+    bits = []
+    if summary.get("failed_candidates"):
+        bits.append(f"候选验证失败 {summary['failed_candidates']} 条")
+    if summary.get("pending_findings"):
+        bits.append(f"候选仍待验证 {summary['pending_findings']} 条")
+    if summary.get("failed_rechecks"):
+        bits.append(f"风险/变体复查失败 {summary['failed_rechecks']} 项")
+    detail = ("(" + "、".join(bits) + ")") if bits else ""
+    return f"- 运行状态: ⛔ 未完整覆盖{detail} —— 续跑可对失败项重新补审"
+
+
 def render_index_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
     sn = _scope_note(meta)
     final = finalize_findings(state.get("confirmed") or [])
@@ -175,6 +191,7 @@ def render_index_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
         f"- 确认漏洞: {len(final)} 条;最高危等级: {top_sev};审计轮数: {summary.get('rounds', state.get('round', 0))};"
         f"候选去重池: {summary.get('candidates', '?')}",
         f"- 收敛: {'是' if summary.get('converged') else '否 —— ' + str(summary.get('stop_reason', ''))}",
+        _index_status_line(summary),
         f"- 按 bug_class 计数: {json.dumps(counts, ensure_ascii=False)}", "",
         "## 漏洞索引(severity 从高到低)", "",
         "| ID | 严重度 | 类型 | 标题 | 位置 | 报告 |", "|---|---|---|---|---|---|",
