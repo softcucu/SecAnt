@@ -1206,8 +1206,7 @@ class Pipeline:
         await self._run_scheduler(stop_when_idle=True, extra_pending=self._history_active)
         final_sweep_enqueued = 0
         if not self.stop_requested():
-            final_sweep_enqueued = self._enqueue_final_failed_sweep()
-            self._final_failed_sweep_done = True
+            final_sweep_enqueued = self._enqueue_final_failed_sweep()  # 内部自标 _final_failed_sweep_done
             if final_sweep_enqueued:
                 self.log(f"最终补跑:重新入队 {final_sweep_enqueued} 个失败候选/复查项")
                 self._in_final_failed_sweep = True
@@ -1354,6 +1353,9 @@ class Pipeline:
     def _enqueue_final_failed_sweep(self) -> int:
         if self._final_failed_sweep_done or self.stop_requested():
             return 0
+        # 自身即标记本次 invocation 的 final sweep 已发起,保证“最多一次”的语义不依赖调用方,
+        # 避免被重复调用时把失败项重复回灌、再次拖住流水线。
+        self._final_failed_sweep_done = True
         enqueued = 0
         for f in list(self.pending_findings.values()):
             if not self._is_candidate_failed(f):
