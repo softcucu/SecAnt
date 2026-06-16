@@ -84,6 +84,14 @@ class Pipeline:
         self.round = 0
         self.in_flight: List[asyncio.Task] = []
         self._started = time.time()
+        # ── PoC 隔离工作目录(全 run 复用 + 串行) ──
+        # opencode/codex 按 cwd 派生 per-project 状态(DB/快照),每个新 cwd 都要付一次冷启动
+        # (一次性 DB 迁移 +「对整棵 target 全量重建快照」)。若每条 PoC 都新建一次性 worktree,
+        # 就会反复冷启动,并发起来还会内存/磁盘尖峰直接拖垮 WSL。这里全 run 复用一个稳定 worktree,
+        # 并用锁串行化(同时保护这个共享目录)。
+        self._poc_worktree: Optional[str] = None
+        self._poc_worktree_disabled = False   # 非 git 仓 / 建失败 → 回退主仓目录,且不再反复尝试
+        self._poc_lock: Optional[asyncio.Lock] = None  # 惰性创建(兼容 py3.8 在事件循环外构造)
 
     # ──────────────────────── 日志 / 事件 ────────────────────────
     def log(self, msg: str) -> None:
@@ -762,34 +770,81 @@ class Pipeline:
                 pass
 
     # ──────────────────────── PoC(隔离工作目录副本) ────────────────────────
-    async def run_poc(self, rec: Dict[str, Any]) -> Any:
+    def _poc_lock_get(self) -> asyncio.Lock:
+        if self._poc_lock is None:
+            self._poc_lock = asyncio.Lock()
+        return self._poc_lock
+
+    def _reset_poc_worktree(self) -> None:
+        """把复用的 PoC worktree 恢复到干净 HEAD,清掉上一条 PoC 留下的产物(含未跟踪/被忽略文件)。
+        既防 worktree 自身占盘膨胀,也避免这些产物被 opencode 每步快照吞进去撑大快照仓。"""
+        wt = self._poc_worktree
+        if not wt or not os.path.isdir(wt):
+            return
+        try:
+            subprocess.run(["git", "-C", wt, "reset", "--hard", "HEAD"],
+                           capture_output=True, text=True)
+            subprocess.run(["git", "-C", wt, "clean", "-fdx"],
+                           capture_output=True, text=True)
+        except Exception:  # noqa: BLE001 —— 清理失败不影响 PoC 本身
+            pass
+
+    def _ensure_poc_worktree(self) -> str:
+        """惰性创建并全 run 复用一个 PoC 专用 git worktree;返回可用 cwd(失败回退主仓目录)。
+
+        路径稳定让 opencode/codex 把它当同一个项目:一次性 DB 迁移 + 全量快照只在首条 PoC 付一次,
+        后续 PoC 走增量。复用前先重置干净,保证每条 PoC 从同一基线开跑。"""
         target = self._abs_target()
-        wt = None
-        cwd = target
+        if self._poc_worktree_disabled:
+            return target
+        if self._poc_worktree and os.path.isdir(self._poc_worktree):
+            self._reset_poc_worktree()   # 复用:先清干净
+            return self._poc_worktree
         is_git = subprocess.run(["git", "-C", target, "rev-parse", "--is-inside-work-tree"],
                                 capture_output=True, text=True).returncode == 0
-        if is_git:
-            try:
-                wt = tempfile.mkdtemp(prefix="pvh-poc-")
-                r = subprocess.run(["git", "-C", target, "worktree", "add", "--detach", wt, "HEAD"],
-                                   capture_output=True, text=True)
-                if r.returncode == 0:
-                    cwd = wt
-                else:
-                    self.log(f"⚠ 创建 git worktree 失败,PoC 退回主仓目录: {r.stderr.strip()[:120]}")
-                    shutil.rmtree(wt, ignore_errors=True)
-                    wt = None
-            except Exception as e:  # noqa: BLE001
-                self.log(f"⚠ worktree 异常,PoC 退回主仓目录: {str(e)[:120]}")
-                wt = None
+        if not is_git:
+            # 非 git 仓建不了 worktree:直接用主仓目录(opencode 仍只有一个稳定 cwd,不额外冷启动)
+            self._poc_worktree_disabled = True
+            return target
         try:
-            return await self.runner.run(self.pb.poc(rec, self.build_hint, S.POC_SCHEMA),
-                                         role="poc", label=f"poc:{rec['id']}", schema=S.POC_SCHEMA, cwd=cwd)
-        finally:
+            wt = tempfile.mkdtemp(prefix="pvh-poc-")
+            r = subprocess.run(["git", "-C", target, "worktree", "add", "--detach", wt, "HEAD"],
+                               capture_output=True, text=True)
+            if r.returncode == 0:
+                self._poc_worktree = wt
+                self.log(f"🧪 PoC 复用 worktree 就绪(全 run 共享,串行执行): {wt}")
+                return wt
+            self.log(f"⚠ 创建 PoC worktree 失败,PoC 退回主仓目录: {r.stderr.strip()[:120]}")
+            shutil.rmtree(wt, ignore_errors=True)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"⚠ PoC worktree 异常,退回主仓目录: {str(e)[:120]}")
+        self._poc_worktree_disabled = True
+        return target
+
+    def _cleanup_poc_worktree(self) -> None:
+        """run 收尾:移除复用的 PoC worktree(git 注册 + 目录),并 prune 掉历史死注册
+        (含上次被 OOM 杀掉、没来得及收尾的 run 残留)。opencode 在数据目录下为该 cwd 生成的快照,
+        仍由 AgentRunner._reap_opencode_artifacts 在后续 PoC 调用时按"最近活跃"滚动回收,这里不重复处理。"""
+        wt = self._poc_worktree
+        self._poc_worktree = None
+        target = self._abs_target()
+        try:
             if wt:
                 subprocess.run(["git", "-C", target, "worktree", "remove", "--force", wt],
                                capture_output=True, text=True)
                 shutil.rmtree(wt, ignore_errors=True)
+            # 无论本 run 是否建过 worktree,都顺手 prune 一次,清掉历史残留的死注册
+            subprocess.run(["git", "-C", target, "worktree", "prune"],
+                           capture_output=True, text=True)
+        except Exception:  # noqa: BLE001 —— 收尾失败不影响主流程
+            pass
+
+    async def run_poc(self, rec: Dict[str, Any]) -> Any:
+        # 串行 + 复用同一 worktree:挡住并发冷启动的内存尖峰,并保护这个共享目录。
+        async with self._poc_lock_get():
+            cwd = self._ensure_poc_worktree()
+            return await self.runner.run(self.pb.poc(rec, self.build_hint, S.POC_SCHEMA),
+                                         role="poc", label=f"poc:{rec['id']}", schema=S.POC_SCHEMA, cwd=cwd)
 
     # ──────────────────────── 阶段 ① 侦察 / 断点恢复 ────────────────────────
     def restore_checkpoint(self) -> bool:
@@ -1613,3 +1668,6 @@ class Pipeline:
             self.emit(EV.ERROR, {"message": str(e)[:500]})
             self.emit(EV.RUN_STATUS, {"status": STATUS_ERROR})
             raise
+        finally:
+            # 收尾:移除全 run 复用的 PoC worktree(成功/失败/停止都执行)
+            self._cleanup_poc_worktree()
