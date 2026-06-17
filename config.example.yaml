@@ -58,7 +58,7 @@ params:
   finders_per_lens: 2           # 每个攻击面每个 lens 每轮派几个 finder
   dry_rounds: 2                 # 连续几轮无新增即收敛
   max_rounds: 6                 # 审计循环硬上限
-  verify_votes: 3               # 每条候选的对抗验证票数(多数否决即杀)
+  verify_votes: 3               # 每条候选的 judge 裁决票数(先正方举证+反方证伪,再对合格裁决票多数决)
   threat_model: REMOTE          # REMOTE | LOCAL_UNPRIVILEGED | BOTH
   enable_poc: true              # 高危项是否进隔离 worktree 编译 PoC
   lenses: [memory, integer, race, injection, authn, crypto, dos, infoleak]

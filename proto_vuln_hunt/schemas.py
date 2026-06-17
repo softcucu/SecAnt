@@ -96,16 +96,79 @@ FINDINGS_SCHEMA = {
     },
 }
 
+VERIFY_PROOF_SCHEMA = {
+    "type": "object",
+    "required": ["supports_real", "evidence_refs", "source_chain", "sink_ref", "reasoning"],
+    "properties": {
+        "supports_real": {"type": "boolean", "description": "正方是否已经用代码证据坐实 finding"},
+        "evidence_refs": {
+            "type": "array",
+            "description": "代码证据,每项格式:path:line - 证据说明",
+            "items": {"type": "string"},
+        },
+        "source_chain": {
+            "type": "array",
+            "description": "从不可信入口到 sink 的关键调用/数据流节点,path:line + 一句话",
+            "items": {"type": "string"},
+        },
+        "sink_ref": {"type": "string", "description": "漏洞 sink 位置,path:line - sink 说明"},
+        "reachability": {"type": "string"},
+        "controllability": {"type": "string"},
+        "corrected_severity": {"type": "string", "enum": ["critical", "high", "medium", "low", "info"]},
+        "exploitability": {"type": "string"},
+        "missing_evidence": {"type": "string", "description": "仍缺什么证据;若证据完整可留空"},
+        "verdict_confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "reasoning": {"type": "string"},
+    },
+}
+
+VERIFY_DISPROOF_SCHEMA = {
+    "type": "object",
+    "required": ["refutes_real", "evidence_refs", "clearing_checks", "reasoning"],
+    "properties": {
+        "refutes_real": {"type": "boolean", "description": "反方是否已经用代码证据证伪 finding"},
+        "evidence_refs": {
+            "type": "array",
+            "description": "代码证据,每项格式:path:line - 证据说明",
+            "items": {"type": "string"},
+        },
+        "clearing_checks": {
+            "type": "array",
+            "description": "证伪点:上游 clamp/return/状态检查/不可控条件等,path:line + 一句话",
+            "items": {"type": "string"},
+        },
+        "non_issue_reason": {"type": "string", "description": "当 refutes_real=true 时填写:最终验证为非问题的代码证据与原因"},
+        "reachability": {"type": "string"},
+        "controllability": {"type": "string"},
+        "corrected_severity": {"type": "string", "enum": ["critical", "high", "medium", "low", "info"]},
+        "exploitability": {"type": "string"},
+        "missing_evidence": {"type": "string", "description": "仍缺什么证伪证据;若已证伪可留空"},
+        "verdict_confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "reasoning": {"type": "string"},
+    },
+}
+
 VERDICT_SCHEMA = {
     "type": "object",
-    "required": ["is_real", "reasoning"],
+    "required": ["decision", "is_real", "evidence_refs", "reasoning"],
     "properties": {
-        "is_real": {"type": "boolean", "description": "反驳不掉为 true;不可达/已被检查/不可控则 false"},
+        "decision": {"type": "string", "enum": ["confirm", "reject", "inconclusive"]},
+        "is_real": {"type": "boolean", "description": "decision=confirm 时为 true;decision=reject 时为 false;inconclusive 时不作为最终真假依据"},
+        "evidence_refs": {
+            "type": "array",
+            "description": "裁决采用的代码证据,每项格式:path:line - 证据说明",
+            "items": {"type": "string"},
+        },
+        "source_chain": {"type": "array", "items": {"type": "string"}},
+        "sink_ref": {"type": "string"},
+        "clearing_checks": {"type": "array", "items": {"type": "string"}},
         "reachability": {"type": "string"},
         "controllability": {"type": "string"},
         "corrected_severity": {"type": "string", "enum": ["critical", "high", "medium", "low", "info"]},
         "exploitability": {"type": "string"},
         "non_issue_reason": {"type": "string", "description": "当 is_real=false 时填写:最终验证为非问题的代码证据与原因"},
+        "missing_evidence": {"type": "string", "description": "decision=inconclusive 时说明缺口"},
+        "verdict_confidence": {"type": "string", "enum": ["high", "medium", "low"]},
         "reasoning": {"type": "string"},
     },
 }

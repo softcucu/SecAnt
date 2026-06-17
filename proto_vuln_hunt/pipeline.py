@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -24,6 +25,8 @@ from .common import (class_code, finalize_findings, finding_key, item_key,
 from .config import Config, normalize_models
 from .prompts import VERIFY_LENSES, PromptBuilder
 from .store import RunStore, STATUS_DONE, STATUS_ERROR, STATUS_INCOMPLETE, STATUS_RUNNING, STATUS_STOPPED
+
+_CODE_REF_RE = re.compile(r"\S+:\d+")
 
 
 def _noop_emit(etype: str, data: Optional[Dict[str, Any]] = None, persist: bool = True) -> None:
@@ -727,25 +730,40 @@ class Pipeline:
         }
 
     def _candidate_rejected_payload(self, f: Dict[str, Any], votes: List[Dict[str, Any]]) -> Dict[str, Any]:
-        false_votes = [v for v in votes if not v.get("is_real")]
+        judge_votes = [v for v in votes if v.get("phase") == "judge" and v.get("validation_ok", True)]
+        counted_votes = judge_votes or votes
+        false_votes = [v for v in counted_votes if self._vote_decision(v) == "reject"]
         reason_bits = []
         for v in false_votes:
             r = (v.get("non_issue_reason") or v.get("reasoning") or "").strip()
+            clearing = " / ".join(self._text_list(v.get("clearing_checks")))
+            if clearing:
+                r = f"{r}: {clearing}" if r else clearing
             if r and r not in reason_bits:
                 reason_bits.append(r)
-        total = len(votes)
+        total = len(counted_votes)
         false_count = len(false_votes)
-        summary = f"多数验证票判定为非问题({false_count}/{total})"
+        summary = f"多数裁决票判定为非问题({false_count}/{total})"
         if reason_bits:
             summary += ": " + " / ".join(reason_bits)
         slim_votes = [{
+            "phase": v.get("phase") or "",
             "model": v.get("model") or "",
             "verify_lens": v.get("verify_lens") or "",
+            "decision": self._vote_decision(v),
             "is_real": bool(v.get("is_real")),
+            "validation_ok": v.get("validation_ok", True),
+            "validation_reason": v.get("validation_reason") or "",
             "reachability": v.get("reachability") or "",
             "controllability": v.get("controllability") or "",
             "corrected_severity": v.get("corrected_severity") or "",
             "exploitability": v.get("exploitability") or "",
+            "evidence_refs": self._text_list(v.get("evidence_refs")),
+            "source_chain": self._text_list(v.get("source_chain")),
+            "sink_ref": v.get("sink_ref") or "",
+            "clearing_checks": self._text_list(v.get("clearing_checks")),
+            "missing_evidence": v.get("missing_evidence") or "",
+            "verdict_confidence": v.get("verdict_confidence") or "",
             "reasoning": v.get("reasoning") or "",
             "non_issue_reason": v.get("non_issue_reason") or "",
         } for v in votes]
@@ -760,6 +778,122 @@ class Pipeline:
             "vote_real": total - false_count,
             "rejection_reason": summary,
         }
+
+    @staticmethod
+    def _text(v: Any) -> str:
+        return str(v).strip() if v is not None else ""
+
+    @classmethod
+    def _text_list(cls, v: Any) -> List[str]:
+        if isinstance(v, list):
+            return [cls._text(x) for x in v if cls._text(x)]
+        s = cls._text(v)
+        return [s] if s else []
+
+    @classmethod
+    def _has_code_ref(cls, v: Any) -> bool:
+        return any(_CODE_REF_RE.search(x) for x in cls._text_list(v))
+
+    @staticmethod
+    def _vote_decision(v: Dict[str, Any]) -> str:
+        d = (v.get("decision") or "").strip().lower()
+        if d in ("confirm", "reject", "inconclusive"):
+            return d
+        return "confirm" if v.get("is_real") else "reject"
+
+    @classmethod
+    def _normalize_judge_vote(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(v) if isinstance(v, dict) else {}
+        decision = cls._vote_decision(out)
+        out["decision"] = decision
+        if decision == "confirm":
+            out["is_real"] = True
+        elif decision == "reject":
+            out["is_real"] = False
+        else:
+            out["is_real"] = False
+        return out
+
+    @classmethod
+    def _validate_verify_proof(cls, proof: Optional[Dict[str, Any]]) -> List[str]:
+        if not isinstance(proof, dict):
+            return ["正方无结构化输出"]
+        missing = []
+        if not proof.get("supports_real"):
+            missing.append("正方未坐实 finding")
+        if not cls._has_code_ref(proof.get("evidence_refs")):
+            missing.append("正方缺少 path:line 代码证据")
+        if not cls._has_code_ref(proof.get("source_chain")):
+            missing.append("正方缺少 source_chain")
+        if not cls._has_code_ref(proof.get("sink_ref")):
+            missing.append("正方缺少 sink_ref")
+        if not cls._text(proof.get("reachability")):
+            missing.append("正方缺少可达性说明")
+        if not cls._text(proof.get("controllability")):
+            missing.append("正方缺少可控性说明")
+        return missing
+
+    @classmethod
+    def _validate_verify_disproof(cls, disproof: Optional[Dict[str, Any]]) -> List[str]:
+        if not isinstance(disproof, dict):
+            return ["反方无结构化输出"]
+        missing = []
+        if not disproof.get("refutes_real"):
+            missing.append("反方未证伪 finding")
+        if not cls._has_code_ref(disproof.get("evidence_refs")):
+            missing.append("反方缺少 path:line 代码证据")
+        if not cls._has_code_ref(disproof.get("clearing_checks")):
+            missing.append("反方缺少 clearing_checks")
+        if not cls._text(disproof.get("non_issue_reason")):
+            missing.append("反方缺少 non_issue_reason")
+        return missing
+
+    @classmethod
+    def _validate_judge_vote(cls, vote: Dict[str, Any], *, proof_ok: bool, disproof_ok: bool) -> List[str]:
+        decision = cls._vote_decision(vote)
+        missing = []
+        if decision == "inconclusive":
+            missing.append("裁决不确定")
+            if not cls._text(vote.get("missing_evidence") or vote.get("reasoning")):
+                missing.append("未说明证据缺口")
+            return missing
+        if not cls._has_code_ref(vote.get("evidence_refs")):
+            missing.append("裁决缺少 path:line 代码证据")
+        if decision == "confirm":
+            if not proof_ok:
+                missing.append("正方举证不合格")
+            if not cls._has_code_ref(vote.get("source_chain")):
+                missing.append("确认票缺少 source_chain")
+            if not cls._has_code_ref(vote.get("sink_ref")):
+                missing.append("确认票缺少 sink_ref")
+            if not cls._text(vote.get("reachability")):
+                missing.append("确认票缺少可达性说明")
+            if not cls._text(vote.get("controllability")):
+                missing.append("确认票缺少可控性说明")
+        elif decision == "reject":
+            if not disproof_ok:
+                missing.append("反方证伪不合格")
+            if not cls._has_code_ref(vote.get("clearing_checks")):
+                missing.append("否决票缺少 clearing_checks")
+            if not cls._text(vote.get("non_issue_reason")):
+                missing.append("否决票缺少 non_issue_reason")
+        else:
+            missing.append(f"未知裁决:{decision}")
+        return missing
+
+    @staticmethod
+    def _mark_vote(v: Optional[Dict[str, Any]], *, phase: str, lens: str,
+                   model: str = "", validation_errors: Optional[List[str]] = None) -> Dict[str, Any]:
+        out = dict(v) if isinstance(v, dict) else {}
+        out["phase"] = phase
+        out["verify_lens"] = lens
+        if model:
+            out["model"] = model
+        errs = validation_errors or []
+        out["validation_ok"] = not errs
+        if errs:
+            out["validation_reason"] = ";".join(errs)
+        return out
 
     @staticmethod
     def _reset_candidate_for_retry(f: Dict[str, Any]) -> None:
@@ -803,31 +937,91 @@ class Pipeline:
             f["verify_status"] = "pending"
             self.dedup_keys.add(k)
 
-            lenses = [VERIFY_LENSES[i % len(VERIFY_LENSES)] for i in range(self.cfg.verify_votes)]
-            vote_metas = [{} for _ in lenses]
-            vote_tasks = [self.runner.run(self.pb.verify(f, lens, S.VERDICT_SCHEMA),
-                                          role="verify", label=f"verify:{(f.get('title') or '')[:24]}#{i + 1}",
-                                          schema=S.VERDICT_SCHEMA, meta=vote_metas[i])
-                          for i, lens in enumerate(lenses)]
-            raw_votes = await asyncio.gather(*vote_tasks)
-            votes = []
-            for i, v in enumerate(raw_votes):
-                if not v:
-                    continue
-                if vote_metas[i].get("model"):
-                    v["model"] = vote_metas[i]["model"]
-                v["verify_lens"] = lenses[i]
-                votes.append(v)
-            required_votes = max(1, -(-self.cfg.verify_votes // 2))
-            if len(votes) < required_votes:
-                self._handle_candidate_verify_failure(f, f"有效验证票不足({len(votes)}/{self.cfg.verify_votes})")
+            title = (f.get("title") or "")[:24]
+            proof_meta: Dict[str, Any] = {}
+            disproof_meta: Dict[str, Any] = {}
+            raw_proof, raw_disproof = await asyncio.gather(
+                self.runner.run(self.pb.verify_prover(f, S.VERIFY_PROOF_SCHEMA),
+                                role="verify", label=f"verify-prover:{title}",
+                                schema=S.VERIFY_PROOF_SCHEMA, meta=proof_meta),
+                self.runner.run(self.pb.verify_disprover(f, S.VERIFY_DISPROOF_SCHEMA),
+                                role="verify", label=f"verify-disprover:{title}",
+                                schema=S.VERIFY_DISPROOF_SCHEMA, meta=disproof_meta),
+            )
+            proof_errors = self._validate_verify_proof(raw_proof)
+            disproof_errors = self._validate_verify_disproof(raw_disproof)
+            proof_ok = not proof_errors
+            disproof_ok = not disproof_errors
+            proof_obj = raw_proof if isinstance(raw_proof, dict) else {}
+            disproof_obj = raw_disproof if isinstance(raw_disproof, dict) else {}
+
+            proof_vote = self._mark_vote(raw_proof, phase="prover", lens="正方举证",
+                                         model=proof_meta.get("model") or "",
+                                         validation_errors=proof_errors)
+            proof_vote["decision"] = "confirm" if proof_obj.get("supports_real") else "inconclusive"
+            proof_vote["is_real"] = bool(proof_obj.get("supports_real"))
+            disproof_vote = self._mark_vote(raw_disproof, phase="disprover", lens="反方证伪",
+                                            model=disproof_meta.get("model") or "",
+                                            validation_errors=disproof_errors)
+            disproof_vote["decision"] = "reject" if disproof_obj.get("refutes_real") else "inconclusive"
+            disproof_vote["is_real"] = not bool(disproof_obj.get("refutes_real"))
+            votes = [proof_vote, disproof_vote]
+
+            if not proof_ok and not disproof_ok:
+                self._handle_candidate_verify_failure(
+                    f,
+                    "正反举证均无合格证据"
+                    f"(正方:{';'.join(proof_errors)};反方:{';'.join(disproof_errors)})",
+                )
                 return
-            real = sum(1 for v in votes if v.get("is_real"))
-            false = len(votes) - real
-            majority = len(votes) // 2 + 1
+
+            lenses = [VERIFY_LENSES[i % len(VERIFY_LENSES)] for i in range(self.cfg.verify_votes)]
+            judge_metas = [{} for _ in lenses]
+            judge_tasks = [
+                self.runner.run(
+                    self.pb.verify_judge(f, proof_vote, disproof_vote, lens, S.VERDICT_SCHEMA),
+                    role="verify", label=f"verify-judge:{title}#{i + 1}",
+                    schema=S.VERDICT_SCHEMA, meta=judge_metas[i],
+                )
+                for i, lens in enumerate(lenses)
+            ]
+            raw_judges = await asyncio.gather(*judge_tasks)
+            valid_judges: List[Dict[str, Any]] = []
+            invalid_reasons: List[str] = []
+            for i, v in enumerate(raw_judges):
+                if not v:
+                    invalid_reasons.append(f"#{i + 1}:无输出或解析失败")
+                    continue
+                judge = self._normalize_judge_vote(v)
+                errs = self._validate_judge_vote(judge, proof_ok=proof_ok, disproof_ok=disproof_ok)
+                if errs:
+                    invalid_reasons.append(f"#{i + 1}:{';'.join(errs)}")
+                if judge_metas[i].get("model"):
+                    judge["model"] = judge_metas[i]["model"]
+                judge["phase"] = "judge"
+                judge["verify_lens"] = lenses[i]
+                judge["validation_ok"] = not errs
+                if errs:
+                    judge["validation_reason"] = ";".join(errs)
+                votes.append(judge)
+                if not errs:
+                    valid_judges.append(judge)
+
+            required_votes = max(1, -(-self.cfg.verify_votes // 2))
+            if len(valid_judges) < required_votes:
+                detail = ";".join(invalid_reasons[:3])
+                self._handle_candidate_verify_failure(
+                    f,
+                    f"有效裁决票不足({len(valid_judges)}/{self.cfg.verify_votes})"
+                    + (f":{detail}" if detail else ""),
+                )
+                return
+            real = sum(1 for v in valid_judges if self._vote_decision(v) == "confirm")
+            false = sum(1 for v in valid_judges if self._vote_decision(v) == "reject")
+            majority = len(valid_judges) // 2 + 1
             if real < majority:
                 if false < majority:
-                    self._handle_candidate_verify_failure(f, "验证票未形成多数")
+                    self._handle_candidate_verify_failure(f, "裁决票未形成多数")
                     return
                 self.processed_keys.add(k)
                 self.pending_findings.pop(k, None)
@@ -836,8 +1030,10 @@ class Pipeline:
                 self.emit(EV.FINDING_REJECTED, payload)
                 return
 
-            corrected = most_severe([v.get("corrected_severity") for v in votes]) or f.get("severity")
-            exploit = next((v.get("exploitability") for v in votes if v.get("exploitability")), "")
+            corrected = most_severe([v.get("corrected_severity") for v in valid_judges]
+                                    + [proof_vote.get("corrected_severity")]) or f.get("severity")
+            exploit = next((v.get("exploitability") for v in valid_judges if v.get("exploitability")),
+                           proof_vote.get("exploitability") or "")
             self.seq += 1
             fid = f"{class_code(f.get('bug_class'))}-{pad3(self.seq)}"
             verify_models = sorted({v["model"] for v in votes if v.get("model")})
@@ -1725,7 +1921,7 @@ class Pipeline:
         self.emit(EV.RUN_STATUS, {"status": STATUS_RUNNING})
         self.log(f"目标={self.cfg.target}{sn} 后端={self.cfg.backend} 并发={self.cfg.concurrency} "
                  f"每lens finder={self.cfg.finders_per_lens} dryRounds={self.cfg.dry_rounds} "
-                 f"maxRounds={self.cfg.max_rounds} 验证票={self.cfg.verify_votes} PoC={self.cfg.enable_poc} "
+                 f"maxRounds={self.cfg.max_rounds} 裁决票={self.cfg.verify_votes} PoC={self.cfg.enable_poc} "
                  f"resume={self.cfg.resume} 威胁模型={self.cfg.threat_model}")
         self.log(f"启用 lens: {', '.join(self.cfg.lenses)} | run 目录: {self.store.dir} | "
                  f"方法库: {self.cfg.methods_abs} ({'就绪' if self.cfg.methods_ok() else '不可用→内联兜底'})")

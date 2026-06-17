@@ -133,7 +133,7 @@ def render_risks_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
         table = "(本次审计未登记潜在风险)"
     return (
         f"# 潜在安全风险登记 — {meta.get('target')}{sn}\n\n"
-        "> 这些是审计中发现、**可疑但未确认为漏洞**的隐患/可加固点(未经多票验证)。\n"
+        "> 这些是审计中发现、**可疑但未确认为漏洞**的隐患/可加固点(未经对抗验证确认)。\n"
         f"**威胁模型**: {meta.get('threat_model')}　|　共 {len(rows_data)} 条\n\n"
         f"{table}\n\n---\n*由 proto-vuln-hunt(python) 从结构化态导出。*\n"
     )

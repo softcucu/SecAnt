@@ -205,7 +205,7 @@ async function viewNew() {
     f("每 lens finder 数", num("finders_per_lens", d.finders_per_lens)),
     f("最大轮数 max_rounds", num("max_rounds", d.max_rounds)),
     f("收敛空轮 dry_rounds", num("dry_rounds", d.dry_rounds)),
-    f("验证票数 verify_votes", num("verify_votes", d.verify_votes)),
+    f("裁决票数 verify_votes", num("verify_votes", d.verify_votes)),
     el("div", { class: "checks", style: "margin:8px 0 14px" },
       el("label", {}, el("input", { type: "checkbox", id: "enable_poc", checked: d.enable_poc ? "" : null }), "启用 PoC"),
       el("label", {}, el("input", { type: "checkbox", id: "decompose", checked: d.decompose ? "" : null }), "区域拆解")),
@@ -443,7 +443,7 @@ function viewDashboard(runId) {
         el("strong", {}, "漏洞候选点"),
         el("span", { class: "muted" }, `共 ${list.length} · 验证中 ${pending} · 已确认 ${confirmed} · 已否决 ${rejected} · 验证失败 ${failed}`)),
       el("p", { class: "muted", style: "margin:6px 0 0;font-size:12px" },
-        "候选点 = 审计/复查 agent 报出、正在多票验证流水线中的疑点;验证通过后升级为「漏洞」,未过则标为已否决。")));
+        "候选点 = 审计/复查 agent 报出、正在正反举证 + 裁决票验证流水线中的疑点;验证通过后升级为「漏洞」,未过则标为已否决。")));
     if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无候选点(审计开始后会实时出现)。")); return; }
     const rank = { pending: 0, verify_failed: 1, confirmed: 2, rejected: 3 };
     list.sort((a, b) =>
@@ -471,6 +471,11 @@ function viewDashboard(runId) {
   function nonIssueVoteReason(v) {
     return (v && (v.non_issue_reason || v.reasoning || v.reachability || v.controllability)) || "";
   }
+  function detailList(label, values) {
+    const arr = Array.isArray(values) ? values.filter(Boolean) : (values ? [values] : []);
+    if (!arr.length) return null;
+    return detailLine(label, arr.map(x => "- " + x).join("\n"), true);
+  }
   function detailLine(label, value, asMd = false) {
     if (value === undefined || value === null || value === "") return null;
     return el("div", { class: "detail-line" },
@@ -478,17 +483,25 @@ function viewDashboard(runId) {
       asMd ? el("div", { class: "detail-value md", html: mdToHtml(value) }) : el("div", { class: "detail-value" }, String(value)));
   }
   function renderVoteCard(v, idx) {
-    const isReal = !!v.is_real;
-    const meta = [v.model, v.verify_lens ? "视角 " + v.verify_lens : ""].filter(Boolean).join(" · ");
+    const decision = v.decision || (v.is_real ? "confirm" : "reject");
+    const isReal = decision === "confirm";
+    const label = decision === "confirm" ? "确认问题" : (decision === "reject" ? "判定非问题" : "证据不足");
+    const meta = [v.phase, v.model, v.verify_lens ? "视角 " + v.verify_lens : ""].filter(Boolean).join(" · ");
     const reason = nonIssueVoteReason(v);
     return el("div", { class: "vote-card " + (isReal ? "vote-real" : "vote-false") },
       el("div", { class: "vote-head" },
-        el("strong", {}, `验证票 #${idx + 1}`),
-        el("span", { class: "pill " + (isReal ? "cand-confirmed" : "cand-rejected") }, isReal ? "仍认为是真问题" : "判定非问题"),
+        el("strong", {}, `验证记录 #${idx + 1}`),
+        el("span", { class: "pill " + (isReal ? "cand-confirmed" : (decision === "reject" ? "cand-rejected" : "cand-pending")) }, label),
         meta ? el("span", { class: "muted model-attr" }, meta) : null),
+      detailLine("证据有效性", v.validation_ok === false ? (v.validation_reason || "未通过证据门槛") : "", true),
+      detailList("代码证据", v.evidence_refs),
+      detailList("调用链", v.source_chain),
+      detailLine("Sink", v.sink_ref, true),
+      detailList("证伪点", v.clearing_checks),
       detailLine("可达性", v.reachability, true),
       detailLine("可控性", v.controllability, true),
-      detailLine(isReal ? "保留问题依据" : "非问题原因", reason || "该验证票未记录详细原因", true),
+      detailLine(isReal ? "保留问题依据" : "非问题原因", reason || "该验证记录未记录详细原因", true),
+      detailLine("缺失证据", v.missing_evidence, true),
       detailLine("可利用性", v.exploitability, true));
   }
   function renderNonIssues() {
@@ -498,7 +511,7 @@ function viewDashboard(runId) {
         el("strong", {}, "工具验证后的非问题"),
         el("span", { class: "muted" }, `共 ${list.length}`)),
       el("p", { class: "muted", style: "margin:6px 0 0;font-size:12px" },
-        "这里收集多票验证后被多数否决的候选点,保留原始疑似问题依据和最终非问题验证依据。")));
+        "这里收集对抗验证后被多数裁决否决的候选点,保留原始疑似问题依据和最终非问题验证依据。")));
     if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无已验证为非问题的候选。")); return; }
     list.sort((a, b) =>
       (SEVS.indexOf(a.severity || "info") - SEVS.indexOf(b.severity || "info")) ||
@@ -524,7 +537,7 @@ function viewDashboard(runId) {
         detailLine("审计模型", c.audit_model),
         detailLine("置信度", c.confidence),
         el("h3", {}, "最终验证非问题原因"),
-        detailLine("多数结论", c.rejection_reason || (total ? `多数验证票判定为非问题(${falseCount}/${total})` : "旧事件未记录验证票详情"), true),
+        detailLine("多数结论", c.rejection_reason || (total ? `多数裁决票判定为非问题(${falseCount}/${total})` : "旧事件未记录验证票详情"), true),
         verifyModels.length ? detailLine("验证模型", verifyModels.join("、")) : null);
       if (votes.length) {
         body.append(el("div", { class: "vote-list" }, ...votes.map(renderVoteCard)));

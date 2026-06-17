@@ -1,6 +1,6 @@
-"""process_finding 多数票判定 + final failed sweep 的单元测试。
+"""process_finding 对抗举证/裁决 + final failed sweep 的单元测试。
 
-不触碰真实后端 CLI:用 FakeRunner 直接喂验证票/报告正文,
+不触碰真实后端 CLI:用 FakeRunner 直接喂正方/反方/裁决票/报告正文,
 用临时目录里的真实 RunStore 落盘(避免再去 stub 一堆 store 方法)。
 
 运行:  python3 -m unittest proto_vuln_hunt.tests.test_pipeline_verify
@@ -16,7 +16,7 @@ from proto_vuln_hunt.store import RunStore
 
 
 class FakeRunner:
-    """按 role 分发的假 AgentRunner:verify 逐票弹出(None=该票 CLI/解析失败),report 返回正文。"""
+    """按 role 分发的假 AgentRunner:verify 逐个弹出(None=CLI/解析失败),report 返回正文。"""
 
     def __init__(self):
         self.verify_responses = []
@@ -39,11 +39,78 @@ def _finding(**over):
     return f
 
 
-def _vote(is_real, sev="high", reasoning=None, non_issue_reason=None):
-    v = {"is_real": is_real, "corrected_severity": sev, "exploitability": "exploitable",
-         "reasoning": reasoning or ("反驳不掉" if is_real else "caller trace 证伪可达性")}
-    if non_issue_reason:
-        v["non_issue_reason"] = non_issue_reason
+def _proof(ok=True, sev="high", **over):
+    if ok:
+        v = {
+            "supports_real": True,
+            "evidence_refs": ["a.c:1 - recv 读入攻击者长度", "a.c:10 - memcpy 使用该长度"],
+            "source_chain": ["a.c:1 - recv_packet", "a.c:8 - fn 传入 len", "a.c:10 - memcpy"],
+            "sink_ref": "a.c:10 - memcpy(dst, src, len)",
+            "reachability": "REMOTE 入口可达 fn",
+            "controllability": "len 由报文字段控制且未夹紧",
+            "corrected_severity": sev,
+            "exploitability": "exploitable",
+            "verdict_confidence": "high",
+            "reasoning": "source 到 sink 链路完整且缺校验",
+        }
+    else:
+        v = {"supports_real": False, "evidence_refs": [], "source_chain": [], "sink_ref": "",
+             "missing_evidence": "未找到真实入口", "reasoning": "正方无法坐实"}
+    v.update(over)
+    return v
+
+
+def _disproof(refutes=False, **over):
+    if refutes:
+        v = {
+            "refutes_real": True,
+            "evidence_refs": ["a.c:4 - len 被夹紧到缓冲区容量以内"],
+            "clearing_checks": ["a.c:4 - if (len > sizeof(dst)) return -1"],
+            "non_issue_reason": "入口已把长度夹紧到缓冲区容量以内",
+            "verdict_confidence": "high",
+            "reasoning": "caller trace 证伪可达危险长度",
+        }
+    else:
+        v = {"refutes_real": False, "evidence_refs": [], "clearing_checks": [],
+             "missing_evidence": "未找到上游证伪点", "reasoning": "反方未能证伪"}
+    v.update(over)
+    return v
+
+
+def _judge(decision="confirm", sev="high", **over):
+    if decision == "confirm":
+        v = {
+            "decision": "confirm",
+            "is_real": True,
+            "evidence_refs": ["a.c:1 - recv 读入攻击者长度", "a.c:10 - memcpy 使用该长度"],
+            "source_chain": ["a.c:1 - recv_packet", "a.c:8 - fn 传入 len", "a.c:10 - memcpy"],
+            "sink_ref": "a.c:10 - memcpy(dst, src, len)",
+            "reachability": "REMOTE 入口可达 fn",
+            "controllability": "len 由报文字段控制且未夹紧",
+            "corrected_severity": sev,
+            "exploitability": "exploitable",
+            "verdict_confidence": "high",
+            "reasoning": "正方证据完整,反方未证伪",
+        }
+    elif decision == "reject":
+        v = {
+            "decision": "reject",
+            "is_real": False,
+            "evidence_refs": ["a.c:4 - len 被夹紧到缓冲区容量以内"],
+            "clearing_checks": ["a.c:4 - if (len > sizeof(dst)) return -1"],
+            "non_issue_reason": "入口已把长度夹紧到缓冲区容量以内",
+            "verdict_confidence": "high",
+            "reasoning": "反方证伪点成立",
+        }
+    else:
+        v = {
+            "decision": "inconclusive",
+            "is_real": False,
+            "evidence_refs": ["a.c:10 - 仅定位到 sink"],
+            "missing_evidence": "source_chain 和 clearing_checks 均不足",
+            "reasoning": "证据不足",
+        }
+    v.update(over)
     return v
 
 
@@ -58,7 +125,9 @@ class _PipelineTestBase(unittest.IsolatedAsyncioTestCase):
         p = Pipeline(cfg, store=RunStore(self._tmp.name).ensure(),
                      emitter=lambda etype, data, persist=True: events.append((etype, data)))
         p.runner = FakeRunner()
-        p.pb.verify = lambda *a, **k: "VERIFY_PROMPT"
+        p.pb.verify_prover = lambda *a, **k: "PROVER_PROMPT"
+        p.pb.verify_disprover = lambda *a, **k: "DISPROVER_PROMPT"
+        p.pb.verify_judge = lambda *a, **k: "JUDGE_PROMPT"
         p.pb.report_body = lambda *a, **k: "REPORT_PROMPT"
         p.events = events
         return p
@@ -72,11 +141,11 @@ class _PipelineTestBase(unittest.IsolatedAsyncioTestCase):
         return next((data for t, data in reversed(p.events) if t == etype), None)
 
 
-class TestMajorityVote(_PipelineTestBase):
-    async def test_majority_real_confirms(self):
-        """3 票里 2 real → 达成多数 → 确认为漏洞。"""
+class TestAdversarialVerify(_PipelineTestBase):
+    async def test_majority_confirm_judges_confirm(self):
+        """正方证据合格 + 3 张裁决票里 2 confirm → 确认为漏洞。"""
         p = self.make_pipeline(verify_votes=3)
-        p.runner.verify_responses = [_vote(True), _vote(True), _vote(False)]
+        p.runner.verify_responses = [_proof(), _disproof(False), _judge("confirm"), _judge("confirm"), _judge("inconclusive")]
         f = _finding()
         await p.process_finding(f)
 
@@ -88,14 +157,18 @@ class TestMajorityVote(_PipelineTestBase):
         self.assertEqual(len(cands), 1)
         self.assertEqual(cands[0]["status"], "confirmed")
         self.assertEqual(cands[0]["id"], "MEM-001")
+        self.assertEqual(len(p.confirmed[0]["votes"]), 5)
+        self.assertTrue(any(v.get("phase") == "prover" for v in p.confirmed[0]["votes"]))
 
-    async def test_majority_false_rejects(self):
-        """3 票里 3 false → 多数否决 → 标记 rejected,不入 confirmed。"""
+    async def test_majority_reject_judges_rejects(self):
+        """反方证伪合格 + 3 张裁决票里 3 reject → 标记 rejected,不入 confirmed。"""
         p = self.make_pipeline(verify_votes=3)
         p.runner.verify_responses = [
-            _vote(False, non_issue_reason="入口已把长度夹紧到缓冲区容量以内"),
-            _vote(False),
-            _vote(False),
+            _proof(False),
+            _disproof(True),
+            _judge("reject"),
+            _judge("reject"),
+            _judge("reject"),
         ]
         f = _finding(description="候选声称长度可控导致溢出", source_to_sink="recv len -> copy")
         await p.process_finding(f)
@@ -109,8 +182,8 @@ class TestMajorityVote(_PipelineTestBase):
         self.assertEqual(payload["description"], "候选声称长度可控导致溢出")
         self.assertEqual(payload["source_to_sink"], "recv len -> copy")
         self.assertEqual(payload["vote_false"], 3)
-        self.assertEqual(len(payload["votes"]), 3)
-        self.assertTrue(payload["votes"][0]["verify_lens"].startswith("可达性"))
+        self.assertEqual(len(payload["votes"]), 5)
+        self.assertEqual(payload["votes"][2]["phase"], "judge")
         self.assertIn("入口已把长度夹紧", payload["rejection_reason"])
         cands = p.store.load_candidates()
         self.assertEqual(len(cands), 1)
@@ -118,9 +191,9 @@ class TestMajorityVote(_PipelineTestBase):
         self.assertEqual(cands[0]["vote_false"], 3)
 
     async def test_tie_no_majority_is_not_a_rejection(self):
-        """偶数票打平(1 real / 1 false)→ 既不确认也不否决 → 正常阶段回队重试。"""
+        """偶数裁决票打平(1 confirm / 1 reject)→ 正常阶段回队重试。"""
         p = self.make_pipeline(verify_votes=2)
-        p.runner.verify_responses = [_vote(True), _vote(False)]
+        p.runner.verify_responses = [_proof(), _disproof(True), _judge("confirm"), _judge("reject")]
         f = _finding()
         await p.process_finding(f)
 
@@ -134,17 +207,41 @@ class TestMajorityVote(_PipelineTestBase):
         self.assertNotIn(EV.FINDING_REJECTED, self._event_types(p))
 
     async def test_insufficient_valid_votes_is_not_a_rejection(self):
-        """3 票里仅 1 票有效(2 票 CLI/解析失败)→ 票数不足 → 回队重试,而非否决。"""
+        """3 张裁决票里仅 1 张有效(2 张 CLI/解析失败)→ 票数不足 → 回队重试。"""
         p = self.make_pipeline(verify_votes=3)
-        p.runner.verify_responses = [_vote(True), None, None]
+        p.runner.verify_responses = [_proof(), _disproof(False), _judge("confirm"), None, None]
         f = _finding()
         await p.process_finding(f)
 
         self.assertEqual(p.confirmed, [])
         self.assertNotIn(finding_key(f), p.processed_keys)
         self.assertEqual(f["verify_attempts"], 1)
-        self.assertIn("票不足", f.get("verify_failure_reason", ""))
+        self.assertIn("裁决票不足", f.get("verify_failure_reason", ""))
         self.assertNotIn(EV.FINDING_REJECTED, self._event_types(p))
+
+    async def test_confirm_judge_without_source_chain_is_invalid(self):
+        """confirm 裁决缺 source_chain → 无证据票不算票。"""
+        p = self.make_pipeline(verify_votes=1)
+        p.runner.verify_responses = [_proof(), _disproof(False), _judge("confirm", source_chain=[])]
+        f = _finding()
+        await p.process_finding(f)
+
+        self.assertEqual(p.confirmed, [])
+        self.assertNotIn(finding_key(f), p.processed_keys)
+        self.assertIn("有效裁决票不足", f.get("verify_failure_reason", ""))
+        self.assertIn("source_chain", f.get("verify_failure_reason", ""))
+
+    async def test_reject_judge_without_clearing_check_is_invalid(self):
+        """reject 裁决缺 clearing_checks → 无证据票不算票。"""
+        p = self.make_pipeline(verify_votes=1)
+        p.runner.verify_responses = [_proof(False), _disproof(True), _judge("reject", clearing_checks=[])]
+        f = _finding()
+        await p.process_finding(f)
+
+        self.assertEqual(p.confirmed, [])
+        self.assertNotIn(finding_key(f), p.processed_keys)
+        self.assertIn("有效裁决票不足", f.get("verify_failure_reason", ""))
+        self.assertIn("clearing_checks", f.get("verify_failure_reason", ""))
 
     async def test_retry_exhaustion_marks_verify_failed(self):
         """连续打平,耗尽 retry.max_attempts 后 → 终态 verify_failed + 发 CANDIDATE_FAILED。"""
@@ -152,13 +249,13 @@ class TestMajorityVote(_PipelineTestBase):
         p.cfg.retry.max_attempts = 1   # 总共允许 1 次失败回队,第 2 次失败即终态
         f = _finding()
 
-        p.runner.verify_responses = [_vote(True), _vote(False)]
+        p.runner.verify_responses = [_proof(), _disproof(True), _judge("confirm"), _judge("reject")]
         await p.process_finding(f)                        # 第 1 次:回队
         self.assertEqual(f["verify_status"], "pending")
         self.assertEqual(f["verify_attempts"], 1)
         self.assertNotIn(EV.CANDIDATE_FAILED, self._event_types(p))
 
-        p.runner.verify_responses = [_vote(True), _vote(False)]
+        p.runner.verify_responses = [_proof(), _disproof(True), _judge("confirm"), _judge("reject")]
         await p.process_finding(f)                        # 第 2 次:超限 → verify_failed
         self.assertEqual(f["verify_status"], "verify_failed")
         self.assertEqual(f["verify_attempts"], 2)
@@ -171,7 +268,7 @@ class TestMajorityVote(_PipelineTestBase):
         """final sweep 模式:一次额外机会,失败即终态 verify_failed(不再回队重试)。"""
         p = self.make_pipeline(verify_votes=2)
         p._in_final_failed_sweep = True
-        p.runner.verify_responses = [_vote(True), _vote(False)]
+        p.runner.verify_responses = [_proof(), _disproof(True), _judge("confirm"), _judge("reject")]
         f = _finding()
         await p.process_finding(f)
 

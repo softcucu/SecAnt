@@ -291,24 +291,65 @@ class PromptBuilder:
             + must_struct(schema)
         )
 
-    # ── 对抗性验证 ──
-    def verify(self, f: Dict[str, Any], lens: str, schema) -> str:
+    @staticmethod
+    def _finding_brief(f: Dict[str, Any]) -> str:
         return (
-            f"**默认这条 finding 是误报,尝试反驳它**。当前威胁模型:{self.threat}。只从这个视角审查:{lens}\n\n"
-            f"{self.verify_methods()}Finding:\n"
             f"- 标题:{f.get('title')}\n"
             f"- 类型:{f.get('bug_class')}\n"
             f"- 位置:{f.get('file')}:{f.get('line') or '?'} 函数 {f.get('function')}\n"
             f"- 描述:{f.get('description')}\n"
             f"- 声称的 source→sink:{f.get('source_to_sink') or '(未给出)'}\n"
-            f"- 变体来源:{f.get('variant_of') or '(无)'}\n\n"
+            f"- 变体来源:{f.get('variant_of') or '(无)'}\n"
+        )
+
+    # ── 对抗性验证:正方举证 ──
+    def verify_prover(self, f: Dict[str, Any], schema) -> str:
+        return (
+            f"你是漏洞验证的**正方举证 agent**。当前威胁模型:{self.threat}。\n"
+            "目标不是泛泛同意 finding,而是用真实代码证据证明它成立;证明不了就 supports_real=false。\n\n"
+            f"{self.verify_methods()}Finding:\n{self._finding_brief(f)}\n"
+            "请用 Read/rg 看真实代码,只追踪关键路径。若要 supports_real=true,必须同时给出:\n"
+            "- 不可信输入入口(path:line)与攻击者可控字段/长度/状态;\n"
+            "- 到漏洞点的 source_chain,每个节点写 path:line + 一句话;\n"
+            "- sink_ref(path:line)与缺失/不足的校验;\n"
+            "- reachability、controllability、corrected_severity、exploitability。\n"
+            "如果入口不清、链路断裂、sink 不明确或关键代码没读到,不要硬判真,把缺口写进 missing_evidence。"
+            + must_struct(schema)
+        )
+
+    # ── 对抗性验证:反方证伪 ──
+    def verify_disprover(self, f: Dict[str, Any], schema) -> str:
+        return (
+            f"你是漏洞验证的**反方证伪 agent**。当前威胁模型:{self.threat}。\n"
+            "默认这条 finding 是误报,但只有拿到真实代码证据才能 refutes_real=true。\n\n"
+            f"{self.verify_methods()}Finding:\n{self._finding_brief(f)}\n"
             "用 Read/rg 看真实代码,回溯从不可信输入源到此处的完整路径。\n"
             "**判误报必须拿证据**(不得凭\"看起来不可达/有缓解/太难利用/别处校验过/只崩溃\"随手否决):"
-            "只有当你能 caller-trace **证伪可达性**、或**确证上游校验确实把输入夹紧**、或**确证根本不是 bug**时,才 is_real=false;"
-            "此时在 non_issue_reason 写清最终验证为非问题的代码证据与原因。\n"
-            f"反驳不掉才 is_real=true。按 {self.threat} 威胁模型给出 corrected_severity 与可利用性判断"
-            "(空口/未认证单包崩溃在 REMOTE 下至少 high;影响认证/crypto 升一级;需赢竞态降一级)。\n"
-            "**聚焦**:只回溯与本视角相关的关键路径,约 5~8 个函数即可,不要全仓漫游。"
+            "只有当你能 caller-trace **证伪可达性**、或**确证上游校验确实把输入夹紧**、或**确证根本不是 bug**时,"
+            "才 refutes_real=true。\n"
+            "若 refutes_real=true,必须填写 clearing_checks 与 non_issue_reason,每条证据写 path:line + 一句话。"
+            "反驳不掉时 refutes_real=false,把仍缺的证伪证据写进 missing_evidence。"
+            + must_struct(schema)
+        )
+
+    # ── 对抗性验证:裁决 ──
+    def verify_judge(self, f: Dict[str, Any], proof: Dict[str, Any],
+                     disproof: Dict[str, Any], lens: str, schema) -> str:
+        proof_s = json.dumps(proof or {}, ensure_ascii=False)
+        disproof_s = json.dumps(disproof or {}, ensure_ascii=False)
+        return (
+            f"你是漏洞验证的**裁判 agent**。当前威胁模型:{self.threat}。裁决重点:{lens}\n\n"
+            "你只裁决正反双方已经给出的结构化证据是否足够;不要重新做大范围审计。"
+            "可以用 Read/rg 核对双方引用的少量 path:line,但不能凭直觉补齐缺失证据。\n\n"
+            f"{self.verify_methods()}Finding:\n{self._finding_brief(f)}\n"
+            f"正方举证 JSON:\n```json\n{proof_s}\n```\n"
+            f"反方证伪 JSON:\n```json\n{disproof_s}\n```\n"
+            "裁决规则:\n"
+            "- decision=confirm:正方有完整 source_chain + sink_ref + evidence_refs,且反方没有给出能证伪的 clearing_checks;\n"
+            "- decision=reject:反方有明确 clearing_checks + non_issue_reason,能证伪可达性/可控性/bug 成立性;\n"
+            "- decision=inconclusive:任一关键证据缺失、双方证据冲突但无法判定、或引用无法核实。\n"
+            "输出 decision=confirm 时 is_real=true;decision=reject 时 is_real=false;inconclusive 时 is_real=false,"
+            "但必须在 missing_evidence 写清缺口。所有采用的证据都必须进入 evidence_refs。"
             + must_struct(schema)
         )
 
@@ -335,8 +376,11 @@ class PromptBuilder:
     # ── 报告正文(返回纯 Markdown 正文,frontmatter 由 Python 拼接) ──
     def report_body(self, rec: Dict[str, Any], poc: Any) -> str:
         votes_brief = json.dumps(
-            [{"is_real": v.get("is_real"), "reachability": v.get("reachability"),
-              "controllability": v.get("controllability"), "reasoning": v.get("reasoning")}
+            [{"phase": v.get("phase"), "decision": v.get("decision"), "is_real": v.get("is_real"),
+              "evidence_refs": v.get("evidence_refs"), "source_chain": v.get("source_chain"),
+              "sink_ref": v.get("sink_ref"), "clearing_checks": v.get("clearing_checks"),
+              "reachability": v.get("reachability"), "controllability": v.get("controllability"),
+              "reasoning": v.get("reasoning"), "non_issue_reason": v.get("non_issue_reason")}
              for v in (rec.get("votes") or [])], ensure_ascii=False)
         poc_brief = json.dumps({
             "compiled": poc.get("compiled"), "triggered": poc.get("triggered"),

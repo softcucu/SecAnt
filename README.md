@@ -1,7 +1,7 @@
 # proto-vuln-hunt (python)
 
 `proto-vuln-hunt` workflow 的 **Python 移植版**:同样的协议栈/管理面 C/C++ 白盒漏洞挖掘流水线
-(侦察 → 区域拆解 → loop-until-dry 审计 → 多票对抗验证 → 流式产出确认漏洞 → 高危 PoC → 汇总),
+(侦察 → 区域拆解 → loop-until-dry 审计 → 正反举证 + 多裁决票对抗验证 → 流式产出确认漏洞 → 高危 PoC → 汇总),
 但**每个 agent 通过外部 CLI 执行**,且带一个 **Web 控制台**。你可以在**配置文件**里:
 
 - 选择后端:`claude` / `opencode` / `codex`(也能自定义任意 CLI 的调用方式);
@@ -174,7 +174,7 @@ REST/SSE 接口(`serve` 时):`/api/runs`(GET/POST)、`/api/runs/{id}`、`/stop`�
 2. **Unified Scheduler** — history commit 分析从启动起就在统一优先级队列里,与 high audit finder 同级;recheck 最高优先级;候选验证/报告流水线高于普通审计;decompose 低于已拆出的 audit,因此一个 region 拆完即可开审,不必等待全部 region 拆完。相同优先级按入队时间 FIFO。若队首任务所需模型容量不可用,调度器会扫描后续任务并先启动有可用模型的任务,避免模型空闲。
 3. **History Feedback** — history 提炼出的「历史问题模式」随挖随补,回灌 Web「历史问题」页签与 recheck 同类变体排查队列。
 4. **Audit** — 工作队列 loop-until-dry:每攻击面 × lens × N finder;动态回灌新攻击面;每个审计项完成即存断点。
-5. **Verify** — 逐发现 `verify_votes` 票多视角对抗反驳,多数否决即杀。
+5. **Verify** — 逐发现先跑正方举证与反方证伪,再跑 `verify_votes` 张 judge 裁决票;只有带 path:line 证据的合格裁决票参与多数决。
 6. **Report** — 每条存活漏洞立即生成 7 段式正文,作为结构化记录进 state + 发 `finding_confirmed` 事件(SSE 流式呈现)。
 7. **PoC**(可选) — 高危项在隔离 git worktree 副本里尝试最小化编译触发(非 git/编不动则降级静态 PoC)。
 7. **Synthesis** — 去重 + 写汇总到 `run.json`/`state.json` + 发 `run_done`(MD/SARIF 留待导出时渲染)。
