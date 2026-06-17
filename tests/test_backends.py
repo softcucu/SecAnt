@@ -553,9 +553,9 @@ class ProcessDrainTests(unittest.IsolatedAsyncioTestCase):
     async def test_probe_model_records_first_token_latency_and_output_speed(self):
         script = (
             "import sys,time;"
-            "sys.stdout.write('2 ');sys.stdout.flush();"
+            "sys.stdout.write('HEALTH_OK\\n');sys.stdout.flush();"
             "time.sleep(0.05);"
-            "sys.stdout.write('1 2 3 4 5 6 7 8 9 10');sys.stdout.flush()"
+            "sys.stdout.write('tok001 tok002 tok003 tok004 tok005 tok006 tok007 tok008');sys.stdout.flush()"
         )
         with tempfile.TemporaryDirectory() as d:
             cfg = Config(
