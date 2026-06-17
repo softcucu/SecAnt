@@ -649,6 +649,88 @@ async def _drain_process(
         raise
 
 
+class _ProbeOutputTiming:
+    """Track when the backend first exposes assistant output on stdout."""
+
+    def __init__(self, backend: str, started: float):
+        self.backend = backend
+        self.started = started
+        self.first_token_at: Optional[float] = None
+        self._opencode_buf = ""
+        self._opencode_seen_json = False
+
+    def observe(self, stream: str, chunk: str) -> None:
+        if self.first_token_at is not None or stream != "stdout":
+            return
+        text = strip_ansi(chunk or "")
+        if not text.strip():
+            return
+        now = time.monotonic()
+        if self.backend == "opencode":
+            if self._observe_opencode(text, now):
+                return
+            if self._opencode_seen_json or self._opencode_buf.lstrip().startswith("{"):
+                return
+        self.first_token_at = now
+
+    def _observe_opencode(self, text: str, now: float) -> bool:
+        self._opencode_buf += text
+        lines = self._opencode_buf.splitlines(keepends=True)
+        if lines and not (lines[-1].endswith("\n") or lines[-1].endswith("\r")):
+            self._opencode_buf = lines.pop()
+        else:
+            self._opencode_buf = ""
+        if len(self._opencode_buf) > 8192:
+            self._opencode_buf = self._opencode_buf[-8192:]
+        pending = self._opencode_buf.strip()
+        if pending.startswith("{"):
+            try:
+                json.loads(pending)
+                lines.append(self._opencode_buf)
+                self._opencode_buf = ""
+            except Exception:
+                pass
+        for raw in lines:
+            ln = raw.strip()
+            if not ln.startswith("{"):
+                continue
+            try:
+                ev = json.loads(ln)
+            except Exception:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            self._opencode_seen_json = True
+            etype = str(ev.get("type") or "")
+            part = _event_part(ev)
+            if not part:
+                continue
+            if part.get("type") != "text" and etype not in ("text", "message.part.updated", "message.part.delta"):
+                continue
+            if str(part.get("text") or "").strip() or _text_delta(ev, part).strip():
+                self.first_token_at = now
+                return True
+        return False
+
+    def first_latency_ms(self, finished: float, has_answer: bool) -> int:
+        first_at = self.first_token_at
+        if first_at is None and has_answer:
+            first_at = finished
+        if first_at is None:
+            return 0
+        return max(0, int((first_at - self.started) * 1000))
+
+    def output_tokens_per_s(self, output_tokens: int, finished: float) -> float:
+        if output_tokens <= 0:
+            return 0.0
+        total_s = max(0.001, finished - self.started)
+        if self.first_token_at is not None:
+            decode_s = finished - self.first_token_at
+            if decode_s >= 0.05:
+                return round(max(1, output_tokens - 1) / decode_s, 2)
+        return round(output_tokens / total_s, 2)
+
+
 class DynamicSemaphore:
     """容量可在运行中调整的 asyncio 信号量(用于动态增减并发)。
 
@@ -1274,6 +1356,8 @@ class AgentRunner:
             rec = {
                 "model": model, "status": "unknown", "backend": self.cfg.backend,
                 "last_check_ts": 0.0, "last_ok_ts": 0.0, "last_latency_ms": 0,
+                "last_first_token_latency_ms": 0, "last_output_tokens": 0,
+                "last_output_tokens_per_s": 0.0,
                 "checks": 0, "ok_checks": 0, "answer": "", "error": "",
                 "calls": 0, "call_fails": 0, "last_call_error": "",
                 "last_call_fail_ts": 0.0, "last_call_ok_ts": 0.0,
@@ -1298,7 +1382,7 @@ class AgentRunner:
         return lk
 
     async def probe_model(self, model: str, *, reason: str = "startup") -> Optional[Dict[str, Any]]:
-        """对单个模型发一个极小探针任务(默认 1+1=?),据响应判定 ok/degraded/down。
+        """对单个模型发一个短探针任务,据响应判定 ok/degraded/down 并记录输出性能。
         探针不计入 token 用量统计,且用独立的较短超时,避免拖慢启动。"""
         if not model:
             return None
@@ -1309,11 +1393,12 @@ class AgentRunner:
         self._emit_health(rec)
         cwd = os.path.abspath(os.path.expanduser(self.cfg.target))
         timeout_s = max(1, (hc.timeout_ms or self.cfg.retry.timeout_ms) / 1000.0)
-        t0 = time.time()
+        t0 = time.monotonic()
+        timing = _ProbeOutputTiming(self.cfg.backend, t0)
         async with self._model_semaphore(model):
             async with self._semaphore():
                 try:
-                    # opencode 探针也按单个 positional message argv 发送,避免为了 1+1 触发
+                    # opencode 探针也按单个 positional message argv 发送,避免为了健康检查触发
                     # "先读任务文件"的工具循环,造成健康状态误判。
                     text, _usage = await self._invoke(
                         hc.prompt,
@@ -1321,13 +1406,19 @@ class AgentRunner:
                         cwd,
                         timeout_s=timeout_s,
                         direct_prompt=(self.cfg.backend == "opencode"),
+                        on_output=timing.observe,
                     )
-                    latency = int((time.time() - t0) * 1000)
+                    finished = time.monotonic()
+                    latency = int((finished - t0) * 1000)
                     answer = (text or "").strip()
+                    output_tokens = _token_int((_usage or {}).get("output_tokens")) or estimate_tokens(answer)
                     healthy = (hc.expect in answer) if hc.expect else bool(answer)
                     rec["checks"] += 1
                     rec["last_check_ts"] = time.time()
                     rec["last_latency_ms"] = latency
+                    rec["last_first_token_latency_ms"] = timing.first_latency_ms(finished, bool(answer))
+                    rec["last_output_tokens"] = output_tokens
+                    rec["last_output_tokens_per_s"] = timing.output_tokens_per_s(output_tokens, finished)
                     rec["answer"] = answer[:160]
                     if healthy:
                         rec["ok_checks"] += 1
@@ -1338,9 +1429,13 @@ class AgentRunner:
                         rec["status"] = "degraded"
                         rec["error"] = "模型可达但回答未命中预期(疑似越权/拒答/输出异常)"
                 except Exception as e:  # noqa: BLE001
+                    finished = time.monotonic()
                     rec["checks"] += 1
                     rec["last_check_ts"] = time.time()
-                    rec["last_latency_ms"] = int((time.time() - t0) * 1000)
+                    rec["last_latency_ms"] = int((finished - t0) * 1000)
+                    rec["last_first_token_latency_ms"] = timing.first_latency_ms(finished, False)
+                    rec["last_output_tokens"] = 0
+                    rec["last_output_tokens_per_s"] = 0.0
                     rec["status"] = "down"
                     rec["error"] = str(e)[:200]
         self._emit_health(rec)

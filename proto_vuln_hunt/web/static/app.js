@@ -26,6 +26,7 @@ function flash(msg) { const f = el("div", { class: "flash" }, msg); document.bod
 function fmtTs(t) { if (!t) return "—"; const d = new Date(t * 1000); return d.toLocaleString(); }
 function fmtClock(t) { if (!t) return "—"; const d = new Date(t * 1000); return d.toLocaleTimeString(); }
 function fmtMs(ms) { ms = Number(ms || 0); if (!ms) return "—"; return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`; }
+function fmtTps(v) { const n = Number(v || 0); if (!Number.isFinite(n) || n <= 0) return "—"; return `${n >= 10 ? Math.round(n) : n.toFixed(1)} tok/s`; }
 function sevPill(s) { return el("span", { class: "pill sev-" + (s || "none") }, s || "none"); }
 function stPill(s) { return el("span", { class: "pill st-" + (s || "queued") }, s || "queued"); }
 function tokenCount(v) {
@@ -498,12 +499,12 @@ function viewDashboard(runId) {
       el("button", { class: "btn secondary", onclick: recheckHealth }, "🩺 重新检查"));
     tabBody.append(el("div", { class: "panel" }, bar,
       el("p", { class: "muted", style: "margin:0" },
-        "运行开始前会对每个配置的模型发一个 1+1 探针;调用某模型前若健康状态陈旧/异常会自动补检。状态实时更新。")));
+        "运行开始前会对每个配置的模型发一个短探针;调用某模型前若健康状态陈旧/异常会自动补检。首 token 与输出速度实时更新。")));
     if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无模型健康数据(开始运行后会自动检测)。")); return; }
     const order = { checking: 0, down: 1, degraded: 2, unknown: 3, ok: 4 };
     list.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9) || String(a.model).localeCompare(String(b.model)));
     const tbl = el("table", {}, el("thead", {}, el("tr", {},
-      el("th", {}, "状态"), el("th", {}, "模型"), el("th", {}, "延迟"), el("th", {}, "探针(正常/总)"),
+      el("th", {}, "状态"), el("th", {}, "模型"), el("th", {}, "首 token"), el("th", {}, "平均输出速度"), el("th", {}, "探针(正常/总)"),
       el("th", {}, "成功调用"), el("th", {}, "失败"), el("th", {}, "最近探针答复"), el("th", {}, "最近调用异常"), el("th", {}, "最近检查"))));
     const tb = el("tbody");
     for (const h of list) {
@@ -512,10 +513,13 @@ function viewDashboard(runId) {
       const ans = h.answer ? h.answer : (probeErr ? el("span", { class: "muted", title: probeErr }, "⚠ " + probeErr) : "—");
       const callErrText = h.last_call_error || legacyCallErr;
       const callErr = callErrText ? el("span", { class: "muted", title: callErrText }, "⚠ " + callErrText) : "—";
+      const firstTokenMs = h.last_first_token_latency_ms || (!("last_first_token_latency_ms" in h) ? h.last_latency_ms : 0);
+      const speedTitle = h.last_output_tokens ? `输出 ${fmtNum(h.last_output_tokens)} token` : "";
       tb.append(el("tr", {},
         el("td", {}, healthPill(h.status)),
         el("td", { class: "loc" }, h.model || "—"),
-        el("td", {}, h.last_latency_ms ? Math.round(h.last_latency_ms) + " ms" : "—"),
+        el("td", {}, fmtMs(firstTokenMs)),
+        el("td", { title: speedTitle }, fmtTps(h.last_output_tokens_per_s)),
         el("td", {}, `${h.ok_checks || 0}/${h.checks || 0}`),
         el("td", {}, String(h.calls || 0)),
         el("td", {}, String(h.call_fails || 0)),

@@ -550,6 +550,39 @@ class ProcessDrainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stdout, "alphabeta")
         self.assertEqual(stderr, "warn")
 
+    async def test_probe_model_records_first_token_latency_and_output_speed(self):
+        script = (
+            "import sys,time;"
+            "sys.stdout.write('2 ');sys.stdout.flush();"
+            "time.sleep(0.05);"
+            "sys.stdout.write('1 2 3 4 5 6 7 8 9 10');sys.stdout.flush()"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Config(
+                target=d,
+                out_dir=os.path.join(d, "out"),
+                backend="dummy",
+                models={"audit": ["unit-model"]},
+                backends={
+                    "dummy": BackendSpec(
+                        name="dummy",
+                        command=[sys.executable, "-c", script],
+                        prompt_mode="stdin",
+                        parse="text",
+                    )
+                },
+            )
+            runner = AgentRunner(cfg, logger=lambda *_args, **_kwargs: None)
+
+            rec = await runner.probe_model("unit-model")
+
+        self.assertEqual(rec["status"], "ok")
+        self.assertGreater(rec["last_latency_ms"], 30)
+        self.assertGreaterEqual(rec["last_first_token_latency_ms"], 0)
+        self.assertLess(rec["last_first_token_latency_ms"], rec["last_latency_ms"])
+        self.assertGreater(rec["last_output_tokens"], 0)
+        self.assertGreater(rec["last_output_tokens_per_s"], 0)
+
     async def test_retry_forever_continues_parse_failures_until_json(self):
         script = (
             "import json,sys\n"
