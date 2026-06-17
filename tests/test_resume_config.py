@@ -109,5 +109,43 @@ class HealthPruneTest(unittest.TestCase):
             self.assertNotIn("removed-model", models)
 
 
+class UsageResumeTest(unittest.TestCase):
+    def test_resume_restores_usage_totals_and_next_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(target=tmp, out_dir=os.path.join(tmp, "out"),
+                         models=_models("m"), resume=True)
+            store = RunStore(cfg.out_dir).ensure()
+            store.append_usage({
+                "id": 1, "input_tokens": 10, "output_tokens": 5,
+                "total_tokens": 15, "estimated": True,
+            })
+            store.append_usage({
+                "id": 7, "input_tokens": 20, "output_tokens": 8,
+                "total_tokens": 28, "estimated": False,
+            })
+
+            pipe = Pipeline(cfg, store=store)
+
+            self.assertEqual(pipe.runner.usage_count, 7)
+            self.assertEqual(pipe.runner.usage_totals, {
+                "calls": 2,
+                "input_tokens": 30,
+                "output_tokens": 13,
+                "total_tokens": 43,
+                "estimated_calls": 1,
+            })
+
+            pipe.runner._record_usage(
+                "prompt", "output", role="audit", label="audit:unit",
+                model="m", attempt=1,
+                backend_usage={"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+            )
+
+            rows = store.load_usage()
+            self.assertEqual(rows[-1]["id"], 8)
+            self.assertEqual(pipe.runner.usage_totals["calls"], 3)
+            self.assertEqual(pipe.runner.usage_totals["total_tokens"], 48)
+
+
 if __name__ == "__main__":
     unittest.main()

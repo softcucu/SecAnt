@@ -41,6 +41,7 @@ class Pipeline:
         self._stop = stop_event   # 可为 None,惰性创建(兼容 py3.8 在事件循环外构造)
         self.runner = AgentRunner(cfg, logger=self.log, usage_sink=self.record_usage,
                                   health_sink=self.record_health, agent_sink=self.record_agent)
+        self._restore_usage_counters()
         self.health_state: Dict[str, Dict[str, Any]] = {}   # model -> 最新健康记录
 
         # ── 运行状态(可被断点恢复) ──
@@ -94,6 +95,44 @@ class Pipeline:
         self._poc_lock: Optional[asyncio.Lock] = None  # 惰性创建(兼容 py3.8 在事件循环外构造)
 
     # ──────────────────────── 日志 / 事件 ────────────────────────
+    @staticmethod
+    def _usage_int(v: Any) -> int:
+        try:
+            return max(0, int(v))
+        except (TypeError, ValueError):
+            return 0
+
+    def _restore_usage_counters(self) -> None:
+        """续跑时从 usage.jsonl 恢复累计 token 统计,并避免新 usage id 从 1 重新开始。"""
+        if not self.cfg.resume:
+            return
+        try:
+            rows = self.store.load_usage()
+        except Exception:
+            return
+        if not rows:
+            return
+        totals = {
+            "calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "estimated_calls": 0,
+        }
+        max_id = 0
+        for rec in rows:
+            if not isinstance(rec, dict):
+                continue
+            totals["calls"] += 1
+            totals["input_tokens"] += self._usage_int(rec.get("input_tokens"))
+            totals["output_tokens"] += self._usage_int(rec.get("output_tokens"))
+            totals["total_tokens"] += self._usage_int(rec.get("total_tokens"))
+            if rec.get("estimated"):
+                totals["estimated_calls"] += 1
+            max_id = max(max_id, self._usage_int(rec.get("id")))
+        self.runner.usage_totals.update(totals)
+        self.runner.usage_count = max(self.runner.usage_count, max_id)
+
     def log(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
         print(f"[{ts}] {msg}", flush=True)
