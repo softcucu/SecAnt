@@ -246,7 +246,7 @@ async function viewNew() {
 // ──────────────────────── view: dashboard ────────────────────────
 function viewDashboard(runId) {
   app.innerHTML = "";
-  const S = { findings: new Map(), risks: new Map(), health: new Map(), agentMap: new Map(), candidateMap: new Map(), coverage: null, recon: null, log: [], usageRows: [], usage: emptyUsage(), manifest: null, meta: null, candidates: 0, status: "queued", round: 0, dry: 0, agents: 0, elapsed: 0 };
+  const S = { findings: new Map(), risks: new Map(), health: new Map(), agentMap: new Map(), candidateMap: new Map(), nonIssueMap: new Map(), coverage: null, recon: null, log: [], usageRows: [], usage: emptyUsage(), manifest: null, meta: null, candidates: 0, status: "queued", round: 0, dry: 0, agents: 0, elapsed: 0 };
   let activeTab = "findings";
   let agentOutputMode = localStorage.getItem("pvh.agentOutputMode") === "raw" ? "raw" : "pretty";
   const agentGroupStoreKey = `pvh.agentGroupsCollapsed:${runId}`;
@@ -328,11 +328,11 @@ function viewDashboard(runId) {
     header.append(stats);
   }
 
-  const TABS = [["findings", "漏洞"], ["candidates", "候选"], ["agents", "实时Agent"], ["health", "模型"], ["coverage", "攻击面覆盖"], ["history", "历史问题"], ["risks", "潜在风险点"], ["usage", "历史任务"], ["recon", "侦察"], ["activity", "活动"], ["exports", "导出"]];
+  const TABS = [["findings", "漏洞"], ["candidates", "候选"], ["nonissues", "非问题"], ["agents", "实时Agent"], ["health", "模型"], ["coverage", "攻击面覆盖"], ["history", "历史问题"], ["risks", "潜在风险点"], ["usage", "历史任务"], ["recon", "侦察"], ["activity", "活动"], ["exports", "导出"]];
   function renderTabs() {
     tabsBar.innerHTML = "";
     const activeAgents = [...S.agentMap.values()].filter(isAgentActive).length;
-    const counts = { findings: S.findings.size, candidates: S.candidateMap.size, risks: S.risks.size, usage: S.usageRows.length, health: S.health.size, agents: activeAgents, history: (S.recon?.history || []).length };
+    const counts = { findings: S.findings.size, candidates: S.candidateMap.size, nonissues: S.nonIssueMap.size, risks: S.risks.size, usage: S.usageRows.length, health: S.health.size, agents: activeAgents, history: (S.recon?.history || []).length };
     for (const [key, label] of TABS) {
       const t = el("div", { class: "tab" + (key === activeTab ? " active" : "") }, label);
       if (counts[key]) t.append(el("span", { class: "tabcount" }, String(counts[key])));
@@ -345,6 +345,7 @@ function viewDashboard(runId) {
     tabBody.innerHTML = "";
     if (activeTab === "findings") return renderFindings();
     if (activeTab === "candidates") return renderCandidates();
+    if (activeTab === "nonissues") return renderNonIssues();
     if (activeTab === "agents") return renderAgents();
     if (activeTab === "health") return renderModels();
     if (activeTab === "coverage") return renderCoverage();
@@ -399,20 +400,36 @@ function viewDashboard(runId) {
   function candKeyOf(d) {
     return d.key || `${(d.file || "").trim()}::${d.line || 0}::${(d.bug_class || "").trim().toLowerCase()}`;
   }
+  const CAND_FIELDS = ["title", "bug_class", "file", "line", "lens", "severity", "function", "description",
+    "source_to_sink", "variant_of", "confidence", "audit_model", "good_validation_ref"];
+  function mergeCandidateFields(c, d) {
+    for (const k of CAND_FIELDS) {
+      if (d[k] !== undefined && d[k] !== null && d[k] !== "") c[k] = d[k];
+    }
+    return c;
+  }
   function upsertCandidate(d) {
     const k = candKeyOf(d);
     const ex = S.candidateMap.get(k);
     if (ex) {
       // 仅补全字段,不覆盖已有状态(confirmed/rejected 优先级高于 pending)
-      ex.title = d.title || ex.title; ex.bug_class = d.bug_class || ex.bug_class;
-      ex.file = d.file || ex.file; ex.line = d.line || ex.line;
-      ex.lens = d.lens || ex.lens; ex.severity = d.severity || ex.severity;
-      ex.function = d.function || ex.function;
-      return ex;
+      return mergeCandidateFields(ex, d);
     }
-    const c = { key: k, status: "pending", title: d.title, bug_class: d.bug_class,
-      file: d.file, line: d.line, lens: d.lens, severity: d.severity, function: d.function || "", seq: S.candidateMap.size };
+    const c = { key: k, status: "pending", seq: S.candidateMap.size };
+    mergeCandidateFields(c, d);
+    c.function = c.function || "";
     S.candidateMap.set(k, c);
+    return c;
+  }
+  function upsertNonIssue(d) {
+    const c = upsertCandidate(d);
+    c.status = "rejected";
+    if (Array.isArray(d.votes)) c.votes = d.votes;
+    if (Array.isArray(d.verify_models)) c.verify_models = d.verify_models;
+    for (const k of ["rejection_reason", "vote_total", "vote_false", "vote_real"]) {
+      if (d[k] !== undefined && d[k] !== null && d[k] !== "") c[k] = d[k];
+    }
+    S.nonIssueMap.set(c.key, c);
     return c;
   }
   function renderCandidates() {
@@ -449,6 +466,73 @@ function viewDashboard(runId) {
     }
     tbl.append(tb);
     tabBody.append(el("div", { class: "panel" }, tbl));
+  }
+
+  function nonIssueVoteReason(v) {
+    return (v && (v.non_issue_reason || v.reasoning || v.reachability || v.controllability)) || "";
+  }
+  function detailLine(label, value, asMd = false) {
+    if (value === undefined || value === null || value === "") return null;
+    return el("div", { class: "detail-line" },
+      el("div", { class: "detail-label" }, label),
+      asMd ? el("div", { class: "detail-value md", html: mdToHtml(value) }) : el("div", { class: "detail-value" }, String(value)));
+  }
+  function renderVoteCard(v, idx) {
+    const isReal = !!v.is_real;
+    const meta = [v.model, v.verify_lens ? "视角 " + v.verify_lens : ""].filter(Boolean).join(" · ");
+    const reason = nonIssueVoteReason(v);
+    return el("div", { class: "vote-card " + (isReal ? "vote-real" : "vote-false") },
+      el("div", { class: "vote-head" },
+        el("strong", {}, `验证票 #${idx + 1}`),
+        el("span", { class: "pill " + (isReal ? "cand-confirmed" : "cand-rejected") }, isReal ? "仍认为是真问题" : "判定非问题"),
+        meta ? el("span", { class: "muted model-attr" }, meta) : null),
+      detailLine("可达性", v.reachability, true),
+      detailLine("可控性", v.controllability, true),
+      detailLine(isReal ? "保留问题依据" : "非问题原因", reason || "该验证票未记录详细原因", true),
+      detailLine("可利用性", v.exploitability, true));
+  }
+  function renderNonIssues() {
+    const list = [...S.nonIssueMap.values()];
+    tabBody.append(el("div", { class: "panel" },
+      el("div", { class: "row", style: "justify-content:space-between" },
+        el("strong", {}, "工具验证后的非问题"),
+        el("span", { class: "muted" }, `共 ${list.length}`)),
+      el("p", { class: "muted", style: "margin:6px 0 0;font-size:12px" },
+        "这里收集多票验证后被多数否决的候选点,保留原始疑似问题依据和最终非问题验证依据。")));
+    if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无已验证为非问题的候选。")); return; }
+    list.sort((a, b) =>
+      (SEVS.indexOf(a.severity || "info") - SEVS.indexOf(b.severity || "info")) ||
+      ((a.seq || 0) - (b.seq || 0)));
+    for (const c of list) {
+      const votes = Array.isArray(c.votes) ? c.votes : [];
+      const falseCount = c.vote_false ?? votes.filter(v => !v.is_real).length;
+      const total = c.vote_total ?? votes.length;
+      const verifyModels = Array.isArray(c.verify_models) ? c.verify_models : [];
+      const head = el("div", { class: "head" },
+        candPill("rejected"),
+        sevPill(c.severity || "none"),
+        el("span", { class: "title" }, c.title || c.key),
+        el("span", { class: "muted" }, c.bug_class || ""),
+        el("span", { class: "loc" }, `${c.file || ""}:${c.line || 0}`),
+        total ? el("span", { class: "muted model-attr" }, `非问题票 ${falseCount}/${total}`) : null);
+      const body = el("div", { class: "body md" },
+        el("h3", {}, "疑似问题候选原因"),
+        detailLine("描述", c.description || "旧事件未记录候选描述", true),
+        detailLine("声称的 source→sink", c.source_to_sink, true),
+        detailLine("变体来源", c.variant_of, true),
+        detailLine("正面对照", c.good_validation_ref, true),
+        detailLine("审计模型", c.audit_model),
+        detailLine("置信度", c.confidence),
+        el("h3", {}, "最终验证非问题原因"),
+        detailLine("多数结论", c.rejection_reason || (total ? `多数验证票判定为非问题(${falseCount}/${total})` : "旧事件未记录验证票详情"), true),
+        verifyModels.length ? detailLine("验证模型", verifyModels.join("、")) : null);
+      if (votes.length) {
+        body.append(el("div", { class: "vote-list" }, ...votes.map(renderVoteCard)));
+      }
+      const card = el("div", { class: "finding nonissue open" }, head, body);
+      head.addEventListener("click", () => card.classList.toggle("open"));
+      tabBody.append(card);
+    }
   }
 
   const HEALTH_TXT = { ok: "✅ 正常", down: "⛔ 不可达", degraded: "⚠️ 异常", checking: "⏳ 检查中", unknown: "· 未检查" };
@@ -1189,17 +1273,17 @@ function viewDashboard(runId) {
       case "finding_confirmed": {
         if (d.id && !S.findings.has(d.id)) { S.findings.set(d.id, d); flash("✔ 疑似漏洞 " + d.id + " [" + d.corrected_severity + "]"); }
         else if (d.id) S.findings.set(d.id, d);
-        const cc = S.candidateMap.get(candKeyOf(d)) || upsertCandidate(d);
+        const cc = upsertCandidate(d);
         cc.status = "confirmed"; cc.id = d.id; cc.severity = d.corrected_severity || cc.severity;
-        renderHeader(); renderTabs(); if (activeTab === "findings" || activeTab === "candidates") renderTab(); break;
+        S.nonIssueMap.delete(cc.key);
+        renderHeader(); renderTabs(); if (activeTab === "findings" || activeTab === "candidates" || activeTab === "nonissues") renderTab(); break;
       }
       case "finding_rejected": {
-        const cr = S.candidateMap.get(candKeyOf(d));
-        if (cr) cr.status = "rejected";
-        renderTabs(); if (activeTab === "candidates") renderTab(); break;
+        upsertNonIssue(d);
+        renderTabs(); if (activeTab === "candidates" || activeTab === "nonissues") renderTab(); break;
       }
       case "candidate_failed": {
-        const cf = S.candidateMap.get(candKeyOf(d)) || upsertCandidate(d);
+        const cf = upsertCandidate(d);
         cf.status = "verify_failed"; cf.reason = d.reason || ""; cf.attempts = d.attempts || cf.attempts;
         renderHeader(); renderTabs(); if (activeTab === "candidates") renderTab(); break;
       }

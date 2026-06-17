@@ -105,6 +105,7 @@ VERDICT_SCHEMA = {
         "controllability": {"type": "string"},
         "corrected_severity": {"type": "string", "enum": ["critical", "high", "medium", "low", "info"]},
         "exploitability": {"type": "string"},
+        "non_issue_reason": {"type": "string", "description": "当 is_real=false 时填写:最终验证为非问题的代码证据与原因"},
         "reasoning": {"type": "string"},
     },
 }

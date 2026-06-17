@@ -24,7 +24,7 @@ class FakeRunner:
         self.agent_count = 0
         self.usage_totals = {}
 
-    async def run(self, prompt, role=None, label=None, schema=None, fallback=None):
+    async def run(self, prompt, role=None, label=None, schema=None, fallback=None, **kwargs):
         if role == "verify":
             return self.verify_responses.pop(0) if self.verify_responses else None
         if role == "report":
@@ -39,8 +39,12 @@ def _finding(**over):
     return f
 
 
-def _vote(is_real, sev="high"):
-    return {"is_real": is_real, "corrected_severity": sev, "exploitability": "exploitable"}
+def _vote(is_real, sev="high", reasoning=None, non_issue_reason=None):
+    v = {"is_real": is_real, "corrected_severity": sev, "exploitability": "exploitable",
+         "reasoning": reasoning or ("反驳不掉" if is_real else "caller trace 证伪可达性")}
+    if non_issue_reason:
+        v["non_issue_reason"] = non_issue_reason
+    return v
 
 
 class _PipelineTestBase(unittest.IsolatedAsyncioTestCase):
@@ -84,8 +88,12 @@ class TestMajorityVote(_PipelineTestBase):
     async def test_majority_false_rejects(self):
         """3 票里 3 false → 多数否决 → 标记 rejected,不入 confirmed。"""
         p = self.make_pipeline(verify_votes=3)
-        p.runner.verify_responses = [_vote(False), _vote(False), _vote(False)]
-        f = _finding()
+        p.runner.verify_responses = [
+            _vote(False, non_issue_reason="入口已把长度夹紧到缓冲区容量以内"),
+            _vote(False),
+            _vote(False),
+        ]
+        f = _finding(description="候选声称长度可控导致溢出", source_to_sink="recv len -> copy")
         await p.process_finding(f)
 
         self.assertEqual(p.confirmed, [])
@@ -93,6 +101,13 @@ class TestMajorityVote(_PipelineTestBase):
         self.assertEqual(p.pending_findings, {})
         self.assertIn(EV.FINDING_REJECTED, self._event_types(p))
         self.assertNotIn(EV.CANDIDATE_FAILED, self._event_types(p))
+        payload = self._last_event(p, EV.FINDING_REJECTED)
+        self.assertEqual(payload["description"], "候选声称长度可控导致溢出")
+        self.assertEqual(payload["source_to_sink"], "recv len -> copy")
+        self.assertEqual(payload["vote_false"], 3)
+        self.assertEqual(len(payload["votes"]), 3)
+        self.assertTrue(payload["votes"][0]["verify_lens"].startswith("可达性"))
+        self.assertIn("入口已把长度夹紧", payload["rejection_reason"])
 
     async def test_tie_no_majority_is_not_a_rejection(self):
         """偶数票打平(1 real / 1 false)→ 既不确认也不否决 → 正常阶段回队重试。"""

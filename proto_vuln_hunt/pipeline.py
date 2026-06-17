@@ -661,13 +661,58 @@ class Pipeline:
         return len(tasks)
 
     # ──────────────────────── 逐发现流水线:验证→(PoC)→报告正文 ────────────────────────
-    def _candidate_failed_payload(self, f: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    @staticmethod
+    def _candidate_payload(f: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "key": finding_key(f), "title": f.get("title"), "bug_class": f.get("bug_class"),
             "file": f.get("file"), "line": f.get("line"), "lens": f.get("lens"),
             "severity": f.get("severity"), "function": f.get("function") or "",
+            "description": f.get("description") or "", "source_to_sink": f.get("source_to_sink") or "",
+            "variant_of": f.get("variant_of") or "", "confidence": f.get("confidence") or "",
+            "audit_model": f.get("audit_model") or "",
+            "good_validation_ref": f.get("good_validation_ref") or "",
+        }
+
+    def _candidate_failed_payload(self, f: Dict[str, Any], reason: str) -> Dict[str, Any]:
+        return {
+            **self._candidate_payload(f),
             "reason": reason, "attempts": int(f.get("verify_attempts") or 0),
             "final_sweep": self._in_final_failed_sweep,
+        }
+
+    def _candidate_rejected_payload(self, f: Dict[str, Any], votes: List[Dict[str, Any]]) -> Dict[str, Any]:
+        false_votes = [v for v in votes if not v.get("is_real")]
+        reason_bits = []
+        for v in false_votes:
+            r = (v.get("non_issue_reason") or v.get("reasoning") or "").strip()
+            if r and r not in reason_bits:
+                reason_bits.append(r)
+        total = len(votes)
+        false_count = len(false_votes)
+        summary = f"多数验证票判定为非问题({false_count}/{total})"
+        if reason_bits:
+            summary += ": " + " / ".join(reason_bits)
+        slim_votes = [{
+            "model": v.get("model") or "",
+            "verify_lens": v.get("verify_lens") or "",
+            "is_real": bool(v.get("is_real")),
+            "reachability": v.get("reachability") or "",
+            "controllability": v.get("controllability") or "",
+            "corrected_severity": v.get("corrected_severity") or "",
+            "exploitability": v.get("exploitability") or "",
+            "reasoning": v.get("reasoning") or "",
+            "non_issue_reason": v.get("non_issue_reason") or "",
+        } for v in votes]
+        verify_models = sorted({v["model"] for v in slim_votes if v.get("model")})
+        return {
+            **self._candidate_payload(f),
+            "status": "rejected",
+            "votes": slim_votes,
+            "verify_models": verify_models,
+            "vote_total": total,
+            "vote_false": false_count,
+            "vote_real": total - false_count,
+            "rejection_reason": summary,
         }
 
     @staticmethod
@@ -720,6 +765,7 @@ class Pipeline:
                     continue
                 if vote_metas[i].get("model"):
                     v["model"] = vote_metas[i]["model"]
+                v["verify_lens"] = lenses[i]
                 votes.append(v)
             required_votes = max(1, -(-self.cfg.verify_votes // 2))
             if len(votes) < required_votes:
@@ -734,7 +780,7 @@ class Pipeline:
                     return
                 self.processed_keys.add(k)
                 self.pending_findings.pop(k, None)
-                self.emit(EV.FINDING_REJECTED, {"key": k, "title": f.get("title"), "bug_class": f.get("bug_class")})
+                self.emit(EV.FINDING_REJECTED, self._candidate_rejected_payload(f, votes))
                 return
 
             corrected = most_severe([v.get("corrected_severity") for v in votes]) or f.get("severity")
@@ -1348,9 +1394,8 @@ class Pipeline:
             item["newThisRound"] = item.get("newThisRound", 0) + 1
             rec["candidates"] = rec.get("candidates", 0) + 1
             self.pending_findings[fk] = f
-            self.emit(EV.CANDIDATE_FOUND, {"key": fk, "title": f.get("title"), "bug_class": f.get("bug_class"),
-                                           "file": f.get("file"), "line": f.get("line"), "lens": lens_key,
-                                           "severity": f.get("severity"), "function": f.get("function") or ""})
+            f["lens"] = lens_key
+            self.emit(EV.CANDIDATE_FOUND, self._candidate_payload(f))
             self._enqueue_finding(f)
         for s in (res.get("new_surfaces") or []):
             sk = (s.get("name") or "").strip().lower()
