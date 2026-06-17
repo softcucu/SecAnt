@@ -721,13 +721,22 @@ class Pipeline:
         except Exception:
             pass
 
-    def _candidate_failed_payload(self, f: Dict[str, Any], reason: str) -> Dict[str, Any]:
-        return {
+    def _candidate_failed_payload(self, f: Dict[str, Any], reason: str,
+                                  votes: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        payload = {
             **self._candidate_payload(f),
             "status": "verify_failed",
             "reason": reason, "attempts": int(f.get("verify_attempts") or 0),
             "final_sweep": self._in_final_failed_sweep,
         }
+        if votes:
+            payload["votes"] = self._slim_verify_votes(votes)
+            valid = [v for v in votes if v.get("phase") == "judge" and v.get("validation_ok", True)]
+            payload["vote_total"] = len(valid)
+            payload["vote_real"] = sum(1 for v in valid if self._vote_decision(v) == "confirm")
+            payload["vote_false"] = sum(1 for v in valid if self._vote_decision(v) == "reject")
+            payload["verify_models"] = sorted({v.get("model") for v in votes if v.get("model")})
+        return payload
 
     def _candidate_rejected_payload(self, f: Dict[str, Any], votes: List[Dict[str, Any]]) -> Dict[str, Any]:
         judge_votes = [v for v in votes if v.get("phase") == "judge" and v.get("validation_ok", True)]
@@ -746,7 +755,21 @@ class Pipeline:
         summary = f"多数裁决票判定为非问题({false_count}/{total})"
         if reason_bits:
             summary += ": " + " / ".join(reason_bits)
-        slim_votes = [{
+        slim_votes = self._slim_verify_votes(votes)
+        verify_models = sorted({v["model"] for v in slim_votes if v.get("model")})
+        return {
+            **self._candidate_payload(f),
+            "status": "rejected",
+            "votes": slim_votes,
+            "verify_models": verify_models,
+            "vote_total": total,
+            "vote_false": false_count,
+            "vote_real": total - false_count,
+            "rejection_reason": summary,
+        }
+
+    def _slim_verify_votes(self, votes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [{
             "phase": v.get("phase") or "",
             "model": v.get("model") or "",
             "verify_lens": v.get("verify_lens") or "",
@@ -767,17 +790,6 @@ class Pipeline:
             "reasoning": v.get("reasoning") or "",
             "non_issue_reason": v.get("non_issue_reason") or "",
         } for v in votes]
-        verify_models = sorted({v["model"] for v in slim_votes if v.get("model")})
-        return {
-            **self._candidate_payload(f),
-            "status": "rejected",
-            "votes": slim_votes,
-            "verify_models": verify_models,
-            "vote_total": total,
-            "vote_false": false_count,
-            "vote_real": total - false_count,
-            "rejection_reason": summary,
-        }
 
     @staticmethod
     def _text(v: Any) -> str:
@@ -901,7 +913,8 @@ class Pipeline:
         f["verify_attempts"] = 0
         f.pop("verify_failure_reason", None)
 
-    def _handle_candidate_verify_failure(self, f: Dict[str, Any], reason: str) -> None:
+    def _handle_candidate_verify_failure(self, f: Dict[str, Any], reason: str,
+                                         votes: Optional[List[Dict[str, Any]]] = None) -> None:
         k = finding_key(f)
         self.pending_findings[k] = f
         self.dedup_keys.add(k)
@@ -913,6 +926,9 @@ class Pipeline:
             f["verify_status"] = "pending"
             payload = {**self._candidate_payload(f), "status": "pending",
                        "reason": reason, "attempts": attempts}
+            if votes:
+                payload["votes"] = self._slim_verify_votes(votes)
+                payload["verify_models"] = sorted({v.get("model") for v in votes if v.get("model")})
             self._save_candidate_state(payload)
             self._enqueue_finding(f)
             self.log(f"候选 {k} 验证失败({reason}),第 {attempts} 次失败后放回验证队列"
@@ -921,7 +937,7 @@ class Pipeline:
             return
 
         f["verify_status"] = "verify_failed"
-        payload = self._candidate_failed_payload(f, reason)
+        payload = self._candidate_failed_payload(f, reason, votes)
         self._save_candidate_state(payload)
         self.emit(EV.CANDIDATE_FAILED, payload)
         self.log(f"候选 {k} 验证失败({reason}),标记为 verify_failed"
@@ -972,6 +988,7 @@ class Pipeline:
                     f,
                     "正反举证均无合格证据"
                     f"(正方:{';'.join(proof_errors)};反方:{';'.join(disproof_errors)})",
+                    votes,
                 )
                 return
 
@@ -1014,6 +1031,7 @@ class Pipeline:
                     f,
                     f"有效裁决票不足({len(valid_judges)}/{self.cfg.verify_votes})"
                     + (f":{detail}" if detail else ""),
+                    votes,
                 )
                 return
             real = sum(1 for v in valid_judges if self._vote_decision(v) == "confirm")
@@ -1021,7 +1039,7 @@ class Pipeline:
             majority = len(valid_judges) // 2 + 1
             if real < majority:
                 if false < majority:
-                    self._handle_candidate_verify_failure(f, "裁决票未形成多数")
+                    self._handle_candidate_verify_failure(f, "裁决票未形成多数", votes)
                     return
                 self.processed_keys.add(k)
                 self.pending_findings.pop(k, None)

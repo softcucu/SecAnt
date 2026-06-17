@@ -140,6 +140,39 @@ def render_risks_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
 
 
 # ──────────────────────── finding/<id>.md ────────────────────────
+def _render_verify_votes_md(votes: List[Dict[str, Any]]) -> str:
+    if not votes:
+        return ""
+    rows = ["\n\n## 对抗验证记录\n"]
+    for i, v in enumerate(votes, 1):
+        phase = v.get("phase") or "verify"
+        decision = v.get("decision") or ("confirm" if v.get("is_real") else "reject")
+        valid = "合格" if v.get("validation_ok", True) else f"无效: {v.get('validation_reason') or '未通过证据门槛'}"
+        meta = " / ".join(x for x in [phase, decision, v.get("verify_lens") or "", v.get("model") or ""] if x)
+        rows.append(f"\n### 验证记录 {i}: {meta}\n\n")
+        rows.append(f"- 证据有效性: {valid}\n")
+        if v.get("verdict_confidence"):
+            rows.append(f"- 置信度: {v.get('verdict_confidence')}\n")
+        if v.get("evidence_refs"):
+            rows.append(f"- 代码证据:\n{_as_md(v.get('evidence_refs'))}\n")
+        if v.get("source_chain"):
+            rows.append(f"- 调用链:\n{_as_md(v.get('source_chain'))}\n")
+        if v.get("sink_ref"):
+            rows.append(f"- Sink: {_nl(str(v.get('sink_ref')))}\n")
+        if v.get("clearing_checks"):
+            rows.append(f"- 证伪点:\n{_as_md(v.get('clearing_checks'))}\n")
+        if v.get("reachability"):
+            rows.append(f"- 可达性: {_nl(str(v.get('reachability')))}\n")
+        if v.get("controllability"):
+            rows.append(f"- 可控性: {_nl(str(v.get('controllability')))}\n")
+        reason = v.get("non_issue_reason") or v.get("reasoning")
+        if reason:
+            rows.append(f"- 理由: {_nl(str(reason))}\n")
+        if v.get("missing_evidence"):
+            rows.append(f"- 缺失证据: {_nl(str(v.get('missing_evidence')))}\n")
+    return "".join(rows)
+
+
 def render_finding_md(finding: Dict[str, Any]) -> str:
     fm = {
         "id": finding.get("id"), "title": finding.get("title"), "bug_class": finding.get("bug_class"),
@@ -154,6 +187,7 @@ def render_finding_md(finding: Dict[str, Any]) -> str:
         poc = finding.get("poc")
         body = (f"## ① 漏洞描述\n{finding.get('description') or finding.get('title')}\n\n"
                 f"## ⑦ PoC / 验证结果\n{json.dumps(poc, ensure_ascii=False) if poc else '(无)'}\n")
+    body += _render_verify_votes_md(finding.get("votes") or [])
     return f"---\n{fm_lines}\n---\n\n{body}\n"
 
 
