@@ -673,9 +673,16 @@ class Pipeline:
             "good_validation_ref": f.get("good_validation_ref") or "",
         }
 
+    def _save_candidate_state(self, rec: Dict[str, Any]) -> None:
+        try:
+            self.store.save_candidate(rec)
+        except Exception:
+            pass
+
     def _candidate_failed_payload(self, f: Dict[str, Any], reason: str) -> Dict[str, Any]:
         return {
             **self._candidate_payload(f),
+            "status": "verify_failed",
             "reason": reason, "attempts": int(f.get("verify_attempts") or 0),
             "final_sweep": self._in_final_failed_sweep,
         }
@@ -731,6 +738,9 @@ class Pipeline:
 
         if not self._in_final_failed_sweep and attempts <= max(0, int(self.cfg.retry.max_attempts)):
             f["verify_status"] = "pending"
+            payload = {**self._candidate_payload(f), "status": "pending",
+                       "reason": reason, "attempts": attempts}
+            self._save_candidate_state(payload)
             self._enqueue_finding(f)
             self.log(f"候选 {k} 验证失败({reason}),第 {attempts} 次失败后放回验证队列"
                      f"(重试上限 {self.cfg.retry.max_attempts})")
@@ -738,7 +748,9 @@ class Pipeline:
             return
 
         f["verify_status"] = "verify_failed"
-        self.emit(EV.CANDIDATE_FAILED, self._candidate_failed_payload(f, reason))
+        payload = self._candidate_failed_payload(f, reason)
+        self._save_candidate_state(payload)
+        self.emit(EV.CANDIDATE_FAILED, payload)
         self.log(f"候选 {k} 验证失败({reason}),标记为 verify_failed"
                  f"{'(最终补跑)' if self._in_final_failed_sweep else ''}")
         self.checkpoint(self.round)
@@ -780,7 +792,9 @@ class Pipeline:
                     return
                 self.processed_keys.add(k)
                 self.pending_findings.pop(k, None)
-                self.emit(EV.FINDING_REJECTED, self._candidate_rejected_payload(f, votes))
+                payload = self._candidate_rejected_payload(f, votes)
+                self._save_candidate_state(payload)
+                self.emit(EV.FINDING_REJECTED, payload)
                 return
 
             corrected = most_severe([v.get("corrected_severity") for v in votes]) or f.get("severity")
@@ -806,6 +820,10 @@ class Pipeline:
             self.store.save_finding(rec)            # 流式:确认即写 findings/<id>.json(写一次即终态)
             self.processed_keys.add(k)
             self.pending_findings.pop(k, None)
+            cand = {**self._candidate_payload(rec), "status": "confirmed", "id": fid,
+                    "severity": corrected, "corrected_severity": corrected,
+                    "verify_models": verify_models}
+            self._save_candidate_state(cand)
             self.emit(EV.FINDING_CONFIRMED, slim_finding(rec))
             self.log(f"✔ 确认漏洞 {fid} [{corrected}] {rec.get('title')} (累计 {len(self.confirmed)})")
         except Exception as e:  # noqa: BLE001
@@ -1395,7 +1413,9 @@ class Pipeline:
             rec["candidates"] = rec.get("candidates", 0) + 1
             self.pending_findings[fk] = f
             f["lens"] = lens_key
-            self.emit(EV.CANDIDATE_FOUND, self._candidate_payload(f))
+            payload = {**self._candidate_payload(f), "status": "pending"}
+            self._save_candidate_state(payload)
+            self.emit(EV.CANDIDATE_FOUND, payload)
             self._enqueue_finding(f)
         for s in (res.get("new_surfaces") or []):
             sk = (s.get("name") or "").strip().lower()

@@ -13,6 +13,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from . import exporters
+from . import events as EV
 from .common import finalize_findings, slim_finding
 from .config import ALL_LENSES, DEFAULT_BACKENDS, ROLES, Config, load_config
 from .events import EventBus
@@ -175,6 +176,86 @@ def _sse(ev: Dict[str, Any]) -> str:
     return f"id: {ev['seq']}\nevent: {ev['type']}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
 
 
+def _candidate_key(d: Dict[str, Any]) -> str:
+    return d.get("key") or f"{(d.get('file') or '').strip()}::{d.get('line') or 0}::{(d.get('bug_class') or '').strip().lower()}"
+
+
+def _merge_candidate(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
+    fields = [
+        "title", "bug_class", "file", "line", "lens", "severity", "function", "description",
+        "source_to_sink", "variant_of", "confidence", "audit_model", "good_validation_ref",
+        "id", "corrected_severity", "reason", "attempts", "final_sweep", "votes",
+        "verify_models", "vote_total", "vote_false", "vote_real", "rejection_reason",
+    ]
+    for k in fields:
+        v = src.get(k)
+        if v not in (None, ""):
+            dst[k] = v
+    return dst
+
+
+def _candidate_snapshot_from_events(store: RunStore) -> List[Dict[str, Any]]:
+    """旧 run 兼容:只重放候选相关事件,迁移成 candidates/*.json 后续直接读结构化态。"""
+    rank = {"pending": 0, "verify_failed": 1, "confirmed": 2, "rejected": 3}
+    candidates: Dict[str, Dict[str, Any]] = {}
+    for ev in store.read_events(0):
+        et = ev.get("type")
+        if et not in (EV.CANDIDATE_FOUND, EV.FINDING_CONFIRMED, EV.FINDING_REJECTED, EV.CANDIDATE_FAILED):
+            continue
+        d = ev.get("data") or {}
+        k = _candidate_key(d)
+        if not k:
+            continue
+        c = candidates.get(k) or {"key": k, "status": "pending", "seq": len(candidates)}
+        _merge_candidate(c, d)
+        if et == EV.CANDIDATE_FOUND:
+            c["status"] = c.get("status") or "pending"
+        elif et == EV.FINDING_CONFIRMED:
+            c["status"] = "confirmed"
+            c["id"] = d.get("id") or c.get("id")
+            c["severity"] = d.get("corrected_severity") or c.get("severity")
+        elif et == EV.FINDING_REJECTED:
+            c["status"] = "rejected"
+        elif et == EV.CANDIDATE_FAILED:
+            c["status"] = "verify_failed"
+        candidates[k] = c
+    out = sorted(candidates.values(), key=lambda c: (rank.get(c.get("status"), 9), int(c.get("seq") or 0)))
+    for c in out:
+        store.save_candidate(c)
+    return out
+
+
+def _dashboard_snapshot(store: RunStore, running: bool, last_seq: int) -> Dict[str, Any]:
+    manifest = store.load_manifest() or {}
+    manifest["running"] = running
+    asf = store.load_attack_surface()
+    regions = asf.get("regions") or (store.load_recon() or {}).get("regions") or []
+    candidates = store.load_candidates()
+    summary = manifest.get("summary") or {}
+    try:
+        candidate_total = int(summary.get("candidates") or 0)
+    except (TypeError, ValueError):
+        candidate_total = 0
+    if not candidates and candidate_total > 0:
+        candidates = _candidate_snapshot_from_events(store)
+    health = store.load_health()
+    health["running"] = running
+    return {
+        "last_seq": last_seq,
+        "round": asf.get("round") or (store.load_checkpoint() or {}).get("round") or 0,
+        "manifest": manifest,
+        "findings": [slim_finding(c) for c in finalize_findings(store.load_findings())],
+        "candidates": candidates,
+        "nonissues": [c for c in candidates if c.get("status") == "rejected"],
+        "risks": store.load_risks(),
+        "coverage": {"ledger": asf.get("ledger") or [], "surfaces": asf.get("surfaces") or [],
+                     "regions": regions, "progress": asf.get("progress") or {"done": 0, "clean": 0, "total": 0}},
+        "recon": store.load_recon(),
+        "health": health,
+        "usage": store.load_usage(),
+    }
+
+
 def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Optional[Dict[str, Any]] = None):
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
@@ -238,6 +319,14 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
         m = store.load_manifest() or {}
         m["running"] = manager.is_running(run_id)
         return m
+
+    @app.get("/api/runs/{run_id}/snapshot")
+    async def dashboard_snapshot(run_id: str):
+        store = _store_or_404(run_id)
+        running = manager.is_running(run_id)
+        bus = manager.get_bus(run_id) if running else None
+        last_seq = bus.last_seq if bus else 0
+        return _dashboard_snapshot(store, running, last_seq)
 
     @app.post("/api/runs/{run_id}/stop")
     async def stop_run(run_id: str):

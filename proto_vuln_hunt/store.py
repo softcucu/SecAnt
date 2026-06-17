@@ -4,6 +4,7 @@
   checkpoint.json      —— 运行时机制态(round/seq/processed/pending/dedup…),高频小幅刷
   recon.json           —— 纯静态侦察认知(用途/威胁/仓库知识/build_hint/初始攻击面/历史模式),写一次
   attack-surface.json  —— 攻击面(初始+动态)+ 覆盖台账 + progress,每轮整体快照(状态持续演变)
+  candidates/<hash>.json —— 每条候选/非问题的当前状态(候选、已确认、已否决、验证失败)
   findings/<id>.json   —— 每条确认漏洞一个文件,确认即写、写一次即终态
   risks/<id>.json      —— 每条风险一个文件,登记即写、写一次即终态
   usage.jsonl          —— 每次 agent 调用的 token 使用记录(真实 usage 或轻量估算)
@@ -19,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import hashlib
 import time
 from typing import Any, Dict, List, Optional
 
@@ -70,6 +72,10 @@ class RunStore:
         return os.path.join(self.dir, "findings")
 
     @property
+    def candidates_dir(self) -> str:              # 候选/非问题当前态:按 key 哈希成文件名
+        return os.path.join(self.dir, "candidates")
+
+    @property
     def risks_dir(self) -> str:                  # 每条风险一个 <id>.json(写一次即终态)
         return os.path.join(self.dir, "risks")
 
@@ -80,6 +86,10 @@ class RunStore:
     @property
     def events_path(self) -> str:
         return os.path.join(self.dir, "events.jsonl")
+
+    @property
+    def event_seq_path(self) -> str:
+        return os.path.join(self.dir, "event-seq.txt")
 
     @property
     def usage_path(self) -> str:
@@ -219,6 +229,29 @@ class RunStore:
             return out
         return (self._legacy_combined() or {}).get("confirmed", [])
 
+    # candidates:候选 / 已确认 / 已否决 / 验证失败的当前态
+    @staticmethod
+    def _candidate_file_id(key: str) -> str:
+        return hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()
+
+    def save_candidate(self, rec: Dict[str, Any]) -> None:
+        key = rec.get("key")
+        if not key:
+            return
+        os.makedirs(self.candidates_dir, exist_ok=True)
+        path = os.path.join(self.candidates_dir, f"{self._candidate_file_id(str(key))}.json")
+        _atomic_write(path, json.dumps(rec, ensure_ascii=False, indent=2))
+
+    def load_candidates(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        if os.path.isdir(self.candidates_dir):
+            for fn in sorted(os.listdir(self.candidates_dir)):
+                if fn.endswith(".json"):
+                    d = self._read_json(os.path.join(self.candidates_dir, fn))
+                    if d:
+                        out.append(d)
+        return out
+
     # risks:每条风险一个文件
     def save_risk(self, rec: Dict[str, Any]) -> None:
         if not rec.get("id"):
@@ -303,10 +336,20 @@ class RunStore:
         os.makedirs(self.dir, exist_ok=True)
         with open(self.events_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        try:
+            with open(self.event_seq_path, "w", encoding="utf-8") as f:
+                f.write(str(int(ev.get("seq", 0) or 0)))
+        except Exception:
+            pass
 
     def last_event_seq(self) -> int:
         """已落盘事件里的最大 seq(0 表示无)。续跑时用来让 EventBus 的 seq 单调续接,
         避免重号导致 SSE `seq>sent` 把续跑后的所有事件过滤掉。"""
+        try:
+            with open(self.event_seq_path, "r", encoding="utf-8") as f:
+                return max(0, int((f.read() or "0").strip() or "0"))
+        except Exception:
+            pass
         last = 0
         if not os.path.isfile(self.events_path):
             return last
@@ -321,6 +364,12 @@ class RunStore:
                     continue
                 if seq > last:
                     last = seq
+        if last:
+            try:
+                with open(self.event_seq_path, "w", encoding="utf-8") as f:
+                    f.write(str(last))
+            except Exception:
+                pass
         return last
 
     def read_events(self, after_seq: int = 0) -> List[Dict[str, Any]]:

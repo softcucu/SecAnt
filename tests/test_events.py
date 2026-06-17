@@ -1,10 +1,13 @@
 import asyncio
+import tempfile
 import unittest
 
 from proto_vuln_hunt import events as EV
 from proto_vuln_hunt.events import EventBus
 from proto_vuln_hunt.pipeline import Pipeline
 from proto_vuln_hunt.config import Config
+from proto_vuln_hunt.server import _candidate_snapshot_from_events
+from proto_vuln_hunt.store import RunStore
 
 
 class EventBusPersistTests(unittest.TestCase):
@@ -34,6 +37,12 @@ class EventBusPersistTests(unittest.TestCase):
         ev = bus.emit(EV.ROUND_START, {"round": 9})
         self.assertEqual(ev["seq"], 5001)
         self.assertGreater(bus.last_seq, 5000)
+
+    def test_run_store_tracks_last_event_seq(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = RunStore(td).ensure()
+            store.append_event({"seq": 7, "ts": 0, "type": EV.LOG, "data": {}})
+            self.assertEqual(store.last_event_seq(), 7)
 
     def test_start_seq_respects_higher_backlog_tail(self):
         # start_seq 与 backlog 尾部取较大者,二者都给时不回退。
@@ -82,6 +91,28 @@ class RecordAgentWiringTests(unittest.TestCase):
         # AGENT_UPDATE 持久化,且跟一条 METRICS
         self.assertIn((EV.AGENT_UPDATE, True), captured)
         self.assertTrue(any(etype == EV.METRICS for etype, _ in captured))
+
+
+class SnapshotMigrationTests(unittest.TestCase):
+    def test_legacy_events_migrate_rejected_candidate(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = RunStore(td).ensure()
+            store.append_event({"seq": 1, "ts": 0, "type": EV.CANDIDATE_FOUND, "data": {
+                "key": "a.c::10::memory", "title": "t", "bug_class": "memory",
+                "file": "a.c", "line": 10, "severity": "high",
+                "description": "candidate reason",
+            }})
+            store.append_event({"seq": 2, "ts": 0, "type": EV.FINDING_REJECTED, "data": {
+                "key": "a.c::10::memory", "title": "t", "bug_class": "memory",
+                "vote_false": 2, "vote_total": 3, "rejection_reason": "多数验证票判定为非问题",
+                "votes": [{"is_real": False, "reasoning": "已被上游夹紧"}],
+            }})
+
+            cands = _candidate_snapshot_from_events(store)
+            self.assertEqual(len(cands), 1)
+            self.assertEqual(cands[0]["status"], "rejected")
+            self.assertEqual(cands[0]["vote_false"], 2)
+            self.assertEqual(store.load_candidates()[0]["status"], "rejected")
 
 
 if __name__ == "__main__":

@@ -246,7 +246,7 @@ async function viewNew() {
 // ──────────────────────── view: dashboard ────────────────────────
 function viewDashboard(runId) {
   app.innerHTML = "";
-  const S = { findings: new Map(), risks: new Map(), health: new Map(), agentMap: new Map(), candidateMap: new Map(), nonIssueMap: new Map(), coverage: null, recon: null, log: [], usageRows: [], usage: emptyUsage(), manifest: null, meta: null, candidates: 0, status: "queued", round: 0, dry: 0, agents: 0, elapsed: 0 };
+  const S = { findings: new Map(), risks: new Map(), health: new Map(), agentMap: new Map(), candidateMap: new Map(), nonIssueMap: new Map(), coverage: null, recon: null, log: [], usageRows: [], usageIds: new Set(), usage: emptyUsage(), manifest: null, meta: null, candidates: 0, status: "queued", round: 0, dry: 0, agents: 0, elapsed: 0 };
   let activeTab = "findings";
   let agentOutputMode = localStorage.getItem("pvh.agentOutputMode") === "raw" ? "raw" : "pretty";
   const agentGroupStoreKey = `pvh.agentGroupsCollapsed:${runId}`;
@@ -268,7 +268,7 @@ function viewDashboard(runId) {
   app.append(header, tabsBar, tabBody);
 
   async function stop() { try { await api("POST", `/api/runs/${encodeURIComponent(runId)}/stop`); flash("已请求停止"); } catch (e) { flash(e.message); } }
-  async function resume() { try { const r = await api("POST", `/api/runs/${encodeURIComponent(runId)}/resume`); flash(r.ok ? "已续跑" : "无法续跑(可能正在运行)"); } catch (e) { flash(e.message); } }
+  async function resume() { try { const r = await api("POST", `/api/runs/${encodeURIComponent(runId)}/resume`); flash(r.ok ? "已续跑" : "无法续跑(可能正在运行)"); if (r.ok) boot(); } catch (e) { flash(e.message); } }
 
   function finiteNumber(v) {
     const n = Number(v);
@@ -1267,9 +1267,9 @@ function viewDashboard(runId) {
     switch (ev.type) {
       case "run_status": setRunStatus(d.status); renderHeader(); break;
       case "metrics": applyMetrics(d); renderHeader(); break;
-      case "usage": { const u = cleanUsage(d); S.usageRows.push(u); addUsage(S.usage, u); renderHeader(); renderTabs(); if (activeTab === "usage") renderTab(); break; }
+      case "usage": { const u = cleanUsage(d); const uid = u.id == null ? "" : String(u.id); if (uid && S.usageIds.has(uid)) break; if (uid) S.usageIds.add(uid); S.usageRows.push(u); addUsage(S.usage, u); renderHeader(); renderTabs(); if (activeTab === "usage") renderTab(); break; }
       case "agent_update": applyAgentUpdate(d); renderHeader(); renderTabs(); if (activeTab === "agents") renderTab(); break;
-      case "candidate_found": S.candidates++; upsertCandidate(d); renderHeader(); renderTabs(); if (activeTab === "candidates") renderTab(); break;
+      case "candidate_found": { const existed = S.candidateMap.has(candKeyOf(d)); upsertCandidate(d); if (!existed) S.candidates++; renderHeader(); renderTabs(); if (activeTab === "candidates") renderTab(); break; }
       case "finding_confirmed": {
         if (d.id && !S.findings.has(d.id)) { S.findings.set(d.id, d); flash("✔ 疑似漏洞 " + d.id + " [" + d.corrected_severity + "]"); }
         else if (d.id) S.findings.set(d.id, d);
@@ -1318,20 +1318,62 @@ function viewDashboard(runId) {
   async function fetchHealth() { try { const h = await api("GET", `/api/runs/${encodeURIComponent(runId)}/health`); for (const r of (h.models || [])) if (r.model) S.health.set(r.model, r); renderTabs(); if (activeTab === "health") renderTab(); } catch (e) {} }
   async function fetchMeta() { try { S.meta = await api("GET", "/api/meta"); if (activeTab === "health") renderTab(); } catch (e) {} }
 
+  function applySnapshot(snap) {
+    if (!snap) return 0;
+    S.manifest = snap.manifest || S.manifest || {};
+    S.findings.clear();
+    for (const f of (snap.findings || [])) if (f.id) S.findings.set(f.id, f);
+    S.candidateMap.clear();
+    S.nonIssueMap.clear();
+    for (const c of (snap.candidates || [])) {
+      const k = candKeyOf(c);
+      const rec = Object.assign({ key: k, seq: S.candidateMap.size }, c, { key: k });
+      S.candidateMap.set(k, rec);
+      if (rec.status === "rejected") S.nonIssueMap.set(k, rec);
+    }
+    for (const c of (snap.nonissues || [])) {
+      const k = candKeyOf(c);
+      const rec = S.candidateMap.get(k) || Object.assign({ key: k, seq: S.candidateMap.size }, c, { key: k });
+      rec.status = "rejected";
+      mergeCandidateFields(rec, c);
+      if (Array.isArray(c.votes)) rec.votes = c.votes;
+      if (Array.isArray(c.verify_models)) rec.verify_models = c.verify_models;
+      for (const k2 of ["rejection_reason", "vote_total", "vote_false", "vote_real"]) if (c[k2] != null) rec[k2] = c[k2];
+      S.candidateMap.set(k, rec);
+      S.nonIssueMap.set(k, rec);
+    }
+    S.risks.clear();
+    for (const r of (snap.risks || [])) S.risks.set((r.area || "") + "::" + (r.file || ""), r);
+    S.health.clear();
+    for (const h of ((snap.health || {}).models || [])) if (h.model) S.health.set(h.model, h);
+    S.coverage = snap.coverage || null;
+    S.recon = snap.recon || null;
+    S.usageRows = (snap.usage || []).map(cleanUsage);
+    S.usageIds = new Set(S.usageRows.map(u => u.id == null ? "" : String(u.id)).filter(Boolean));
+    Object.assign(S.usage, emptyUsage());
+    for (const u of S.usageRows) addUsage(S.usage, u);
+    applyMetrics((S.manifest && S.manifest.summary) || {});
+    if (S.candidates == null || S.candidates === 0) S.candidates = S.candidateMap.size;
+    S.round = snap.round ?? S.round;
+    setRunStatus(S.manifest.running ? "running" : S.manifest.status);
+    return Number(snap.last_seq || 0);
+  }
+
   async function boot() {
+    let lastSeq = 0;
     try {
-      S.manifest = await api("GET", `/api/runs/${encodeURIComponent(runId)}`);
-      applyMetrics(S.manifest.summary || {});
-      setRunStatus(S.manifest.running ? "running" : S.manifest.status);
+      lastSeq = applySnapshot(await api("GET", `/api/runs/${encodeURIComponent(runId)}/snapshot`));
     } catch (e) {}
     renderHeader(); renderTabs(); renderTab();
-    fetchRecon(); fetchHealth(); fetchCoverage(); fetchRisks(); fetchMeta();
+    fetchMeta();
     if (window._pvhElapsedTimer) clearInterval(window._pvhElapsedTimer);
     window._pvhElapsedTimer = setInterval(() => {
       if (isRunClockActive()) renderHeader();
     }, 1000);
-    // SSE:从 seq 0 重放历史事件(重建 findings/coverage/risks/log)再接实时;EventSource 断线自动带 Last-Event-ID 续传
-    const es = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events`);
+    if (window._es) try { window._es.close(); } catch (_) {}
+    if (!(S.manifest && S.manifest.running)) return;
+    // 首屏由 snapshot 提供完整关键数据;SSE 只接 snapshot 之后的新事件。
+    const es = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events?last_id=${encodeURIComponent(lastSeq)}`);
     window._es = es;
     const TYPES = ["run_status", "metrics", "usage", "agent_update", "candidate_found", "finding_confirmed", "finding_rejected", "candidate_failed", "risk_added", "recheck_enqueued", "recheck_done", "risk_severity_changed", "surface_added", "coverage_update", "round_start", "round_done", "recon_done", "history_added", "run_done", "log", "decompose_done", "poc_done", "error", "model_health", "health_check_start", "health_check_done", "config_updated"];
     for (const t of TYPES) es.addEventListener(t, (e) => { try { applyEvent(JSON.parse(e.data)); } catch (_) {} });

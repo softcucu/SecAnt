@@ -84,6 +84,10 @@ class TestMajorityVote(_PipelineTestBase):
         self.assertIn(finding_key(f), p.processed_keys)
         self.assertEqual(p.pending_findings, {})
         self.assertIn(EV.FINDING_CONFIRMED, self._event_types(p))
+        cands = p.store.load_candidates()
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0]["status"], "confirmed")
+        self.assertEqual(cands[0]["id"], "MEM-001")
 
     async def test_majority_false_rejects(self):
         """3 票里 3 false → 多数否决 → 标记 rejected,不入 confirmed。"""
@@ -108,6 +112,10 @@ class TestMajorityVote(_PipelineTestBase):
         self.assertEqual(len(payload["votes"]), 3)
         self.assertTrue(payload["votes"][0]["verify_lens"].startswith("可达性"))
         self.assertIn("入口已把长度夹紧", payload["rejection_reason"])
+        cands = p.store.load_candidates()
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0]["status"], "rejected")
+        self.assertEqual(cands[0]["vote_false"], 3)
 
     async def test_tie_no_majority_is_not_a_rejection(self):
         """偶数票打平(1 real / 1 false)→ 既不确认也不否决 → 正常阶段回队重试。"""
