@@ -380,13 +380,23 @@ function viewDashboard(runId) {
             body.dataset.loaded = "1";
             body.innerHTML = mdToHtml(full.report_body || "(无正文)");
             const votes = Array.isArray(full.votes) ? full.votes : [];
-            const voteTxt = votes.map(v => `${v.model || "?"}${v.is_real ? "✓" : "✗"}`).join("、");
+            const judgeVotes = votes.filter(v => (v.phase || "") === "judge");
+            const countedVotes = judgeVotes.filter(v => v.validation_ok !== false);
+            const confirmCount = countedVotes.filter(v => (v.decision || (v.is_real ? "confirm" : "reject")) === "confirm").length;
+            const rejectCount = countedVotes.filter(v => (v.decision || (v.is_real ? "confirm" : "reject")) === "reject").length;
+            const voteTxt = countedVotes.length
+              ? `裁决票 ${confirmCount} 确认 / ${rejectCount} 否决 / ${countedVotes.length} 合格`
+              : votes.map(v => `${v.model || "?"}${v.is_real ? "✓" : "✗"}`).join("、");
             const attrBits = [];
             if (full.audit_model) attrBits.push("<strong>审计模型:</strong> " + esc(full.audit_model));
-            if (voteTxt) attrBits.push("<strong>验证模型(" + votes.length + "票):</strong> " + esc(voteTxt));
+            if (voteTxt) attrBits.push("<strong>验证裁决:</strong> " + esc(voteTxt));
             else if ((full.verify_models || []).length) attrBits.push("<strong>验证模型:</strong> " + esc(full.verify_models.join("、")));
             if (attrBits.length) body.prepend(el("p", { class: "model-attr", html: "🧠 " + attrBits.join("　|　") }));
             if (full.exploitability) body.prepend(el("p", { html: "<strong>可利用性:</strong> " + esc(full.exploitability) }));
+            if (votes.length) {
+              body.append(el("h3", {}, "对抗验证记录"));
+              body.append(el("div", { class: "vote-list" }, ...votes.map(renderVoteCard)));
+            }
             body.append(el("p", { style: "margin-top:10px" }, el("a", { href: `/api/runs/${encodeURIComponent(runId)}/export/finding/${encodeURIComponent(f.id)}.md`, target: "_blank" }, "下载该条报告 .md")));
           } catch (e) { body.innerHTML = "加载失败: " + esc(e.message); }
         }
@@ -432,6 +442,19 @@ function viewDashboard(runId) {
     S.nonIssueMap.set(c.key, c);
     return c;
   }
+  function candidateVerifySummary(c) {
+    if (c.status === "verify_failed") {
+      const attempts = c.attempts ? ` · 尝试 ${c.attempts}` : "";
+      return `失败${attempts}: ${c.reason || "未记录原因"}`;
+    }
+    if (c.status === "rejected") {
+      const total = c.vote_total ?? (Array.isArray(c.votes) ? c.votes.filter(v => (v.phase || "") === "judge").length : 0);
+      const falseCount = c.vote_false ?? 0;
+      return `否决 ${falseCount}/${total || "?"}: ${c.rejection_reason || "未记录原因"}`;
+    }
+    if (c.status === "confirmed") return c.id ? `确认编号 ${c.id}` : "已确认";
+    return "验证中";
+  }
   function renderCandidates() {
     const list = [...S.candidateMap.values()];
     const pending = list.filter(c => c.status === "pending").length;
@@ -452,7 +475,7 @@ function viewDashboard(runId) {
       ((a.seq || 0) - (b.seq || 0)));
     const tbl = el("table", { class: "cand-table" }, el("thead", {}, el("tr", {},
       el("th", {}, "状态"), el("th", {}, "严重度"), el("th", {}, "类别"), el("th", {}, "标题"),
-      el("th", {}, "位置"), el("th", {}, "lens"), el("th", {}, "确认编号"))));
+      el("th", {}, "位置"), el("th", {}, "lens"), el("th", {}, "验证摘要"), el("th", {}, "确认编号"))));
     const tb = el("tbody");
     for (const c of list) {
       tb.append(el("tr", { class: "cand-row cand-" + cssKey(c.status) },
@@ -462,6 +485,7 @@ function viewDashboard(runId) {
         el("td", {}, c.title || ""),
         el("td", { class: "loc" }, `${c.file || ""}:${c.line || 0}${c.function ? " · " + c.function : ""}`),
         el("td", {}, c.lens || ""),
+        el("td", { class: "verify-summary" }, candidateVerifySummary(c)),
         el("td", {}, c.id || "—")));
     }
     tbl.append(tb);
@@ -484,14 +508,15 @@ function viewDashboard(runId) {
   }
   function renderVoteCard(v, idx) {
     const decision = v.decision || (v.is_real ? "confirm" : "reject");
+    const invalid = v.validation_ok === false;
     const isReal = decision === "confirm";
-    const label = decision === "confirm" ? "确认问题" : (decision === "reject" ? "判定非问题" : "证据不足");
+    const label = invalid ? "无效证据" : (decision === "confirm" ? "确认问题" : (decision === "reject" ? "判定非问题" : "证据不足"));
     const meta = [v.phase, v.model, v.verify_lens ? "视角 " + v.verify_lens : ""].filter(Boolean).join(" · ");
     const reason = nonIssueVoteReason(v);
-    return el("div", { class: "vote-card " + (isReal ? "vote-real" : "vote-false") },
+    return el("div", { class: "vote-card " + (invalid ? "vote-invalid" : (isReal ? "vote-real" : "vote-false")) },
       el("div", { class: "vote-head" },
         el("strong", {}, `验证记录 #${idx + 1}`),
-        el("span", { class: "pill " + (isReal ? "cand-confirmed" : (decision === "reject" ? "cand-rejected" : "cand-pending")) }, label),
+        el("span", { class: "pill " + (invalid ? "cand-verify-failed" : (isReal ? "cand-confirmed" : (decision === "reject" ? "cand-rejected" : "cand-pending"))) }, label),
         meta ? el("span", { class: "muted model-attr" }, meta) : null),
       detailLine("证据有效性", v.validation_ok === false ? (v.validation_reason || "未通过证据门槛") : "", true),
       detailList("代码证据", v.evidence_refs),
@@ -508,7 +533,7 @@ function viewDashboard(runId) {
     const list = [...S.nonIssueMap.values()];
     tabBody.append(el("div", { class: "panel" },
       el("div", { class: "row", style: "justify-content:space-between" },
-        el("strong", {}, "工具验证后的非问题"),
+        el("strong", {}, "对抗验证后的非问题"),
         el("span", { class: "muted" }, `共 ${list.length}`)),
       el("p", { class: "muted", style: "margin:6px 0 0;font-size:12px" },
         "这里收集对抗验证后被多数裁决否决的候选点,保留原始疑似问题依据和最终非问题验证依据。")));

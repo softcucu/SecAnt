@@ -101,7 +101,9 @@ tr:hover td{background:var(--panel2)}
 .vote-card{border:1px solid var(--border);border-radius:8px;padding:10px 12px;background:var(--panel)}
 .vote-card.vote-false{border-color:rgba(107,114,128,.72)}
 .vote-card.vote-real{border-color:rgba(22,163,74,.55)}
+.vote-card.vote-invalid{border-color:rgba(217,119,6,.78);background:rgba(217,119,6,.08)}
 .vote-head{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
+.verify-summary{max-width:360px;overflow-wrap:anywhere;color:var(--muted);font-size:12px}
 
 .md h1,.md h2,.md h3{margin:.6em 0 .3em} .md p{margin:.4em 0}
 .md code{background:var(--panel2);padding:1px 5px;border-radius:4px;font-family:ui-monospace,Menlo,monospace;font-size:12px}
