@@ -61,7 +61,7 @@ params:
   verify_votes: 3               # 每条候选的 judge 裁决票数(先正方举证+反方证伪,再对合格裁决票多数决)
   threat_model: REMOTE          # REMOTE | LOCAL_UNPRIVILEGED | BOTH
   enable_poc: true              # 高危项是否进隔离 worktree 编译 PoC
-  lenses: [memory, integer, race, injection, authn, crypto, dos, infoleak]
+  lenses: [memory, integer, race, injection, authn, crypto, dos, infoleak, resource-realtime]
   decompose: true               # 审计前把大 region 拆成有界子任务
   unit_line_budget: 1500
   max_subtasks_per_region: 16

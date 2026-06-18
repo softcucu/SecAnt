@@ -41,7 +41,7 @@ def class_code(bc: str) -> str:
         return "AUTH"
     if re.search(r"crypto|cipher|tls|cert|random|nonce|iv\b", s):
         return "CRYPTO"
-    if re.search(r"dos|denial|exhaust|recursion|deadlock", s):
+    if re.search(r"dos|denial|exhaust|recursion|deadlock|resource|starv|watchdog|priority.?inversion|rtos|real.?time|timer.?storm|pool.?exhaust|task.?stack|stack.?exhaust", s):
         return "DOS"
     return "VULN"
 

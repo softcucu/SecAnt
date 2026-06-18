@@ -23,8 +23,8 @@ except Exception:  # pragma: no cover
 # 这是项目自带的副本,不依赖任何外部目录;用户仍可在配置里用 methods_dir 覆盖。
 BUNDLED_METHODS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "methods")
 
-# 审计 lens(8 类)
-ALL_LENSES = ["memory", "integer", "race", "injection", "authn", "crypto", "dos", "infoleak"]
+# 审计 lens(9 类)
+ALL_LENSES = ["memory", "integer", "race", "injection", "authn", "crypto", "dos", "infoleak", "resource-realtime"]
 
 # 流水线里会用到的 agent 角色;每个会运行的角色都必须在 models 里显式指定模型。
 # history:统一调度队列中的「git 历史问题模式挖掘」(每条提交一个 agent,与 high audit finder 同级)。

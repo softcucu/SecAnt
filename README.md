@@ -109,7 +109,7 @@ params:
   verify_votes: 3
   threat_model: REMOTE                # REMOTE | LOCAL_UNPRIVILEGED | BOTH
   enable_poc: true
-  lenses: [memory, integer, race, injection, authn, crypto, dos, infoleak]
+  lenses: [memory, integer, race, injection, authn, crypto, dos, infoleak, resource-realtime]
   decompose: true
 
 methods_dir: proto_vuln_hunt/methods  # 默认即项目自带方法库,无需配置;可覆盖为自定义目录
