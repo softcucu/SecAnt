@@ -258,6 +258,7 @@ function viewDashboard(runId) {
   let activeTab = "findings";
   const nonIssueOpenKeys = new Set();
   let tabRenderTimer = null;
+  let pendingFocus = null;
   let agentOutputMode = localStorage.getItem("pvh.agentOutputMode") === "raw" ? "raw" : "pretty";
   const agentGroupStoreKey = `pvh.agentGroupsCollapsed:${runId}`;
   const agentOutputStoreKey = `pvh.agentOutputsExpanded:${runId}`;
@@ -361,18 +362,21 @@ function viewDashboard(runId) {
       tabRenderTimer = null;
     }
     tabBody.innerHTML = "";
-    if (activeTab === "findings") return renderFindings();
-    if (activeTab === "candidates") return renderCandidates();
-    if (activeTab === "nonissues") return renderNonIssues();
-    if (activeTab === "agents") return renderAgents();
-    if (activeTab === "health") return renderModels();
-    if (activeTab === "coverage") return renderCoverage();
-    if (activeTab === "history") return renderHistory();
-    if (activeTab === "risks") return renderRisks();
-    if (activeTab === "usage") return renderUsage();
-    if (activeTab === "recon") return renderRecon();
-    if (activeTab === "activity") return renderActivity();
-    if (activeTab === "exports") return renderExports();
+    let rendered;
+    if (activeTab === "findings") rendered = renderFindings();
+    else if (activeTab === "candidates") rendered = renderCandidates();
+    else if (activeTab === "nonissues") rendered = renderNonIssues();
+    else if (activeTab === "agents") rendered = renderAgents();
+    else if (activeTab === "health") rendered = renderModels();
+    else if (activeTab === "coverage") rendered = renderCoverage();
+    else if (activeTab === "history") rendered = renderHistory();
+    else if (activeTab === "risks") rendered = renderRisks();
+    else if (activeTab === "usage") rendered = renderUsage();
+    else if (activeTab === "recon") rendered = renderRecon();
+    else if (activeTab === "activity") rendered = renderActivity();
+    else if (activeTab === "exports") rendered = renderExports();
+    requestAnimationFrame(applyPendingFocus);
+    return rendered;
   }
   function scheduleRenderTab(delay = 120) {
     if (tabRenderTimer) return;
@@ -380,6 +384,62 @@ function viewDashboard(runId) {
       tabRenderTimer = null;
       renderTab();
     }, delay);
+  }
+  function showTab(key, focus = null) {
+    activeTab = key;
+    pendingFocus = focus;
+    renderTabs();
+    renderTab();
+  }
+  function findByData(name, value) {
+    if (!value) return null;
+    for (const n of tabBody.querySelectorAll(`[data-${name}]`)) {
+      if (n.getAttribute(`data-${name}`) === String(value)) return n;
+    }
+    return null;
+  }
+  function highlightNode(node) {
+    if (!node) return;
+    for (const n of tabBody.querySelectorAll(".target-hit")) n.classList.remove("target-hit");
+    node.classList.add("target-hit");
+    node.scrollIntoView({ block: "center", behavior: "smooth" });
+    setTimeout(() => node.classList.remove("target-hit"), 2600);
+  }
+  function applyPendingFocus() {
+    if (!pendingFocus) return;
+    const focus = pendingFocus;
+    pendingFocus = null;
+    let node = null;
+    if (focus.type === "finding") {
+      node = findByData("finding-id", focus.id);
+      if (node && !node.classList.contains("open")) {
+        const head = node.querySelector(".head");
+        if (head) head.click();
+      }
+    } else if (focus.type === "candidate") {
+      node = findByData("cand-key", focus.key);
+    }
+    highlightNode(node);
+  }
+  function jumpToFinding(fid) {
+    if (!fid) return;
+    showTab("findings", { type: "finding", id: fid });
+  }
+  function jumpToNonIssue(key) {
+    if (!key) return;
+    nonIssueOpenKeys.add(key);
+    showTab("nonissues", { type: "candidate", key });
+  }
+  function jumpToCandidate(c) {
+    if (!c) return;
+    if (c.status === "confirmed" && c.id) return jumpToFinding(c.id);
+    if (c.status === "rejected") return jumpToNonIssue(c.key || candKeyOf(c));
+    showTab("candidates", { type: "candidate", key: c.key || candKeyOf(c) });
+  }
+  function jumpToCandidateKey(key) {
+    const c = S.candidateMap.get(key);
+    if (c) return jumpToCandidate(c);
+    showTab("candidates", { type: "candidate", key });
   }
 
   function renderFindingFeedback(f) {
@@ -433,7 +493,7 @@ function viewDashboard(runId) {
         renderFindingFeedback(f),
         modelBits.length ? el("span", { class: "muted model-attr" }, "🧠 " + modelBits.join(" · ")) : null);
       const body = el("div", { class: "body md" }, el("div", { class: "muted" }, "加载详情…"));
-      const card = el("div", { class: "finding" }, head, body);
+      const card = el("div", { class: "finding", "data-finding-id": f.id }, head, body);
       head.addEventListener("click", async () => {
         card.classList.toggle("open");
         if (card.classList.contains("open") && !body.dataset.loaded) {
@@ -478,7 +538,7 @@ function viewDashboard(runId) {
     return d.key || `${(d.file || "").trim()}::${d.line || 0}::${(d.bug_class || "").trim().toLowerCase()}`;
   }
   const CAND_FIELDS = ["title", "bug_class", "file", "line", "lens", "severity", "function", "description",
-    "source_to_sink", "variant_of", "confidence", "audit_model", "good_validation_ref"];
+    "source_to_sink", "variant_of", "confidence", "audit_model", "good_validation_ref", "risk_id", "risk_area"];
   function mergeCandidateFields(c, d) {
     for (const k of CAND_FIELDS) {
       if (d[k] !== undefined && d[k] !== null && d[k] !== "") c[k] = d[k];
@@ -522,6 +582,65 @@ function viewDashboard(runId) {
     if (c.status === "confirmed") return c.id ? `确认编号 ${c.id}` : "已确认";
     return "验证中";
   }
+  function linkButton(label, onClick, title = "") {
+    return el("button", { type: "button", class: "link-btn", title, onclick: onClick }, label);
+  }
+  function normRel(s) {
+    return String(s || "").trim().toLowerCase();
+  }
+  function candidateRelText(c) {
+    return normRel([c.variant_of, c.risk_id, c.risk_area, c.title, c.description, c.source_to_sink, c.file].filter(Boolean).join("\n"));
+  }
+  function candidateActionLabel(c) {
+    if (c.status === "confirmed" && c.id) return "查看漏洞";
+    if (c.status === "rejected") return "查看非问题";
+    return "定位候选";
+  }
+  function candidateSummaryLine(c) {
+    const loc = `${c.file || ""}:${c.line || 0}`;
+    return [c.title || c.key, c.bug_class, loc !== ":0" ? loc : ""].filter(Boolean).join(" · ");
+  }
+  function candidatesForHistory(h) {
+    const pattern = normRel(h.pattern);
+    const source = normRel(h.source);
+    if (!pattern && !source) return [];
+    return [...S.candidateMap.values()].filter(c => {
+      const v = normRel(c.variant_of);
+      return (pattern && v.includes(pattern)) || (source && v.includes(source));
+    });
+  }
+  function candidatesForRisk(r) {
+    const rid = normRel(r.id);
+    const area = normRel(r.area);
+    return [...S.candidateMap.values()].filter(c => {
+      if (rid && normRel(c.risk_id) === rid) return true;
+      const text = candidateRelText(c);
+      if (rid && text.includes(rid)) return true;
+      if (area && normRel(c.risk_area) === area) return true;
+      return area && normRel(c.variant_of).includes("风险") && normRel(c.variant_of).includes(area);
+    });
+  }
+  function ledgerByKey(key) {
+    return (((S.coverage || {}).ledger || []).find(r => r.key === key)) || null;
+  }
+  function renderRelatedCandidates(cands, emptyText = "无关联候选") {
+    const uniq = [];
+    const seen = new Set();
+    for (const c of cands || []) {
+      const k = c.key || candKeyOf(c);
+      if (!k || seen.has(k)) continue;
+      seen.add(k);
+      uniq.push(c);
+    }
+    if (!uniq.length) return el("span", { class: "muted" }, emptyText);
+    return el("details", { class: "related-candidates" },
+      el("summary", {}, `候选 ${uniq.length}`),
+      el("div", { class: "related-list" },
+        ...uniq.map(c => el("div", { class: "related-item" },
+          candPill(c.status),
+          el("span", { class: "related-title" }, candidateSummaryLine(c)),
+          linkButton(candidateActionLabel(c), () => jumpToCandidate(c))))));
+  }
   function renderCandidates() {
     const list = [...S.candidateMap.values()];
     const pending = list.filter(c => c.status === "pending").length;
@@ -542,10 +661,13 @@ function viewDashboard(runId) {
       ((a.seq || 0) - (b.seq || 0)));
     const tbl = el("table", { class: "cand-table" }, el("thead", {}, el("tr", {},
       el("th", {}, "状态"), el("th", {}, "严重度"), el("th", {}, "类别"), el("th", {}, "标题"),
-      el("th", {}, "位置"), el("th", {}, "lens"), el("th", {}, "验证摘要"), el("th", {}, "确认编号"))));
+      el("th", {}, "位置"), el("th", {}, "lens"), el("th", {}, "验证摘要"), el("th", {}, "确认编号"), el("th", {}, "去向"))));
     const tb = el("tbody");
     for (const c of list) {
-      tb.append(el("tr", { class: "cand-row cand-" + cssKey(c.status) },
+      const action = (c.status === "confirmed" && c.id) || c.status === "rejected"
+        ? linkButton(candidateActionLabel(c), () => jumpToCandidate(c))
+        : el("span", { class: "muted" }, "—");
+      tb.append(el("tr", { class: "cand-row cand-" + cssKey(c.status), "data-cand-key": c.key || candKeyOf(c) },
         el("td", {}, candPill(c.status)),
         el("td", {}, sevPill(c.severity || "none")),
         el("td", {}, c.bug_class || ""),
@@ -553,7 +675,8 @@ function viewDashboard(runId) {
         el("td", { class: "loc" }, `${c.file || ""}:${c.line || 0}${c.function ? " · " + c.function : ""}`),
         el("td", {}, c.lens || ""),
         el("td", { class: "verify-summary" }, candidateVerifySummary(c)),
-        el("td", {}, c.id || "—")));
+        el("td", {}, c.id || "—"),
+        el("td", {}, action)));
     }
     tbl.append(tb);
     tabBody.append(el("div", { class: "panel" }, tbl));
@@ -638,7 +761,7 @@ function viewDashboard(runId) {
         el("span", { class: "loc" }, `${c.file || ""}:${c.line || 0}`),
         total ? el("span", { class: "muted model-attr" }, `非问题票 ${falseCount}/${total}`) : null);
       const bodyHost = el("div", { class: "body md" });
-      const card = el("div", { class: "finding nonissue" + (nonIssueOpenKeys.has(c.key) ? " open" : "") }, head, bodyHost);
+      const card = el("div", { class: "finding nonissue" + (nonIssueOpenKeys.has(c.key) ? " open" : ""), "data-cand-key": c.key }, head, bodyHost);
       const loadBody = () => {
         if (bodyHost.dataset.loaded) return;
         bodyHost.dataset.loaded = "1";
@@ -1184,8 +1307,12 @@ function viewDashboard(runId) {
       const vt = el("table", {}, el("thead", {}, el("tr", {},
         el("th", {}, "状态"), el("th", {}, "问题模式"), el("th", {}, "出处"), el("th", {}, "轮"), el("th", {}, "候选"))));
       const vtb = el("tbody");
-      for (const v of variants) vtb.append(el("tr", {}, el("td", {}, statusBadge(v.status)), el("td", {}, v.name || ""),
-        el("td", {}, v.source || "—"), el("td", {}, String(v.passes || 0)), el("td", {}, String(v.candidates || 0))));
+      for (const v of variants) {
+        const related = candidatesForHistory({ pattern: v.pattern || v.name, source: v.source });
+        const empty = v.candidates ? `候选 ${v.candidates}(旧数据未保存关联)` : "—";
+        vtb.append(el("tr", {}, el("td", {}, statusBadge(v.status)), el("td", {}, v.name || ""),
+          el("td", {}, v.source || "—"), el("td", {}, String(v.passes || 0)), el("td", {}, renderRelatedCandidates(related, empty))));
+      }
       vt.append(vtb);
       tabBody.append(el("div", { class: "panel" }, vt));
     }
@@ -1251,11 +1378,14 @@ function viewDashboard(runId) {
   function renderRisks() {
     const list = [...S.risks.values()].sort((a, b) => SEVS.indexOf(a.severity_hint) - SEVS.indexOf(b.severity_hint));
     if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无风险登记。")); return; }
-    const tbl = el("table", { class: "data-table risk-table" }, el("thead", {}, el("tr", {}, el("th", {}, "风险"), el("th", {}, "主题"), el("th", {}, "位置"), el("th", {}, "说明"), el("th", {}, "lens"), el("th", {}, "排查"))));
+    const tbl = el("table", { class: "data-table risk-table" }, el("thead", {}, el("tr", {}, el("th", {}, "风险"), el("th", {}, "主题"), el("th", {}, "位置"), el("th", {}, "说明"), el("th", {}, "lens"), el("th", {}, "排查"), el("th", {}, "候选"))));
     const tb = el("tbody");
     for (const r of list) {
       const sevCell = r.id ? severitySelect(r) : sevPill(r.severity_hint);
-      tb.append(el("tr", {}, el("td", {}, sevCell), el("td", {}, r.area || ""), el("td", { class: "loc" }, r.file || "—"), el("td", {}, r.note || ""), el("td", {}, r.lens || ""), el("td", {}, RECHECK_TXT[r.recheck_status] || r.recheck_status || "—")));
+      const related = candidatesForRisk(r);
+      const ledger = r.id ? ledgerByKey("risk:" + r.id) : null;
+      const empty = ledger?.candidates ? `候选 ${ledger.candidates}(旧数据未保存关联)` : "—";
+      tb.append(el("tr", {}, el("td", {}, sevCell), el("td", {}, r.area || ""), el("td", { class: "loc" }, r.file || "—"), el("td", {}, r.note || ""), el("td", {}, r.lens || ""), el("td", {}, RECHECK_TXT[r.recheck_status] || r.recheck_status || "—"), el("td", {}, renderRelatedCandidates(related, empty))));
     }
     tbl.append(tb);
     tabBody.append(el("div", { class: "panel" }, el("div", { class: "table-wrap" }, tbl)));
@@ -1321,17 +1451,20 @@ function viewDashboard(runId) {
     const variants = variantStatusByPattern();
     const tbl = el("table", { class: "data-table history-table" }, el("thead", {}, el("tr", {},
       el("th", {}, "lens"), el("th", {}, "问题模式"), el("th", {}, "是否排查完"),
-      el("th", {}, "排查状态"), el("th", {}, "出处"), el("th", {}, "相关文件"))));
+      el("th", {}, "排查状态"), el("th", {}, "候选"), el("th", {}, "出处"), el("th", {}, "相关文件"))));
     const tb = el("tbody");
     for (const h of hist) {
       const key = String(h.pattern || "").trim().toLowerCase();
       const v = variants.get(key);
       const status = v?.status || "";
+      const related = candidatesForHistory(h);
+      const empty = v?.candidates ? `候选 ${v.candidates}(旧数据未保存关联)` : "—";
       tb.append(el("tr", {},
         el("td", {}, el("span", { class: "tag" }, h.lens_hint || "—")),
         el("td", {}, h.pattern || ""),
         el("td", {}, historyCheckText(status)),
         el("td", {}, statusBadge(status || "pending")),
+        el("td", {}, renderRelatedCandidates(related, empty)),
         el("td", {}, h.source || "—"),
         el("td", { class: "loc" }, (h.files || []).join(", ") || "—")));
     }

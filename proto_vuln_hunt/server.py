@@ -187,6 +187,7 @@ def _merge_candidate(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]
     fields = [
         "title", "bug_class", "file", "line", "lens", "severity", "function", "description",
         "source_to_sink", "variant_of", "confidence", "audit_model", "good_validation_ref",
+        "risk_id", "risk_area",
         "id", "corrected_severity", "reason", "attempts", "final_sweep", "votes",
         "verify_models", "vote_total", "vote_false", "vote_real", "rejection_reason",
     ]

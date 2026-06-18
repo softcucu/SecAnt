@@ -713,6 +713,8 @@ class Pipeline:
             "variant_of": f.get("variant_of") or "", "confidence": f.get("confidence") or "",
             "audit_model": f.get("audit_model") or "",
             "good_validation_ref": f.get("good_validation_ref") or "",
+            "risk_id": f.get("risk_id") or "",
+            "risk_area": f.get("risk_area") or "",
         }
 
     def _save_candidate_state(self, rec: Dict[str, Any]) -> None:
@@ -1691,6 +1693,14 @@ class Pipeline:
             if from_recheck and item.get("kind") == "variant" and not (f.get("variant_of") or "").strip():
                 src = (item.get("source") or "").strip()
                 f["variant_of"] = (item.get("pattern") or "").strip() + (f"(出处:{src})" if src else "")
+            if from_recheck and item.get("kind") == "risk":
+                if item.get("id"):
+                    f["risk_id"] = item.get("id")
+                if item.get("area"):
+                    f["risk_area"] = item.get("area")
+                if not (f.get("variant_of") or "").strip():
+                    f["variant_of"] = "风险点 " + " · ".join(
+                        str(x) for x in [item.get("id"), item.get("area")] if x)
             item["newThisRound"] = item.get("newThisRound", 0) + 1
             rec["candidates"] = rec.get("candidates", 0) + 1
             self.pending_findings[fk] = f

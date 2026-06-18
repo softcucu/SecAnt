@@ -21,6 +21,8 @@ main{padding:20px clamp(12px,1.6vw,24px);max-width:none;margin:0;width:100%}
 .btn.secondary{background:var(--panel2);border:1px solid var(--border);color:var(--text)}
 .btn.danger{background:var(--crit)}
 .btn:disabled{opacity:.5;cursor:not-allowed}
+.link-btn{appearance:none;border:0;background:transparent;color:var(--accent);padding:0;cursor:pointer;font:inherit;text-align:left}
+.link-btn:hover{text-decoration:underline}
 .segmented{display:inline-flex;align-items:center;border:1px solid var(--border);border-radius:6px;overflow:hidden;background:var(--bg)}
 .seg-btn{appearance:none;border:0;border-right:1px solid var(--border);background:transparent;color:var(--muted);padding:5px 10px;cursor:pointer;font-size:12px;line-height:1.3}
 .seg-btn:last-child{border-right:0}
@@ -44,19 +46,21 @@ tr:hover td{background:var(--panel2)}
 .run-table th:nth-child(4),.run-table td:nth-child(4),.run-table th:nth-child(5),.run-table td:nth-child(5){width:72px}
 .run-table th:nth-child(6),.run-table td:nth-child(6){width:190px}
 .run-table th:nth-child(7),.run-table td:nth-child(7){width:78px}
-.risk-table{min-width:1120px}
+.risk-table{min-width:1280px}
 .risk-table th:nth-child(1),.risk-table td:nth-child(1){width:100px}
-.risk-table th:nth-child(2),.risk-table td:nth-child(2){width:18%}
-.risk-table th:nth-child(3),.risk-table td:nth-child(3){width:20%}
+.risk-table th:nth-child(2),.risk-table td:nth-child(2){width:16%}
+.risk-table th:nth-child(3),.risk-table td:nth-child(3){width:18%}
 .risk-table th:nth-child(5),.risk-table td:nth-child(5){width:92px}
 .risk-table th:nth-child(6),.risk-table td:nth-child(6){width:108px}
-.history-table{min-width:1180px}
+.risk-table th:nth-child(7),.risk-table td:nth-child(7){width:210px}
+.history-table{min-width:1280px}
 .history-table th:nth-child(1),.history-table td:nth-child(1){width:92px}
-.history-table th:nth-child(2),.history-table td:nth-child(2){width:34%}
+.history-table th:nth-child(2),.history-table td:nth-child(2){width:30%}
 .history-table th:nth-child(3),.history-table td:nth-child(3){width:116px}
 .history-table th:nth-child(4),.history-table td:nth-child(4){width:112px}
-.history-table th:nth-child(5),.history-table td:nth-child(5){width:170px}
-.history-table th:nth-child(6),.history-table td:nth-child(6){width:24%}
+.history-table th:nth-child(5),.history-table td:nth-child(5){width:210px}
+.history-table th:nth-child(6),.history-table td:nth-child(6){width:170px}
+.history-table th:nth-child(7),.history-table td:nth-child(7){width:22%}
 
 .model-attr{font-size:12px;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .finding .head .model-attr{margin-left:auto;white-space:nowrap}
@@ -96,6 +100,8 @@ tr:hover td{background:var(--panel2)}
 .finding .loc{color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 .finding .body{padding:14px 16px;border-top:1px solid var(--border);background:var(--bg);display:none}
 .finding.open .body{display:block}
+.target-hit{outline:2px solid var(--accent);outline-offset:-2px}
+tr.target-hit td{background:rgba(59,130,246,.18)}
 .detail-line{display:grid;grid-template-columns:minmax(110px,15%) 1fr;gap:12px;padding:7px 0;border-bottom:1px solid rgba(43,51,64,.6)}
 .detail-line:last-child{border-bottom:0}
 .detail-label{color:var(--muted);font-size:12px}
@@ -107,6 +113,10 @@ tr:hover td{background:var(--panel2)}
 .vote-card.vote-invalid{border-color:rgba(217,119,6,.78);background:rgba(217,119,6,.08)}
 .vote-head{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
 .verify-summary{max-width:360px;overflow-wrap:anywhere;color:var(--muted);font-size:12px}
+.related-candidates summary{cursor:pointer;color:var(--accent);font-size:12px}
+.related-list{display:grid;gap:6px;margin-top:8px;min-width:220px}
+.related-item{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:8px;align-items:start}
+.related-title{overflow-wrap:anywhere;font-size:12px;color:var(--text)}
 
 .md h1,.md h2,.md h3{margin:.6em 0 .3em} .md p{margin:.4em 0}
 .md code{background:var(--panel2);padding:1px 5px;border-radius:4px;font-family:ui-monospace,Menlo,monospace;font-size:12px}
