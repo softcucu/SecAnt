@@ -256,6 +256,8 @@ function viewDashboard(runId) {
   app.innerHTML = "";
   const S = { findings: new Map(), risks: new Map(), health: new Map(), agentMap: new Map(), candidateMap: new Map(), nonIssueMap: new Map(), coverage: null, recon: null, log: [], usageRows: [], usageIds: new Set(), usage: emptyUsage(), manifest: null, meta: null, candidates: 0, status: "queued", round: 0, dry: 0, agents: 0, elapsed: 0 };
   let activeTab = "findings";
+  const nonIssueOpenKeys = new Set();
+  let tabRenderTimer = null;
   let agentOutputMode = localStorage.getItem("pvh.agentOutputMode") === "raw" ? "raw" : "pretty";
   const agentGroupStoreKey = `pvh.agentGroupsCollapsed:${runId}`;
   const agentOutputStoreKey = `pvh.agentOutputsExpanded:${runId}`;
@@ -354,6 +356,10 @@ function viewDashboard(runId) {
   }
 
   function renderTab() {
+    if (tabRenderTimer) {
+      clearTimeout(tabRenderTimer);
+      tabRenderTimer = null;
+    }
     tabBody.innerHTML = "";
     if (activeTab === "findings") return renderFindings();
     if (activeTab === "candidates") return renderCandidates();
@@ -367,6 +373,13 @@ function viewDashboard(runId) {
     if (activeTab === "recon") return renderRecon();
     if (activeTab === "activity") return renderActivity();
     if (activeTab === "exports") return renderExports();
+  }
+  function scheduleRenderTab(delay = 120) {
+    if (tabRenderTimer) return;
+    tabRenderTimer = setTimeout(() => {
+      tabRenderTimer = null;
+      renderTab();
+    }, delay);
   }
 
   function renderFindingFeedback(f) {
@@ -583,6 +596,23 @@ function viewDashboard(runId) {
       detailLine("缺失证据", v.missing_evidence, true),
       detailLine("可利用性", v.exploitability, true));
   }
+  function renderNonIssueBody(c, votes, falseCount, total, verifyModels) {
+    const body = el("div", { class: "body md" },
+      el("h3", {}, "疑似问题候选原因"),
+      detailLine("描述", c.description || "旧事件未记录候选描述", true),
+      detailLine("声称的 source→sink", c.source_to_sink, true),
+      detailLine("变体来源", c.variant_of, true),
+      detailLine("正面对照", c.good_validation_ref, true),
+      detailLine("审计模型", c.audit_model),
+      detailLine("置信度", c.confidence),
+      el("h3", {}, "最终验证非问题原因"),
+      detailLine("多数结论", c.rejection_reason || (total ? `多数裁决票判定为非问题(${falseCount}/${total})` : "旧事件未记录验证票详情"), true),
+      verifyModels.length ? detailLine("验证模型", verifyModels.join("、")) : null);
+    if (votes.length) {
+      body.append(el("div", { class: "vote-list" }, ...votes.map(renderVoteCard)));
+    }
+    return body;
+  }
   function renderNonIssues() {
     const list = [...S.nonIssueMap.values()];
     tabBody.append(el("div", { class: "panel" },
@@ -607,22 +637,24 @@ function viewDashboard(runId) {
         el("span", { class: "muted" }, c.bug_class || ""),
         el("span", { class: "loc" }, `${c.file || ""}:${c.line || 0}`),
         total ? el("span", { class: "muted model-attr" }, `非问题票 ${falseCount}/${total}`) : null);
-      const body = el("div", { class: "body md" },
-        el("h3", {}, "疑似问题候选原因"),
-        detailLine("描述", c.description || "旧事件未记录候选描述", true),
-        detailLine("声称的 source→sink", c.source_to_sink, true),
-        detailLine("变体来源", c.variant_of, true),
-        detailLine("正面对照", c.good_validation_ref, true),
-        detailLine("审计模型", c.audit_model),
-        detailLine("置信度", c.confidence),
-        el("h3", {}, "最终验证非问题原因"),
-        detailLine("多数结论", c.rejection_reason || (total ? `多数裁决票判定为非问题(${falseCount}/${total})` : "旧事件未记录验证票详情"), true),
-        verifyModels.length ? detailLine("验证模型", verifyModels.join("、")) : null);
-      if (votes.length) {
-        body.append(el("div", { class: "vote-list" }, ...votes.map(renderVoteCard)));
-      }
-      const card = el("div", { class: "finding nonissue open" }, head, body);
-      head.addEventListener("click", () => card.classList.toggle("open"));
+      const bodyHost = el("div", { class: "body md" });
+      const card = el("div", { class: "finding nonissue" + (nonIssueOpenKeys.has(c.key) ? " open" : "") }, head, bodyHost);
+      const loadBody = () => {
+        if (bodyHost.dataset.loaded) return;
+        bodyHost.dataset.loaded = "1";
+        bodyHost.replaceWith(renderNonIssueBody(c, votes, falseCount, total, verifyModels));
+      };
+      if (nonIssueOpenKeys.has(c.key)) loadBody();
+      head.addEventListener("click", () => {
+        const open = !card.classList.contains("open");
+        card.classList.toggle("open", open);
+        if (open) {
+          nonIssueOpenKeys.add(c.key);
+          loadBody();
+        } else {
+          nonIssueOpenKeys.delete(c.key);
+        }
+      });
       tabBody.append(card);
     }
   }
@@ -1383,7 +1415,7 @@ function viewDashboard(runId) {
       }
       case "finding_rejected": {
         upsertNonIssue(d);
-        renderTabs(); if (activeTab === "candidates" || activeTab === "nonissues") renderTab(); break;
+        renderTabs(); if (activeTab === "candidates") renderTab(); else if (activeTab === "nonissues") scheduleRenderTab(); break;
       }
       case "candidate_failed": {
         const cf = upsertCandidate(d);
