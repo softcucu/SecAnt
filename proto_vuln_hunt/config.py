@@ -197,7 +197,7 @@ class Config:
     lenses: List[str] = field(default_factory=lambda: list(ALL_LENSES))
     decompose: bool = True
     unit_line_budget: int = 1500
-    max_subtasks_per_region: int = 16
+    max_subtasks_per_region: int = 40    # 动态拆解预算的硬封顶;0 表示不额外封顶
     max_files_per_unit: int = 4
 
     # 方法库 / 断点(默认用项目自带的 methods/;可在配置里覆盖为自定义目录)
@@ -231,7 +231,8 @@ class Config:
         self.dry_rounds = max(1, int(self.dry_rounds))
         self.max_rounds = max(1, int(self.max_rounds))
         self.verify_votes = max(1, int(self.verify_votes))
-        self.max_subtasks_per_region = max(1, int(self.max_subtasks_per_region))
+        self.unit_line_budget = max(1, int(self.unit_line_budget))
+        self.max_subtasks_per_region = max(0, int(self.max_subtasks_per_region))
         self.max_files_per_unit = max(1, int(self.max_files_per_unit))
         self.recheck.concurrency = max(1, int(self.recheck.concurrency))
         if self.recheck.risk_min_severity not in ("high", "medium", "low", "info"):

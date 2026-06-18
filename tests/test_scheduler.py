@@ -289,6 +289,34 @@ class TestSchedulerPriority(unittest.TestCase):
             self.assertEqual(work["kind"], "_history_commit")
 
 
+class TestDynamicDecomposeBudget(unittest.TestCase):
+    def test_subtask_limit_scales_with_region_line_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "big.c")
+            with open(src, "w", encoding="utf-8") as f:
+                f.write("int x;\n" * 25000)
+            p = _pipe(tmp, unit_line_budget=1000, max_subtasks_per_region=0)
+
+            limit, lines, files = p._subtask_limit_for_region({"files": ["big.c"]})
+
+            self.assertEqual(lines, 25000)
+            self.assertEqual(files, 1)
+            self.assertEqual(limit, 25)
+
+    def test_subtask_limit_honors_hard_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "big.c")
+            with open(src, "w", encoding="utf-8") as f:
+                f.write("int x;\n" * 25000)
+            p = _pipe(tmp, unit_line_budget=1000, max_subtasks_per_region=12)
+
+            limit, lines, files = p._subtask_limit_for_region({"files": ["big.c"]})
+
+            self.assertEqual(lines, 25000)
+            self.assertEqual(files, 1)
+            self.assertEqual(limit, 12)
+
+
 class TestFinderResultShape(unittest.TestCase):
     def test_consume_accepts_top_level_finding_array(self):
         with tempfile.TemporaryDirectory() as tmp:

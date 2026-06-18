@@ -31,6 +31,9 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--max-rounds", dest="max_rounds", type=int)
     p.add_argument("--dry-rounds", dest="dry_rounds", type=int)
     p.add_argument("--verify-votes", dest="verify_votes", type=int)
+    p.add_argument("--unit-line-budget", dest="unit_line_budget", type=int, help="region 动态拆解时每个子任务的目标行数")
+    p.add_argument("--max-files-per-unit", dest="max_files_per_unit", type=int, help="region 动态拆解时每个子任务的目标文件数")
+    p.add_argument("--max-subtasks-per-region", dest="max_subtasks_per_region", type=int, help="动态子任务预算硬封顶;0 表示不额外封顶")
     p.add_argument("--no-poc", dest="enable_poc", action="store_false", default=None, help="禁用 PoC 阶段")
     p.add_argument("--no-decompose", dest="decompose", action="store_false", default=None, help="禁用区域拆解")
     p.add_argument("--fresh", action="store_true", default=None, help="忽略断点从头跑")
@@ -59,6 +62,7 @@ def _overrides_from_args(args) -> dict:
     overrides = {}
     for k in ("target", "scope", "out_dir", "backend", "concurrency", "threat_model",
               "finders_per_lens", "max_rounds", "dry_rounds", "verify_votes",
+              "unit_line_budget", "max_files_per_unit", "max_subtasks_per_region",
               "enable_poc", "decompose", "fresh", "methods_dir", "host", "port", "runs_dir"):
         v = getattr(args, k, None)
         if v is not None:
@@ -87,6 +91,8 @@ def cmd_run(args) -> int:
             "threat_model": cfg.threat_model, "finders_per_lens": cfg.finders_per_lens,
             "max_rounds": cfg.max_rounds, "dry_rounds": cfg.dry_rounds, "verify_votes": cfg.verify_votes,
             "enable_poc": cfg.enable_poc, "decompose": cfg.decompose, "resume": cfg.resume,
+            "unit_line_budget": cfg.unit_line_budget, "max_files_per_unit": cfg.max_files_per_unit,
+            "max_subtasks_per_region": cfg.max_subtasks_per_region,
             "methods_dir": cfg.methods_abs, "methods_ok": cfg.methods_ok(),
             "model_config_error": cfg.model_config_error(),
             "backend_command": cfg.backend_spec().command,

@@ -63,9 +63,9 @@ params:
   enable_poc: true              # 高危项是否进隔离 worktree 编译 PoC
   lenses: [memory, integer, race, injection, authn, crypto, dos, infoleak, resource-realtime]
   decompose: true               # 审计前把大 region 拆成有界子任务
-  unit_line_budget: 1500
-  max_subtasks_per_region: 16
-  max_files_per_unit: 4
+  unit_line_budget: 1500         # 动态拆解预算:约每 N 行代码允许 1 个子任务
+  max_files_per_unit: 4          # 动态拆解预算:约每 N 个文件允许 1 个子任务
+  max_subtasks_per_region: 40    # 动态预算的硬封顶;设为 0 表示不额外封顶
 
 # ── git 历史问题模式挖掘(统一调度队列中与 high audit finder 同级) ──
 # 从侦察中抽离:遍历 git log 的提交,**每条提交派 1 个 agent**(role=history)读其改动,

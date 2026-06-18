@@ -27,6 +27,8 @@ from .prompts import VERIFY_LENSES, PromptBuilder
 from .store import RunStore, STATUS_DONE, STATUS_ERROR, STATUS_INCOMPLETE, STATUS_RUNNING, STATUS_STOPPED
 
 _CODE_REF_RE = re.compile(r"\S+:\d+")
+_SOURCE_EXTS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inc", ".ipp", ".s", ".S"}
+_COUNT_SKIP_DIRS = {".git", ".proto-vuln-hunt", "pvh-runs"}
 
 
 def _noop_emit(etype: str, data: Optional[Dict[str, Any]] = None, persist: bool = True) -> None:
@@ -649,17 +651,96 @@ class Pipeline:
         return active
 
     # ──────────────────────── 区域拆解 ────────────────────────
+    @staticmethod
+    def _path_within(path: str, base: str) -> bool:
+        try:
+            return os.path.commonpath([path, base]) == base
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _count_file_lines(path: str) -> int:
+        lines = 0
+        saw_data = False
+        last = b""
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    saw_data = True
+                    lines += chunk.count(b"\n")
+                    last = chunk[-1:]
+        except OSError:
+            return 0
+        if saw_data and last != b"\n":
+            lines += 1
+        return lines
+
+    def _iter_region_code_files(self, region: Dict[str, Any]) -> List[str]:
+        base = os.path.realpath(self._abs_target())
+        out: List[str] = []
+        seen = set()
+        for raw in region.get("files") or []:
+            if not isinstance(raw, str):
+                continue
+            name = raw.strip()
+            if not name:
+                continue
+            if os.path.isabs(name):
+                path = os.path.realpath(os.path.abspath(os.path.expanduser(name)))
+            else:
+                path = os.path.realpath(os.path.abspath(os.path.join(base, name)))
+            if not self._path_within(path, base):
+                continue
+            if os.path.isfile(path):
+                if path not in seen:
+                    seen.add(path)
+                    out.append(path)
+                continue
+            if not os.path.isdir(path):
+                continue
+            for root, dirs, files in os.walk(path):
+                dirs[:] = [d for d in dirs if d not in _COUNT_SKIP_DIRS]
+                for fn in files:
+                    if os.path.splitext(fn)[1].lower() not in _SOURCE_EXTS:
+                        continue
+                    fp = os.path.join(root, fn)
+                    if fp not in seen:
+                        seen.add(fp)
+                        out.append(fp)
+        return out
+
+    def _region_code_volume(self, region: Dict[str, Any]) -> tuple[int, int]:
+        files = self._iter_region_code_files(region)
+        return sum(self._count_file_lines(p) for p in files), len(files)
+
+    def _subtask_limit_for_region(self, region: Dict[str, Any]) -> tuple[int, int, int]:
+        lines, file_count = self._region_code_volume(region)
+        unit = max(1, int(self.cfg.unit_line_budget))
+        max_files = max(1, int(self.cfg.max_files_per_unit))
+        line_units = (lines + unit - 1) // unit if lines > 0 else 0
+        file_units = (file_count + max_files - 1) // max_files if file_count > 0 else 0
+        dynamic = max(1, line_units, file_units) if (line_units or file_units) else 8
+        hard_cap = int(self.cfg.max_subtasks_per_region or 0)
+        if hard_cap > 0:
+            dynamic = min(dynamic, hard_cap)
+        return max(1, dynamic), lines, file_count
+
     async def decompose_region(self, region: Dict[str, Any]) -> int:
         rkey = item_key(region)
         rec = self.ledger_rec(region)
         tasks: List[Dict[str, Any]] = []
+        subtask_limit, region_lines, region_file_count = self._subtask_limit_for_region(region)
         if self.cfg.decompose:
             r = await self.runner.run(
-                self.pb.decompose(region, S.SUBTASKS_SCHEMA),
+                self.pb.decompose(region, S.SUBTASKS_SCHEMA, subtask_limit=subtask_limit,
+                                  region_lines=region_lines, region_file_count=region_file_count),
                 role="decompose", label=f"decompose:{str(region.get('name'))[:26]}",
                 schema=S.SUBTASKS_SCHEMA, retries=1, fallback=None)
             if r and isinstance(r, dict) and isinstance(r.get("subtasks"), list):
-                for s in r["subtasks"][: self.cfg.max_subtasks_per_region]:
+                for s in r["subtasks"][:subtask_limit]:
                     tasks.append({
                         "kind": "task", "region": region.get("name"), "objective": s.get("objective") or "(未命名子任务)",
                         "files": s.get("files") or region.get("files") or [],
@@ -691,6 +772,9 @@ class Pipeline:
         self.completed_items.add(rkey)
         rec["status"] = "decomposed"
         rec["subtasks"] = len(tasks)
+        rec["subtaskLimit"] = subtask_limit
+        rec["regionLines"] = region_lines
+        rec["regionFiles"] = region_file_count
         rec["lastRound"] = self.round
         if self._decompose_total:
             self._decompose_done += 1
@@ -1972,6 +2056,8 @@ class Pipeline:
             "lenses": self.cfg.lenses, "finders_per_lens": self.cfg.finders_per_lens,
             "max_rounds": self.cfg.max_rounds, "dry_rounds": self.cfg.dry_rounds,
             "verify_votes": self.cfg.verify_votes, "enable_poc": self.cfg.enable_poc, "decompose": self.cfg.decompose,
+            "unit_line_budget": self.cfg.unit_line_budget, "max_files_per_unit": self.cfg.max_files_per_unit,
+            "max_subtasks_per_region": self.cfg.max_subtasks_per_region,
             "methods_dir": self.cfg.methods_abs, "methods_ok": self.cfg.methods_ok(),
         })
         self.store.set_status(STATUS_RUNNING)

@@ -26,7 +26,8 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "st
 _RUN_FIELDS = {
     "target", "scope", "backend", "concurrency", "threat_model", "lenses",
     "finders_per_lens", "max_rounds", "dry_rounds", "verify_votes",
-    "enable_poc", "decompose", "methods_dir", "models", "model_concurrency", "resume", "fresh",
+    "enable_poc", "decompose", "unit_line_budget", "max_files_per_unit", "max_subtasks_per_region",
+    "methods_dir", "models", "model_concurrency", "resume", "fresh",
 }
 
 # 续跑历史任务时,这些"后端/模型"字段改用本次启动的基础配置(self.base,随服务重启读取最新
@@ -316,7 +317,10 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
                 "threat_model": cfg.threat_model, "lenses": cfg.lenses,
                 "finders_per_lens": cfg.finders_per_lens, "max_rounds": cfg.max_rounds,
                 "dry_rounds": cfg.dry_rounds, "verify_votes": cfg.verify_votes,
-                "enable_poc": cfg.enable_poc, "decompose": cfg.decompose, "methods_dir": cfg.methods_abs,
+                "enable_poc": cfg.enable_poc, "decompose": cfg.decompose,
+                "unit_line_budget": cfg.unit_line_budget, "max_files_per_unit": cfg.max_files_per_unit,
+                "max_subtasks_per_region": cfg.max_subtasks_per_region,
+                "methods_dir": cfg.methods_abs,
                 "health": {"enabled": cfg.health.enabled, "on_start": cfg.health.on_start,
                            "gate": cfg.health.gate, "ttl_s": cfg.health.ttl_s},
             },

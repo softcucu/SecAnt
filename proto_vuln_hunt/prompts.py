@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 OUTPUT_LANGUAGE_ZH = (
@@ -201,9 +201,15 @@ class PromptBuilder:
         )
 
     # ── 区域拆解 ──
-    def decompose(self, region: Dict[str, Any], schema) -> str:
+    def decompose(self, region: Dict[str, Any], schema, *, subtask_limit: Optional[int] = None,
+                  region_lines: int = 0, region_file_count: int = 0) -> str:
         files = ", ".join(region.get("files") or []) or "(自行定位)"
         eps = ", ".join(region.get("entry_points") or []) or "自行定位"
+        limit = max(1, int(subtask_limit or self.cfg.max_subtasks_per_region))
+        if region_lines > 0 or region_file_count > 0:
+            volume = f"本区域静态估算约 {region_lines} 行 / {region_file_count} 个文件,"
+        else:
+            volume = "本区域代码量无法从 regions.files 静态估算,"
         return (
             f"你在对 C/C++ 源码做白盒审计的**任务拆解**阶段(威胁模型:{self.threat})。目标:{self.target}{self.scope_note}\n"
             f"攻击面区域「{region.get('name')}」({region.get('category')}),涉及文件:{files}\n"
@@ -214,7 +220,8 @@ class PromptBuilder:
             "- **聚焦内聚**:一个子任务 = 一个函数簇 / 一条数据流路径 / 一个解析器 / 一个状态机 / 一个文件的核心逻辑。\n"
             "- **覆盖完整**:子任务合起来覆盖该区域所有安全相关代码;每个子任务写清覆盖哪些 files/functions。\n"
             "- **标注 lens**:给每个子任务标 lens_hints(最相关的 1~3 个),后续只派这些 lens 的 finder。\n"
-            f"- 子任务总数控制在 {self.cfg.max_subtasks_per_region} 个以内;只输出拆解结果,**不要现在找具体 bug**。"
+            f"- **动态拆解预算**:{volume}本次最多输出 {limit} 个子任务;小区域不要为了凑数拆碎,大区域可接近上限。\n"
+            "- 只输出拆解结果,**不要现在找具体 bug**。"
             + must_struct(schema)
         )
 

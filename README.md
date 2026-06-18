@@ -111,6 +111,9 @@ params:
   enable_poc: true
   lenses: [memory, integer, race, injection, authn, crypto, dos, infoleak, resource-realtime]
   decompose: true
+  unit_line_budget: 1500          # region 拆解时按代码量动态计算子任务预算
+  max_files_per_unit: 4
+  max_subtasks_per_region: 40     # 动态预算硬封顶;0 表示不额外封顶
 
 methods_dir: proto_vuln_hunt/methods  # 默认即项目自带方法库,无需配置;可覆盖为自定义目录
 
