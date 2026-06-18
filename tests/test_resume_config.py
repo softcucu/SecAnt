@@ -1,4 +1,4 @@
-"""续跑历史任务时,后端/模型相关配置应改用本次启动的最新基础配置(self.base),
+"""续跑历史任务时,后端/模型/并发相关配置应改用本次启动的最新基础配置(self.base),
 而不沿用 run 首次创建时落盘到 manifest 的旧快照。"""
 import os
 import sys
@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from proto_vuln_hunt.config import Config, load_config
 from proto_vuln_hunt.pipeline import Pipeline
 from proto_vuln_hunt.server import RunManager
-from proto_vuln_hunt.store import RunRegistry, RunStore
+from proto_vuln_hunt.store import RunRegistry, RunStore, STATUS_INTERRUPTED
 
 
 _ROLES = ["recon", "history", "recheck", "decompose", "audit", "verify", "report", "poc"]
@@ -21,13 +21,14 @@ def _models(name):
 
 
 class ResumeConfigTest(unittest.TestCase):
-    def _manager(self, tmp, base_model):
+    def _manager(self, tmp, base_model, concurrency=7):
         base = Config(
             target=tmp,
             runs_dir=os.path.join(tmp, "runs"),
             backend="claude",
             models=_models(base_model),
             model_concurrency={base_model: 2},
+            concurrency=concurrency,
         )
         registry = RunRegistry(base.runs_dir).ensure()
         return RunManager(base, registry), registry
@@ -39,6 +40,7 @@ class ResumeConfigTest(unittest.TestCase):
             "target": tmp, "backend": "codex",
             "models": _models("old-stale-model"),
             "model_concurrency": {"old-stale-model": 9},
+            "concurrency": 1,
             "max_rounds": 3,
         })
         return store
@@ -54,15 +56,31 @@ class ResumeConfigTest(unittest.TestCase):
             self.assertTrue(manager.resume(store.id))
             cfg = launched["cfg"]
 
-            # 后端/模型相关 → 取本次启动的最新基础配置
+            # 后端/模型/并发相关 → 取本次启动的最新基础配置
             self.assertEqual(cfg.backend, "claude")
             self.assertEqual(cfg.models["audit"], ["new-startup-model"])
             self.assertEqual(cfg.model_concurrency, {"new-startup-model": 2})
+            self.assertEqual(cfg.concurrency, 7)
             # 非模型字段 → 仍沿用 run 的旧快照
             self.assertEqual(cfg.max_rounds, 3)
             # 续跑标志生效
             self.assertTrue(cfg.resume)
             self.assertFalse(cfg.fresh)
+
+    def test_interrupted_run_display_uses_resume_model_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager, registry = self._manager(tmp, "new-startup-model")
+            store = self._stale_run(registry, tmp)
+            store.set_status(STATUS_INTERRUPTED)
+
+            manifest = manager.manifest_for_display(store)
+            cfg = manifest["config"]
+
+            self.assertEqual(cfg["backend"], "claude")
+            self.assertEqual(cfg["models"]["audit"], ["new-startup-model"])
+            self.assertEqual(cfg["model_concurrency"], {"new-startup-model": 2})
+            self.assertEqual(cfg["concurrency"], 7)
+            self.assertEqual(cfg["max_rounds"], 3)
 
     def test_resume_rereads_config_file(self):
         """编辑配置文件后无需重启进程:续跑应读到文件里的最新模型。"""

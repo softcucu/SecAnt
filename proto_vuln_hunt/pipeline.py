@@ -638,6 +638,24 @@ class Pipeline:
             "model_config_error": self.cfg.model_config_error(),
         }
 
+    @staticmethod
+    def manifest_config_for(cfg: Config) -> Dict[str, Any]:
+        """写入 run.json 的配置快照。"""
+        return {
+            "target": cfg.target, "scope": cfg.scope, "backend": cfg.backend,
+            "models": cfg.models, "model_concurrency": cfg.model_concurrency,
+            "concurrency": cfg.concurrency, "threat_model": cfg.threat_model,
+            "lenses": cfg.lenses, "finders_per_lens": cfg.finders_per_lens,
+            "max_rounds": cfg.max_rounds, "dry_rounds": cfg.dry_rounds,
+            "verify_votes": cfg.verify_votes, "enable_poc": cfg.enable_poc, "decompose": cfg.decompose,
+            "unit_line_budget": cfg.unit_line_budget, "max_files_per_unit": cfg.max_files_per_unit,
+            "max_subtasks_per_region": cfg.max_subtasks_per_region,
+            "methods_dir": cfg.methods_abs, "methods_ok": cfg.methods_ok(),
+        }
+
+    def manifest_config(self) -> Dict[str, Any]:
+        return self.manifest_config_for(self.cfg)
+
     # ──────────────────────── lens 选择 ────────────────────────
     def lenses_for(self, item: Dict[str, Any]) -> List[str]:
         active = self.cfg.lenses
@@ -2049,17 +2067,7 @@ class Pipeline:
     # ──────────────────────── 总入口 ────────────────────────
     async def run(self) -> Dict[str, Any]:
         sn = self.pb.scope_note
-        self.store.init_manifest({
-            "target": self.cfg.target, "scope": self.cfg.scope, "backend": self.cfg.backend,
-            "models": self.cfg.models, "model_concurrency": self.cfg.model_concurrency,
-            "concurrency": self.cfg.concurrency, "threat_model": self.cfg.threat_model,
-            "lenses": self.cfg.lenses, "finders_per_lens": self.cfg.finders_per_lens,
-            "max_rounds": self.cfg.max_rounds, "dry_rounds": self.cfg.dry_rounds,
-            "verify_votes": self.cfg.verify_votes, "enable_poc": self.cfg.enable_poc, "decompose": self.cfg.decompose,
-            "unit_line_budget": self.cfg.unit_line_budget, "max_files_per_unit": self.cfg.max_files_per_unit,
-            "max_subtasks_per_region": self.cfg.max_subtasks_per_region,
-            "methods_dir": self.cfg.methods_abs, "methods_ok": self.cfg.methods_ok(),
-        })
+        self.store.init_manifest(self.manifest_config())
         self.store.set_status(STATUS_RUNNING)
         self.emit(EV.RUN_STATUS, {"status": STATUS_RUNNING})
         self.log(f"目标={self.cfg.target}{sn} 后端={self.cfg.backend} 并发={self.cfg.concurrency} "

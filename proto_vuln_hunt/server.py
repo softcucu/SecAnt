@@ -30,9 +30,9 @@ _RUN_FIELDS = {
     "methods_dir", "models", "model_concurrency", "resume", "fresh",
 }
 
-# 续跑历史任务时,这些"后端/模型"字段改用本次启动的基础配置(self.base,随服务重启读取最新
-# 配置文件刷新),而不沿用 run 首次创建时落盘的旧快照——避免改了配置文件重启后续跑仍用老模型。
-_RESUME_FROM_BASE_FIELDS = {"backend", "models", "model_concurrency"}
+# 续跑历史任务时,这些"后端/模型/并发"字段改用本次启动的基础配置(self.base,随服务重启读取最新
+# 配置文件刷新),而不沿用 run 首次创建时落盘的旧快照——避免改了配置文件重启后续跑仍用老模型/老并发。
+_RESUME_FROM_BASE_FIELDS = {"backend", "models", "model_concurrency", "concurrency"}
 
 _FINDING_FEEDBACK_STATUSES = {"unreviewed", "confirmed", "false_positive", "needs_review"}
 
@@ -92,6 +92,11 @@ class RunManager:
         bus = EventBus(sink=store.append_event, start_seq=store.last_event_seq())
         stop = asyncio.Event()
         pipe = Pipeline(cfg, store=store, emitter=bus.emit, stop_event=stop)
+        # 在后台任务真正跑起来前先同步配置快照,避免 Web 立刻刷新时仍读到上次服务的旧模型配置。
+        try:
+            store.init_manifest(pipe.manifest_config())
+        except Exception:
+            pass
         task = asyncio.create_task(pipe.run())
         self.active[store.id] = {"task": task, "pipeline": pipe, "bus": bus, "stop": stop}
 
@@ -106,15 +111,42 @@ class RunManager:
         store = self.registry.create()
         return self._launch(cfg, store)
 
+    def _config_for_resume(self, store: RunStore) -> Config:
+        base = self._fresh_base()  # 重读配置文件,确保续跑用的是磁盘上最新的模型/后端/并发配置
+        m = store.load_manifest() or {}
+        # 后端/模型/并发相关字段不从 run 旧快照沿用,改由最新基础配置 base 提供。
+        saved = {k: v for k, v in (m.get("config") or {}).items() if k not in _RESUME_FROM_BASE_FIELDS}
+        return build_run_config(base, {**saved, "resume": True, "fresh": False})
+
+    def manifest_for_display(self, store: RunStore) -> Dict[str, Any]:
+        """返回 Web 应显示的 manifest。
+
+        服务重启后 interrupted run 的磁盘 manifest 仍可能是上一次服务写入的旧模型配置;
+        但续跑实际会使用本次服务加载的基础配置。模型页默认值应和实际续跑配置一致。
+        """
+        m = store.load_manifest() or {}
+        rec = self.active.get(store.id)
+        if rec and not rec["task"].done():
+            try:
+                cfg = rec["pipeline"].manifest_config()
+                out = dict(m)
+                out["config"] = {**(m.get("config") or {}), **cfg}
+                return out
+            except Exception:
+                return m
+        if m.get("status") == STATUS_INTERRUPTED:
+            cfg = self._config_for_resume(store)
+            from .pipeline import Pipeline  # 惰性,避免无 Web 依赖场景提前牵连编排器
+            out = dict(m)
+            out["config"] = {**(m.get("config") or {}), **Pipeline.manifest_config_for(cfg)}
+            return out
+        return m
+
     def resume(self, run_id: str) -> bool:
         store = self.registry.get(run_id)
         if not store or self.is_running(run_id):
             return False
-        base = self._fresh_base()  # 重读配置文件,确保续跑用的是磁盘上最新的模型/后端配置
-        m = store.load_manifest() or {}
-        # 后端/模型相关字段不从 run 旧快照沿用,改由最新基础配置 base 提供。
-        saved = {k: v for k, v in (m.get("config") or {}).items() if k not in _RESUME_FROM_BASE_FIELDS}
-        cfg = build_run_config(base, {**saved, "resume": True, "fresh": False})
+        cfg = self._config_for_resume(store)
         self._launch(cfg, store)
         return True
 
@@ -255,8 +287,9 @@ def _candidate_snapshot_from_events(store: RunStore) -> List[Dict[str, Any]]:
     return out
 
 
-def _dashboard_snapshot(store: RunStore, running: bool, last_seq: int) -> Dict[str, Any]:
-    manifest = store.load_manifest() or {}
+def _dashboard_snapshot(store: RunStore, running: bool, last_seq: int,
+                        manifest: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    manifest = manifest or store.load_manifest() or {}
     manifest["running"] = running
     asf = store.load_attack_surface()
     regions = asf.get("regions") or (store.load_recon() or {}).get("regions") or []
@@ -349,7 +382,7 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
     @app.get("/api/runs/{run_id}")
     async def get_run(run_id: str):
         store = _store_or_404(run_id)
-        m = store.load_manifest() or {}
+        m = manager.manifest_for_display(store)
         m["running"] = manager.is_running(run_id)
         return m
 
@@ -359,7 +392,7 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
         running = manager.is_running(run_id)
         bus = manager.get_bus(run_id) if running else None
         last_seq = bus.last_seq if bus else 0
-        return _dashboard_snapshot(store, running, last_seq)
+        return _dashboard_snapshot(store, running, last_seq, manager.manifest_for_display(store))
 
     @app.post("/api/runs/{run_id}/stop")
     async def stop_run(run_id: str):
