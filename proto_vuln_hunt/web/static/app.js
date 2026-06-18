@@ -2,6 +2,12 @@
 // ──────────────────────── helpers ────────────────────────
 const app = document.getElementById("app");
 const SEVS = ["critical", "high", "medium", "low", "info"];
+const FINDING_FEEDBACK_OPTIONS = [
+  ["unreviewed", "未确认"],
+  ["confirmed", "确认漏洞"],
+  ["false_positive", "误报"],
+  ["needs_review", "待复核"],
+];
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 function el(tag, attrs = {}, ...kids) {
   const e = document.createElement(tag);
@@ -25,6 +31,7 @@ async function api(method, path, body) {
 function flash(msg) { const f = el("div", { class: "flash" }, msg); document.body.append(f); setTimeout(() => f.remove(), 4200); }
 function fmtTs(t) { if (!t) return "—"; const d = new Date(t * 1000); return d.toLocaleString(); }
 function fmtClock(t) { if (!t) return "—"; const d = new Date(t * 1000); return d.toLocaleTimeString(); }
+function fmtPct(num, den) { if (!den) return "0%"; const v = (num / den) * 100; return `${v >= 10 ? v.toFixed(1) : v.toFixed(2)}%`; }
 function fmtMs(ms) { ms = Number(ms || 0); if (!ms) return "—"; return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`; }
 function fmtTps(v) { const n = Number(v || 0); if (!Number.isFinite(n) || n <= 0) return "—"; return `${n >= 10 ? Math.round(n) : n.toFixed(1)} tok/s`; }
 function sevPill(s) { return el("span", { class: "pill sev-" + (s || "none") }, s || "none"); }
@@ -41,6 +48,7 @@ function fmtTok(n) {
   return n.toLocaleString();
 }
 function cssKey(s) { return String(s || "unknown").replace(/[^a-z0-9-]+/gi, "-").toLowerCase(); }
+function findingFeedbackStatus(f) { return (f && f.manual_feedback && f.manual_feedback.status) || "unreviewed"; }
 function modelText(v) { return Array.isArray(v) ? v.join(", ") : (v || ""); }
 function splitModels(v) { return String(v || "").split(",").map(s => s.trim()).filter(Boolean); }
 function kvText(obj) { return Object.entries(obj || {}).map(([k, v]) => `${k}=${v}`).join(", "); }
@@ -307,6 +315,8 @@ function viewDashboard(runId) {
 
   function renderHeader() {
     const bySev = {}; for (const f of S.findings.values()) bySev[f.corrected_severity] = (bySev[f.corrected_severity] || 0) + 1;
+    const suspectedCount = S.findings.size;
+    const manualConfirmed = [...S.findings.values()].filter(f => findingFeedbackStatus(f) === "confirmed").length;
     header.innerHTML = "";
     const m = S.manifest || {}; const cfg = m.config || {};
     const agentCount = Math.max(S.agents || 0, S.agentMap.size, S.usageRows.length);
@@ -317,7 +327,9 @@ function viewDashboard(runId) {
         el("span", { class: "muted" }, `后端 ${esc(cfg.backend || "?")} · 威胁 ${esc(cfg.threat_model || "?")}`)),
       el("div", { class: "muted" }, `轮 ${S.round}/${cfg.max_rounds ?? "?"} · dry ${S.dry} · 用时 ${elapsed}s`)));
     const stats = el("div", { class: "stats" },
-      el("div", { class: "stat" }, el("div", { class: "n" }, String(S.findings.size)), el("div", { class: "l" }, "疑似漏洞")),
+      el("div", { class: "stat" }, el("div", { class: "n" }, String(suspectedCount)), el("div", { class: "l" }, "疑似漏洞")),
+      el("div", { class: "stat" }, el("div", { class: "n" }, String(manualConfirmed)), el("div", { class: "l" }, "确认漏洞")),
+      el("div", { class: "stat" }, el("div", { class: "n" }, fmtPct(manualConfirmed, suspectedCount)), el("div", { class: "l" }, "准确率")),
       ...SEVS.map(s => el("div", { class: "stat" }, el("div", { class: "n", style: "color:var(--" + (s === "critical" ? "crit" : s === "high" ? "high" : s === "medium" ? "med" : s === "low" ? "low" : "info") + ")" }, String(bySev[s] || 0)), el("div", { class: "l" }, s))),
       el("div", { class: "stat" }, el("div", { class: "n" }, String(S.candidates)), el("div", { class: "l" }, "候选")),
       el("div", { class: "stat" }, el("div", { class: "n" }, String(S.risks.size)), el("div", { class: "l" }, "风险登记")),
@@ -357,6 +369,40 @@ function viewDashboard(runId) {
     if (activeTab === "exports") return renderExports();
   }
 
+  function renderFindingFeedback(f) {
+    const select = el("select", { class: "feedback-select", title: "人工确认反馈" },
+      ...FINDING_FEEDBACK_OPTIONS.map(([value, label]) =>
+        el("option", { value, selected: value === findingFeedbackStatus(f) ? "" : null }, label)));
+    const wrap = el("label", { class: "feedback-control" },
+      el("span", { class: "muted" }, "人工确认"),
+      select);
+    wrap.addEventListener("click", e => e.stopPropagation());
+    select.addEventListener("change", async e => {
+      e.stopPropagation();
+      const previous = findingFeedbackStatus(f);
+      const status = select.value;
+      select.disabled = true;
+      try {
+        const r = await api("POST", `/api/runs/${encodeURIComponent(runId)}/findings/${encodeURIComponent(f.id)}/feedback`, { status });
+        if (r.finding) {
+          Object.assign(f, r.finding);
+          S.findings.set(f.id, f);
+        } else {
+          f.manual_feedback = { status };
+        }
+        renderHeader();
+        renderTabs();
+        flash("人工确认反馈已保存");
+      } catch (err) {
+        select.value = previous;
+        flash("保存反馈失败: " + err.message);
+      } finally {
+        select.disabled = false;
+      }
+    });
+    return wrap;
+  }
+
   function renderFindings() {
     const list = [...S.findings.values()].sort((a, b) => SEVS.indexOf(a.corrected_severity) - SEVS.indexOf(b.corrected_severity));
     if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无疑似漏洞(审计进行中会实时出现)。")); return; }
@@ -365,10 +411,13 @@ function viewDashboard(runId) {
       const modelBits = [];
       if (f.audit_model) modelBits.push("审计 " + f.audit_model);
       if (vmodels.length) modelBits.push("验证 " + vmodels.join("/"));
+      const outputTs = f.output_ts || f.confirmed_at || f.created_at || 0;
       const head = el("div", { class: "head" }, sevPill(f.corrected_severity),
         el("span", { class: "title" }, f.title || f.id),
         el("span", { class: "muted" }, f.bug_class || ""),
         el("span", { class: "loc" }, `${f.file || ""}:${f.line || 0}`),
+        el("span", { class: "muted output-time" }, `输出 ${fmtTs(outputTs)}`),
+        renderFindingFeedback(f),
         modelBits.length ? el("span", { class: "muted model-attr" }, "🧠 " + modelBits.join(" · ")) : null);
       const body = el("div", { class: "body md" }, el("div", { class: "muted" }, "加载详情…"));
       const card = el("div", { class: "finding" }, head, body);
@@ -377,6 +426,10 @@ function viewDashboard(runId) {
         if (card.classList.contains("open") && !body.dataset.loaded) {
           try {
             const full = await api("GET", `/api/runs/${encodeURIComponent(runId)}/findings/${encodeURIComponent(f.id)}`);
+            Object.assign(f, {
+              output_ts: full.output_ts || f.output_ts,
+              manual_feedback: full.manual_feedback || f.manual_feedback || {},
+            });
             body.dataset.loaded = "1";
             body.innerHTML = mdToHtml(full.report_body || "(无正文)");
             const votes = Array.isArray(full.votes) ? full.votes : [];
@@ -388,6 +441,7 @@ function viewDashboard(runId) {
               ? `裁决票 ${confirmCount} 确认 / ${rejectCount} 否决 / ${countedVotes.length} 合格`
               : votes.map(v => `${v.model || "?"}${v.is_real ? "✓" : "✗"}`).join("、");
             const attrBits = [];
+            if (full.output_ts) attrBits.push("<strong>输出时间:</strong> " + esc(fmtTs(full.output_ts)));
             if (full.audit_model) attrBits.push("<strong>审计模型:</strong> " + esc(full.audit_model));
             if (voteTxt) attrBits.push("<strong>验证裁决:</strong> " + esc(voteTxt));
             else if ((full.verify_models || []).length) attrBits.push("<strong>验证模型:</strong> " + esc(full.verify_models.join("、")));
@@ -1309,6 +1363,7 @@ function viewDashboard(runId) {
       case "agent_update": applyAgentUpdate(d); renderHeader(); renderTabs(); if (activeTab === "agents") renderTab(); break;
       case "candidate_found": { const existed = S.candidateMap.has(candKeyOf(d)); upsertCandidate(d); if (!existed) S.candidates++; renderHeader(); renderTabs(); if (activeTab === "candidates") renderTab(); break; }
       case "finding_confirmed": {
+        if (!d.output_ts && ev.ts) d.output_ts = ev.ts / 1000;
         if (d.id && !S.findings.has(d.id)) { S.findings.set(d.id, d); flash("✔ 疑似漏洞 " + d.id + " [" + d.corrected_severity + "]"); }
         else if (d.id) S.findings.set(d.id, d);
         const cc = upsertCandidate(d);

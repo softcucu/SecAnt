@@ -4,7 +4,7 @@
 结构化为主:运行期**只写结构化态**(经 RunStore 按关注点分文件落盘:checkpoint.json / recon.json /
 attack-surface.json / findings/<id>.json / risks/<id>.json / usage.jsonl)并发结构化事件(经 EventBus → SSE + events.jsonl);
 不再在运行期写 RECON/ATTACK-SURFACE/RISKS/findings/INDEX/SARIF 这些 Markdown——它们改由 exporters.py
-从结构化态**按需渲染**(Web 导出端点 / CLI `--export`)。漏洞/风险确认即各写一个文件(流式、写一次即终态)。
+从结构化态**按需渲染**(Web 导出端点 / CLI `--export`)。漏洞/风险确认即各写一个文件(流式落盘)。
 """
 from __future__ import annotations
 
@@ -1069,8 +1069,9 @@ class Pipeline:
             rec["report_body"] = body or ""
             rec["poc"] = poc
             rec["report_failed"] = not body
+            rec["output_ts"] = time.time()
             self.confirmed.append(rec)
-            self.store.save_finding(rec)            # 流式:确认即写 findings/<id>.json(写一次即终态)
+            self.store.save_finding(rec)            # 流式:确认即写 findings/<id>.json
             self.processed_keys.add(k)
             self.pending_findings.pop(k, None)
             cand = {**self._candidate_payload(rec), "status": "confirmed", "id": fid,
@@ -1175,7 +1176,7 @@ class Pipeline:
             self.seq = ckpt.get("seq", 0)
             self.risk_seq = ckpt.get("risk_seq", 0)
             self.start_round = ckpt.get("round", 0)
-            self.confirmed = self.store.load_findings()            # 扫 findings/<id>.json 恢复(写一次即终态)
+            self.confirmed = self.store.load_findings()            # 扫 findings/<id>.json 恢复
             for k in (ckpt.get("processedKeys") or []):
                 self.dedup_keys.add(k)
                 self.processed_keys.add(k)

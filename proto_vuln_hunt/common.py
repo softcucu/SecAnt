@@ -80,6 +80,8 @@ def slim_finding(c: Dict[str, Any]) -> Dict[str, Any]:
         "file": c.get("file"), "line": c.get("line") or 0, "function": c.get("function") or "",
         "exploitability": c.get("exploitability") or "", "variant_of": c.get("variant_of") or "",
         "audit_model": c.get("audit_model") or "", "verify_models": c.get("verify_models") or [],
+        "output_ts": c.get("output_ts") or c.get("confirmed_at") or c.get("created_at") or 0,
+        "manual_feedback": c.get("manual_feedback") or {},
     }
 
 

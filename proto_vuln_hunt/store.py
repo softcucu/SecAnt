@@ -5,13 +5,13 @@
   recon.json           —— 纯静态侦察认知(用途/威胁/仓库知识/build_hint/初始攻击面/历史模式),写一次
   attack-surface.json  —— 攻击面(初始+动态)+ 覆盖台账 + progress,每轮整体快照(状态持续演变)
   candidates/<hash>.json —— 每条候选/非问题的当前状态(候选、已确认、已否决、验证失败)
-  findings/<id>.json   —— 每条确认漏洞一个文件,确认即写、写一次即终态
+  findings/<id>.json   —— 每条确认漏洞一个文件,确认即写;人工反馈可追加更新
   risks/<id>.json      —— 每条风险一个文件,登记即写、写一次即终态
   usage.jsonl          —— 每次 agent 调用的 token 使用记录(真实 usage 或轻量估算)
   events.jsonl         —— append-only 事件日志(SSE 重放 / 服务重启回看)
   exports/             —— 按需生成的 MD / SARIF(由 exporters.py 渲染)
 
-判据:会演变的(攻击面/覆盖)单文件快照;写定不动的(漏洞/风险)多文件;纯认知(recon)单文件。
+判据:会演变的(攻击面/覆盖)单文件快照;漏洞/风险多文件独立寻址;纯认知(recon)单文件。
 旧版单一 state.json 仍可被向后兼容读取(_legacy_combined)。
 Web 的 run 放在 runs_root/<run_id>/;CLI 仍可用 <out_dir>/ 当 run 目录(resume 行为不变)。
 """
@@ -68,7 +68,7 @@ class RunStore:
         return os.path.join(self.dir, "attack-surface.json")
 
     @property
-    def findings_dir(self) -> str:               # 每条确认漏洞一个 <id>.json(写一次即终态)
+    def findings_dir(self) -> str:               # 每条确认漏洞一个 <id>.json(人工反馈可追加更新)
         return os.path.join(self.dir, "findings")
 
     @property
@@ -216,6 +216,19 @@ class RunStore:
             if c.get("id") == fid:
                 return c
         return None
+
+    def update_finding_feedback(self, fid: str, feedback: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """保存人工确认反馈。只更新 finding 记录,不改变流水线的自动验证结论。"""
+        if not self._safe_id(fid):
+            return None
+        d = self.load_finding(fid)
+        if not d:
+            return None
+        d["manual_feedback"] = feedback
+        if not d.get("output_ts"):
+            d["output_ts"] = d.get("confirmed_at") or d.get("created_at") or 0
+        self.save_finding(d)
+        return d
 
     def load_findings(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []

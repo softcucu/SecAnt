@@ -10,6 +10,7 @@ import asyncio
 import dataclasses
 import json
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from . import exporters
@@ -31,6 +32,8 @@ _RUN_FIELDS = {
 # 续跑历史任务时,这些"后端/模型"字段改用本次启动的基础配置(self.base,随服务重启读取最新
 # 配置文件刷新),而不沿用 run 首次创建时落盘的旧快照——避免改了配置文件重启后续跑仍用老模型。
 _RESUME_FROM_BASE_FIELDS = {"backend", "models", "model_concurrency"}
+
+_FINDING_FEEDBACK_STATUSES = {"unreviewed", "confirmed", "false_positive", "needs_review"}
 
 
 def _meta_from_manifest(m: Dict[str, Any]) -> Dict[str, Any]:
@@ -194,6 +197,31 @@ def _merge_candidate(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]
     return dst
 
 
+def _apply_finding_output_times(store: RunStore, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """旧 run 兼容:旧 finding 文件无 output_ts 时,从 finding_confirmed 事件时间补展示用时间。"""
+    missing = {f.get("id") for f in findings if f.get("id") and not f.get("output_ts")}
+    if not missing:
+        return findings
+    by_id: Dict[str, float] = {}
+    for ev in store.read_events(0):
+        if ev.get("type") != EV.FINDING_CONFIRMED:
+            continue
+        d = ev.get("data") or {}
+        fid = d.get("id")
+        if fid in missing:
+            by_id[fid] = float(d.get("output_ts") or (ev.get("ts") or 0) / 1000 or 0)
+    for f in findings:
+        fid = f.get("id")
+        if fid in by_id and not f.get("output_ts"):
+            f["output_ts"] = by_id[fid]
+    return findings
+
+
+def _response_findings(store: RunStore) -> List[Dict[str, Any]]:
+    findings = _apply_finding_output_times(store, finalize_findings(store.load_findings()))
+    return [slim_finding(c) for c in findings]
+
+
 def _candidate_snapshot_from_events(store: RunStore) -> List[Dict[str, Any]]:
     """旧 run 兼容:只重放候选相关事件,迁移成 candidates/*.json 后续直接读结构化态。"""
     rank = {"pending": 0, "verify_failed": 1, "confirmed": 2, "rejected": 3}
@@ -244,7 +272,7 @@ def _dashboard_snapshot(store: RunStore, running: bool, last_seq: int) -> Dict[s
         "last_seq": last_seq,
         "round": asf.get("round") or (store.load_checkpoint() or {}).get("round") or 0,
         "manifest": manifest,
-        "findings": [slim_finding(c) for c in finalize_findings(store.load_findings())],
+        "findings": _response_findings(store),
         "candidates": candidates,
         "nonissues": [c for c in candidates if c.get("status") == "rejected"],
         "risks": store.load_risks(),
@@ -340,7 +368,7 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
     @app.get("/api/runs/{run_id}/findings")
     async def findings(run_id: str):
         store = _store_or_404(run_id)
-        return [slim_finding(c) for c in finalize_findings(store.load_findings())]
+        return _response_findings(store)
 
     @app.get("/api/runs/{run_id}/findings/{fid}")
     async def finding(run_id: str, fid: str):
@@ -348,7 +376,25 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
         rec = store.load_finding(fid)
         if not rec:
             raise HTTPException(404, "finding not found")
+        _apply_finding_output_times(store, [rec])
         return rec
+
+    @app.post("/api/runs/{run_id}/findings/{fid}/feedback")
+    async def set_finding_feedback(run_id: str, fid: str, req: Request):
+        store = _store_or_404(run_id)
+        body = await req.json()
+        status = (body or {}).get("status") or "unreviewed"
+        if status not in _FINDING_FEEDBACK_STATUSES:
+            raise HTTPException(400, "status 必须是 unreviewed/confirmed/false_positive/needs_review 之一")
+        note = str((body or {}).get("note") or "")[:2000]
+        feedback: Dict[str, Any] = {"status": status, "updated_at": time.time()}
+        if note:
+            feedback["note"] = note
+        rec = store.update_finding_feedback(fid, feedback)
+        if not rec:
+            raise HTTPException(404, "finding not found")
+        _apply_finding_output_times(store, [rec])
+        return {"ok": True, "finding": slim_finding(rec)}
 
     @app.get("/api/runs/{run_id}/coverage")
     async def coverage(run_id: str):

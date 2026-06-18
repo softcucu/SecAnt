@@ -6,7 +6,7 @@ from proto_vuln_hunt import events as EV
 from proto_vuln_hunt.events import EventBus
 from proto_vuln_hunt.pipeline import Pipeline
 from proto_vuln_hunt.config import Config
-from proto_vuln_hunt.server import _candidate_snapshot_from_events
+from proto_vuln_hunt.server import _candidate_snapshot_from_events, _response_findings
 from proto_vuln_hunt.store import RunStore
 
 
@@ -94,6 +94,23 @@ class RecordAgentWiringTests(unittest.TestCase):
 
 
 class SnapshotMigrationTests(unittest.TestCase):
+    def test_response_findings_include_feedback_and_legacy_output_time(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = RunStore(td).ensure()
+            store.save_finding({
+                "id": "MEM-001", "title": "t", "bug_class": "memory",
+                "file": "a.c", "line": 10, "severity": "high",
+            })
+            store.append_event({"seq": 1, "ts": 12345000, "type": EV.FINDING_CONFIRMED, "data": {
+                "id": "MEM-001",
+            }})
+            updated = store.update_finding_feedback("MEM-001", {"status": "confirmed", "updated_at": 200.0})
+
+            self.assertEqual(updated["manual_feedback"]["status"], "confirmed")
+            rows = _response_findings(store)
+            self.assertEqual(rows[0]["manual_feedback"]["status"], "confirmed")
+            self.assertEqual(rows[0]["output_ts"], 12345.0)
+
     def test_legacy_events_migrate_rejected_candidate(self):
         with tempfile.TemporaryDirectory() as td:
             store = RunStore(td).ensure()

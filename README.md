@@ -149,13 +149,13 @@ shell 插值方式,否则换行会被 shell 当作命令分隔。
 ├── checkpoint.json      # 运行时机制态(round/seq/processed/pending/dedup…),高频小幅刷
 ├── recon.json           # 纯静态侦察认知(用途/威胁/仓库知识/build_hint/初始攻击面/历史模式),写一次
 ├── attack-surface.json  # 攻击面(初始+动态)+ 覆盖台账 + progress,每轮整体快照(状态持续演变)
-├── findings/<id>.json   # 每条确认漏洞一个文件(确认即写、写一次即终态;含全文/votes/poc)
+├── findings/<id>.json   # 每条确认漏洞一个文件(确认即写;含全文/votes/poc,人工反馈可追加更新)
 ├── risks/<id>.json      # 每条风险一个文件(登记即写、写一次即终态)
 ├── events.jsonl         # append-only 事件日志(SSE 重放 / 服务重启回看)
 └── exports/             # 按需渲染的 MD/SARIF(Web「导出全部」或 CLI --export 时生成)
 ```
 
-**拆分判据**:会演变的(攻击面/覆盖)用单文件快照;写定不动的(漏洞/风险)用多文件、各自独立寻址、确认即流式落盘;纯认知(recon)单文件;运行机制态单独放 `checkpoint.json`,这样高频刷新不再带着漏洞全文反复重写。旧版单一 `state.json` 仍可被向后兼容读取。
+**拆分判据**:会演变的(攻击面/覆盖)用单文件快照;漏洞/风险用多文件、各自独立寻址、确认即流式落盘;纯认知(recon)单文件;运行机制态单独放 `checkpoint.json`,这样高频刷新不再带着漏洞全文反复重写。旧版单一 `state.json` 仍可被向后兼容读取。
 
 **导出**(从结构化态按需渲染,内容与原 workflow 一致):`RECON.md` / `ATTACK-SURFACE.md`(含覆盖台账)/
 `RISKS.md` / `findings/<CLASS>-NNN.md`(frontmatter + 7 段式)/ `INDEX.md` / `REPORT.sarif`(2.1.0)。
