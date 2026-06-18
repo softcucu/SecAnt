@@ -2,6 +2,7 @@
 // ──────────────────────── helpers ────────────────────────
 const app = document.getElementById("app");
 const SEVS = ["critical", "high", "medium", "low", "info"];
+const RELATED_CANDIDATE_RENDER_LIMIT = 80;
 const FINDING_FEEDBACK_OPTIONS = [
   ["unreviewed", "未确认"],
   ["confirmed", "确认漏洞"],
@@ -346,7 +347,7 @@ function viewDashboard(runId) {
   const TABS = [["findings", "漏洞"], ["candidates", "候选"], ["nonissues", "非问题"], ["agents", "实时Agent"], ["health", "模型"], ["coverage", "攻击面覆盖"], ["history", "历史问题"], ["risks", "潜在风险点"], ["usage", "历史任务"], ["recon", "侦察"], ["activity", "活动"], ["exports", "导出"]];
   function renderTabs() {
     tabsBar.innerHTML = "";
-    const activeAgents = [...S.agentMap.values()].filter(isAgentActive).length;
+    const activeAgents = [...S.agentMap.values()].filter(a => isAgentActive(a) && isVisibleAgentCategory(agentCategory(a))).length;
     const counts = { findings: S.findings.size, candidates: S.candidateMap.size, nonissues: S.nonIssueMap.size, risks: S.risks.size, usage: S.usageRows.length, health: S.health.size, agents: activeAgents, history: (S.recon?.history || []).length };
     for (const [key, label] of TABS) {
       const t = el("div", { class: "tab" + (key === activeTab ? " active" : "") }, label);
@@ -620,13 +621,30 @@ function viewDashboard(runId) {
       uniq.push(c);
     }
     if (!uniq.length) return el("span", { class: "muted" }, emptyText);
-    return el("details", { class: "related-candidates" },
-      el("summary", {}, `候选 ${uniq.length}`),
-      el("div", { class: "related-list" },
-        ...uniq.map(c => el("div", { class: "related-item" },
+    const list = el("div", { class: "related-list" });
+    let rendered = false;
+    const renderList = () => {
+      if (rendered) return;
+      rendered = true;
+      const shown = uniq.slice(0, RELATED_CANDIDATE_RENDER_LIMIT);
+      const frag = document.createDocumentFragment();
+      for (const c of shown) {
+        frag.append(el("div", { class: "related-item" },
           candPill(c.status),
           el("span", { class: "related-title" }, candidateSummaryLine(c)),
-          linkButton(candidateActionLabel(c), () => jumpToCandidate(c))))));
+          linkButton(candidateActionLabel(c), () => jumpToCandidate(c))));
+      }
+      if (uniq.length > shown.length) {
+        frag.append(el("div", { class: "related-more muted" },
+          `仅显示前 ${shown.length} 条，另有 ${uniq.length - shown.length} 条可到候选页查看`));
+      }
+      list.append(frag);
+    };
+    const details = el("details", { class: "related-candidates" },
+      el("summary", {}, `候选 ${uniq.length}`),
+      list);
+    details.addEventListener("toggle", () => { if (details.open) renderList(); });
+    return details;
   }
   function renderCandidates() {
     const list = [...S.candidateMap.values()];
@@ -882,9 +900,8 @@ function viewDashboard(runId) {
     synthesis: "汇总",
     recheck: "复查",
     util: "工具",
-    agent: "Agent",
   };
-  const AGENT_ROLE_ORDER = ["recheck", "recon", "history", "decompose", "audit", "verify", "report", "poc", "synthesis", "util", "agent"];
+  const AGENT_ROLE_ORDER = ["recheck", "recon", "history", "decompose", "audit", "verify", "report", "poc", "synthesis", "util"];
   // 始终常驻显示的 8 个角色分组(与 pipeline 实际拉起的 role 一一对应),无论当前是否有在跑的 agent。
   const AGENT_REAL_ROLES = ["recon", "decompose", "history", "audit", "verify", "recheck", "report", "poc"];
   function isAgentActive(a) { return ["queued", "running", "retrying", "failed_attempt"].includes(a.status); }
@@ -918,6 +935,7 @@ function viewDashboard(runId) {
     renderTab();
   }
   function agentCategory(a) { return String(a.role || "agent"); }
+  function isVisibleAgentCategory(key) { return key && key !== "agent"; }
   function agentCategoryLabel(key) { return AGENT_ROLE_TXT[key] || key || "Agent"; }
   function agentGroupOrder(key) {
     const i = AGENT_ROLE_ORDER.indexOf(key);
@@ -1204,8 +1222,8 @@ function viewDashboard(runId) {
   }
   function renderAgents() {
     // 8 个角色分组常驻显示(无论当前是否有在跑的 agent),组头显示运行中/已结束数量;
-    // 组体只列正在运行的 agent 卡片,跑完的不再展示。出现未知角色时追加其分组,确保不遗漏。
-    const all = [...S.agentMap.values()].sort(agentSort);
+    // 组体只列正在运行的 agent 卡片,跑完的不再展示。出现非兜底未知角色时追加其分组,确保不遗漏。
+    const all = [...S.agentMap.values()].sort(agentSort).filter(a => isVisibleAgentCategory(agentCategory(a)));
     const running = all.filter(isAgentActive);
     const done = all.length - running.length;
     tabBody.append(el("div", { class: "panel agent-summary" },
