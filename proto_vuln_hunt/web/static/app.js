@@ -630,6 +630,14 @@ function viewDashboard(runId) {
   const HEALTH_TXT = { ok: "✅ 正常", down: "⛔ 不可达", degraded: "⚠️ 异常", checking: "⏳ 检查中", unknown: "· 未检查" };
   function healthPill(s) { return el("span", { class: "pill health-" + (s || "unknown") }, HEALTH_TXT[s] || s || "未检查"); }
   function isCallErrorText(s) { return /CLI 未产出|后端输出无可解析 JSON|结构化 JSON|parsefail|stdout 已存/.test(String(s || "")); }
+  function runningModelCounts() {
+    const counts = new Map();
+    for (const a of S.agentMap.values()) {
+      if (a.status !== "running" || !a.model) continue;
+      counts.set(a.model, (counts.get(a.model) || 0) + 1);
+    }
+    return counts;
+  }
   function renderConfigPanel() {
     const cfg = (S.manifest && S.manifest.config) || {};
     const running = isRunClockActive();
@@ -670,6 +678,7 @@ function viewDashboard(runId) {
   function renderModels() {
     renderConfigPanel();
     const list = [...S.health.values()];
+    const runningByModel = runningModelCounts();
     const bar = el("div", { class: "row", style: "justify-content:space-between;margin-bottom:6px" },
       el("strong", {}, "各模型健康度"),
       el("button", { class: "btn secondary", onclick: recheckHealth }, "🩺 重新检查"));
@@ -680,7 +689,7 @@ function viewDashboard(runId) {
     const order = { checking: 0, down: 1, degraded: 2, unknown: 3, ok: 4 };
     list.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9) || String(a.model).localeCompare(String(b.model)));
     const tbl = el("table", {}, el("thead", {}, el("tr", {},
-      el("th", {}, "状态"), el("th", {}, "模型"), el("th", {}, "首 token"), el("th", {}, "平均输出速度"), el("th", {}, "探针(正常/总)"),
+      el("th", {}, "状态"), el("th", {}, "模型"), el("th", {}, "运行中"), el("th", {}, "首 token"), el("th", {}, "平均输出速度"), el("th", {}, "探针(正常/总)"),
       el("th", {}, "成功调用"), el("th", {}, "失败"), el("th", {}, "最近探针答复"), el("th", {}, "最近调用异常"), el("th", {}, "最近检查"))));
     const tb = el("tbody");
     for (const h of list) {
@@ -694,6 +703,7 @@ function viewDashboard(runId) {
       tb.append(el("tr", {},
         el("td", {}, healthPill(h.status)),
         el("td", { class: "loc" }, h.model || "—"),
+        el("td", {}, String(runningByModel.get(h.model) || 0)),
         el("td", {}, fmtMs(firstTokenMs)),
         el("td", { title: speedTitle }, fmtTps(h.last_output_tokens_per_s)),
         el("td", {}, `${h.ok_checks || 0}/${h.checks || 0}`),
@@ -1360,7 +1370,7 @@ function viewDashboard(runId) {
       case "run_status": setRunStatus(d.status); renderHeader(); break;
       case "metrics": applyMetrics(d); renderHeader(); break;
       case "usage": { const u = cleanUsage(d); const uid = u.id == null ? "" : String(u.id); if (uid && S.usageIds.has(uid)) break; if (uid) S.usageIds.add(uid); S.usageRows.push(u); addUsage(S.usage, u); renderHeader(); renderTabs(); if (activeTab === "usage") renderTab(); break; }
-      case "agent_update": applyAgentUpdate(d); renderHeader(); renderTabs(); if (activeTab === "agents") renderTab(); break;
+      case "agent_update": applyAgentUpdate(d); renderHeader(); renderTabs(); if (activeTab === "agents" || activeTab === "health") renderTab(); break;
       case "candidate_found": { const existed = S.candidateMap.has(candKeyOf(d)); upsertCandidate(d); if (!existed) S.candidates++; renderHeader(); renderTabs(); if (activeTab === "candidates") renderTab(); break; }
       case "finding_confirmed": {
         if (!d.output_ts && ev.ts) d.output_ts = ev.ts / 1000;
