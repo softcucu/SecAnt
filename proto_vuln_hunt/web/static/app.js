@@ -260,6 +260,35 @@ function viewDashboard(runId) {
   const nonIssueOpenKeys = new Set();
   let tabRenderTimer = null;
   let pendingFocus = null;
+  // 大列表分页:每页只建一页 DOM,切页签与 SSE 重渲都只重建当页,与总量无关。
+  const PAGE_SIZE = { findings: 40, candidates: 100, nonissues: 40, history: 50, risks: 50 };
+  const pageState = { findings: 1, candidates: 1, nonissues: 1, history: 1, risks: 1 };
+  function clampPage(p, total) { return Math.min(Math.max(1, p | 0 || 1), Math.max(1, total)); }
+  // 返回当前页应渲染的切片;若 pendingFocus 命中某条,则翻到它所在页。
+  function paginate(tabKey, list, focusIndex = -1) {
+    const size = PAGE_SIZE[tabKey] || 50;
+    const pages = Math.max(1, Math.ceil(list.length / size));
+    let page = pageState[tabKey] || 1;
+    if (focusIndex >= 0) page = Math.floor(focusIndex / size) + 1;
+    page = clampPage(page, pages);
+    pageState[tabKey] = page;
+    const start = (page - 1) * size;
+    return { items: list.slice(start, start + size), page, pages, size, total: list.length, start };
+  }
+  function pagerBar(tabKey, info) {
+    if (info.pages <= 1) return null;
+    const go = (p) => {
+      pageState[tabKey] = clampPage(p, info.pages);
+      renderTab();
+      tabBody.scrollIntoView({ block: "start", behavior: "smooth" });
+    };
+    const prev = el("button", { type: "button", class: "btn secondary", disabled: info.page <= 1 ? "" : null, onclick: () => go(info.page - 1) }, "← 上一页");
+    const next = el("button", { type: "button", class: "btn secondary", disabled: info.page >= info.pages ? "" : null, onclick: () => go(info.page + 1) }, "下一页 →");
+    const label = el("span", { class: "muted" },
+      `第 ${info.page}/${info.pages} 页 · 显示 ${info.start + 1}–${info.start + info.items.length} / 共 ${info.total}`);
+    return el("div", { class: "pager row", style: "justify-content:space-between;align-items:center;margin:8px 0" },
+      prev, label, next);
+  }
   let agentOutputMode = localStorage.getItem("pvh.agentOutputMode") === "raw" ? "raw" : "pretty";
   const agentGroupStoreKey = `pvh.agentGroupsCollapsed:${runId}`;
   const agentOutputStoreKey = `pvh.agentOutputsExpanded:${runId}`;
@@ -267,6 +296,11 @@ function viewDashboard(runId) {
   let expandedAgentOutputs = loadLocalSet(agentOutputStoreKey);
   let elapsedBase = 0;
   let elapsedBaseAt = Date.now();
+  // 候选列表缓存:仅在新增/清空候选时失效,渲染期间复用同一数组,
+  // 避免 renderHistory/renderRisks/renderCoverage 每行都 [...S.candidateMap.values()]。
+  let candListCache = null;
+  function candidateList() { return candListCache || (candListCache = [...S.candidateMap.values()]); }
+  function invalidateCandIndex() { candListCache = null; }
 
   const header = el("div", { class: "panel" });
   const tabsBar = el("div", { class: "tabs" });
@@ -386,6 +420,18 @@ function viewDashboard(runId) {
       renderTab();
     }, delay);
   }
+  // agent_update 在流式输出时频率极高(每个 chunk 一次),合并到 ~150ms 一帧统一刷新,
+  // 避免 header/tabs/tab 被逐 token 全量重建造成持续卡顿。
+  let agentRefreshTimer = null;
+  function scheduleAgentRefresh(delay = 150) {
+    if (agentRefreshTimer) return;
+    agentRefreshTimer = setTimeout(() => {
+      agentRefreshTimer = null;
+      renderHeader();
+      renderTabs();
+      if (activeTab === "agents" || activeTab === "health") renderTab();
+    }, delay);
+  }
   function showTab(key, focus = null) {
     activeTab = key;
     pendingFocus = focus;
@@ -480,7 +526,12 @@ function viewDashboard(runId) {
   function renderFindings() {
     const list = [...S.findings.values()].sort((a, b) => SEVS.indexOf(a.corrected_severity) - SEVS.indexOf(b.corrected_severity));
     if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无疑似漏洞(审计进行中会实时出现)。")); return; }
-    for (const f of list) {
+    const focusIdx = pendingFocus?.type === "finding" ? list.findIndex(f => String(f.id) === String(pendingFocus.id)) : -1;
+    const info = paginate("findings", list, focusIdx);
+    const topPager = pagerBar("findings", info);
+    if (topPager) tabBody.append(topPager);
+    const frag = document.createDocumentFragment();
+    for (const f of info.items) {
       const vmodels = Array.isArray(f.verify_models) ? f.verify_models : [];
       const modelBits = [];
       if (f.audit_model) modelBits.push("审计 " + f.audit_model);
@@ -529,8 +580,11 @@ function viewDashboard(runId) {
           } catch (e) { body.innerHTML = "加载失败: " + esc(e.message); }
         }
       });
-      tabBody.append(card);
+      frag.append(card);
     }
+    tabBody.append(frag);
+    const bottomPager = pagerBar("findings", info);
+    if (bottomPager) tabBody.append(bottomPager);
   }
 
   const CAND_STATUS_TXT = { pending: "验证中", confirmed: "已确认", rejected: "已否决", verify_failed: "验证失败" };
@@ -544,6 +598,7 @@ function viewDashboard(runId) {
     for (const k of CAND_FIELDS) {
       if (d[k] !== undefined && d[k] !== null && d[k] !== "") c[k] = d[k];
     }
+    c._relText = undefined; c._varNorm = undefined;   // 关联文本缓存随字段变动失效
     return c;
   }
   function upsertCandidate(d) {
@@ -557,6 +612,7 @@ function viewDashboard(runId) {
     mergeCandidateFields(c, d);
     c.function = c.function || "";
     S.candidateMap.set(k, c);
+    invalidateCandIndex();
     return c;
   }
   function upsertNonIssue(d) {
@@ -576,8 +632,14 @@ function viewDashboard(runId) {
   function normRel(s) {
     return String(s || "").trim().toLowerCase();
   }
+  function candidateVarNorm(c) {
+    if (c._varNorm === undefined) c._varNorm = normRel(c.variant_of);
+    return c._varNorm;
+  }
   function candidateRelText(c) {
-    return normRel([c.variant_of, c.risk_id, c.risk_area, c.title, c.description, c.source_to_sink, c.file].filter(Boolean).join("\n"));
+    if (c._relText === undefined)
+      c._relText = normRel([c.variant_of, c.risk_id, c.risk_area, c.title, c.description, c.source_to_sink, c.file].filter(Boolean).join("\n"));
+    return c._relText;
   }
   function candidateActionLabel(c) {
     if (c.status === "confirmed" && c.id) return "查看漏洞";
@@ -592,20 +654,21 @@ function viewDashboard(runId) {
     const pattern = normRel(h.pattern);
     const source = normRel(h.source);
     if (!pattern && !source) return [];
-    return [...S.candidateMap.values()].filter(c => {
-      const v = normRel(c.variant_of);
+    return candidateList().filter(c => {
+      const v = candidateVarNorm(c);
       return (pattern && v.includes(pattern)) || (source && v.includes(source));
     });
   }
   function candidatesForRisk(r) {
     const rid = normRel(r.id);
     const area = normRel(r.area);
-    return [...S.candidateMap.values()].filter(c => {
+    return candidateList().filter(c => {
       if (rid && normRel(c.risk_id) === rid) return true;
       const text = candidateRelText(c);
       if (rid && text.includes(rid)) return true;
       if (area && normRel(c.risk_area) === area) return true;
-      return area && normRel(c.variant_of).includes("风险") && normRel(c.variant_of).includes(area);
+      const v = candidateVarNorm(c);
+      return area && v.includes("风险") && v.includes(area);
     });
   }
   function ledgerByKey(key) {
@@ -664,11 +727,14 @@ function viewDashboard(runId) {
       (rank[a.status] ?? 9) - (rank[b.status] ?? 9) ||
       (SEVS.indexOf(a.severity) - SEVS.indexOf(b.severity)) ||
       ((a.seq || 0) - (b.seq || 0)));
+    const focusKey = pendingFocus?.type === "candidate" ? pendingFocus.key : null;
+    const focusIdx = focusKey ? list.findIndex(c => (c.key || candKeyOf(c)) === focusKey) : -1;
+    const info = paginate("candidates", list, focusIdx);
     const tbl = el("table", { class: "cand-table" }, el("thead", {}, el("tr", {},
       el("th", {}, "状态"), el("th", {}, "严重度"), el("th", {}, "类别"), el("th", {}, "标题"),
       el("th", {}, "位置"), el("th", {}, "lens"), el("th", {}, "确认编号"))));
     const tb = el("tbody");
-    for (const c of list) {
+    for (const c of info.items) {
       const confirmedRef = c.status === "confirmed" && c.id
         ? linkButton(String(c.id), () => jumpToCandidate(c), "查看漏洞")
         : c.status === "rejected"
@@ -684,7 +750,10 @@ function viewDashboard(runId) {
         el("td", {}, confirmedRef)));
     }
     tbl.append(tb);
-    tabBody.append(el("div", { class: "panel" }, tbl));
+    const panel = el("div", { class: "panel" }, tbl);
+    const pager = pagerBar("candidates", info);
+    if (pager) panel.append(pager);
+    tabBody.append(panel);
   }
 
   function nonIssueVoteReason(v) {
@@ -753,7 +822,13 @@ function viewDashboard(runId) {
     list.sort((a, b) =>
       (SEVS.indexOf(a.severity || "info") - SEVS.indexOf(b.severity || "info")) ||
       ((a.seq || 0) - (b.seq || 0)));
-    for (const c of list) {
+    const focusKey = pendingFocus?.type === "candidate" ? pendingFocus.key : null;
+    const focusIdx = focusKey ? list.findIndex(c => c.key === focusKey) : -1;
+    const info = paginate("nonissues", list, focusIdx);
+    const topPager = pagerBar("nonissues", info);
+    if (topPager) tabBody.append(topPager);
+    const frag = document.createDocumentFragment();
+    for (const c of info.items) {
       const votes = Array.isArray(c.votes) ? c.votes : [];
       const falseCount = c.vote_false ?? votes.filter(v => !v.is_real).length;
       const total = c.vote_total ?? votes.length;
@@ -783,8 +858,11 @@ function viewDashboard(runId) {
           nonIssueOpenKeys.delete(c.key);
         }
       });
-      tabBody.append(card);
+      frag.append(card);
     }
+    tabBody.append(frag);
+    const bottomPager = pagerBar("nonissues", info);
+    if (bottomPager) tabBody.append(bottomPager);
   }
 
   const HEALTH_TXT = { ok: "✅ 正常", down: "⛔ 不可达", degraded: "⚠️ 异常", checking: "⏳ 检查中", unknown: "· 未检查" };
@@ -946,6 +1024,14 @@ function viewDashboard(runId) {
   }
   function agentStreamOutput(a, stream) {
     return (a.chunks || []).filter(c => c.stream === stream).map(c => c.chunk).join("");
+  }
+  // 缓存 stdout 拼接,按 chunk 数量失效,避免每次渲染都 filter+join 全量分片。
+  function agentStdout(a) {
+    const n = (a.chunks || []).length;
+    if (a._stdoutN === n && a._stdout !== undefined) return a._stdout;
+    a._stdoutN = n;
+    a._stdout = agentStreamOutput(a, "stdout") || (n ? "" : (a.output || ""));
+    return a._stdout;
   }
   function modeButton(mode, label) {
     const b = el("button", { type: "button", class: "seg-btn" + (agentOutputMode === mode ? " active" : "") }, label);
@@ -1113,12 +1199,17 @@ function viewDashboard(runId) {
     return { items: items.filter(x => x.kind !== "step" || /finish/.test(x.title)), sessionId };
   }
   function renderAgentReadable(a) {
-    const stdout = agentStreamOutput(a, "stdout") || ((a.chunks || []).length ? "" : (a.output || ""));
-    const events = parseOpencodeEvents(stdout);
-    if (!events) {
+    const stdout = agentStdout(a);
+    // 解析结果按 stdout 长度缓存:流式追加时 length 变化才重解析,切回页签复用上次结果。
+    let cache = a._oc;
+    if (!cache || cache.len !== stdout.length) {
+      const events = parseOpencodeEvents(stdout);
+      cache = a._oc = { len: stdout.length, events: !!events, parsed: events ? buildOpencodeItems(events) : null };
+    }
+    if (!cache.events) {
       return el("pre", { class: "agent-output agent-raw" }, stdout || "(暂未收到 stdout)");
     }
-    const parsed = buildOpencodeItems(events);
+    const parsed = cache.parsed;
     const out = el("div", { class: "agent-output agent-pretty" });
     if (parsed.sessionId) out.append(el("div", { class: "agent-session" }, "session ", el("code", {}, parsed.sessionId)));
     let hasContent = false;
@@ -1284,6 +1375,7 @@ function viewDashboard(runId) {
     const regionNames = new Set(regionRecs.map(r => r.name));
     if (regionRecs.length || tasks.length) {
       tabBody.append(el("h3", { class: "section-title" }, "攻击面审计进度(区域 → 拆解的子任务)"));
+      const regionFrag = document.createDocumentFragment();
       for (const rg of regionRecs) {
         const subs = tasksByRegion.get(rg.name) || [];
         const card = el("div", { class: "region" },
@@ -1294,16 +1386,17 @@ function viewDashboard(runId) {
             statusBadge(rg.status),
             el("span", { class: "rmeta" }, `${subs.length} 个子任务 · 候选 ${rg.candidates || 0} · 风险 ${rg.risks || 0}`)),
           subs.length ? el("div", { class: "subtasks" }, ...subs.map(subtaskRow)) : null);
-        tabBody.append(card);
+        regionFrag.append(card);
       }
       // 区域记录里没有的 region(兜底:子任务的 region 名不在 region 台账里)
       for (const [rname, subs] of tasksByRegion) {
         if (regionNames.has(rname)) continue;
-        tabBody.append(el("div", { class: "region" },
+        regionFrag.append(el("div", { class: "region" },
           el("div", { class: "region-head" }, el("span", { class: "rname" }, rname),
             el("span", { class: "rmeta" }, `${subs.length} 个子任务`)),
           el("div", { class: "subtasks" }, ...subs.map(subtaskRow))));
       }
+      tabBody.append(regionFrag);
     }
 
     // 历史模式排查(variant 工作项)
@@ -1383,9 +1476,10 @@ function viewDashboard(runId) {
   function renderRisks() {
     const list = [...S.risks.values()].sort((a, b) => SEVS.indexOf(a.severity_hint) - SEVS.indexOf(b.severity_hint));
     if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无风险登记。")); return; }
+    const info = paginate("risks", list);
     const tbl = el("table", { class: "data-table risk-table" }, el("thead", {}, el("tr", {}, el("th", {}, "风险"), el("th", {}, "主题"), el("th", {}, "位置"), el("th", {}, "说明"), el("th", {}, "lens"), el("th", {}, "排查"), el("th", {}, "候选"))));
     const tb = el("tbody");
-    for (const r of list) {
+    for (const r of info.items) {
       const sevCell = r.id ? severitySelect(r) : sevPill(r.severity_hint);
       const related = candidatesForRisk(r);
       const ledger = r.id ? ledgerByKey("risk:" + r.id) : null;
@@ -1393,7 +1487,10 @@ function viewDashboard(runId) {
       tb.append(el("tr", {}, el("td", {}, sevCell), el("td", {}, r.area || ""), el("td", { class: "loc" }, r.file || "—"), el("td", {}, r.note || ""), el("td", {}, r.lens || ""), el("td", {}, RECHECK_TXT[r.recheck_status] || r.recheck_status || "—"), el("td", {}, renderRelatedCandidates(related, empty))));
     }
     tbl.append(tb);
-    tabBody.append(el("div", { class: "panel" }, el("div", { class: "table-wrap" }, tbl)));
+    const panel = el("div", { class: "panel" }, el("div", { class: "table-wrap" }, tbl));
+    const pager = pagerBar("risks", info);
+    if (pager) panel.append(pager);
+    tabBody.append(panel);
   }
 
   const PRI_PILL = { high: "high", medium: "medium", low: "low" };
@@ -1454,11 +1551,12 @@ function viewDashboard(runId) {
       return;
     }
     const variants = variantStatusByPattern();
+    const info = paginate("history", hist);
     const tbl = el("table", { class: "data-table history-table" }, el("thead", {}, el("tr", {},
       el("th", {}, "lens"), el("th", {}, "问题模式"), el("th", {}, "是否排查完"),
       el("th", {}, "排查状态"), el("th", {}, "候选"), el("th", {}, "出处"), el("th", {}, "相关文件"))));
     const tb = el("tbody");
-    for (const h of hist) {
+    for (const h of info.items) {
       const key = String(h.pattern || "").trim().toLowerCase();
       const v = variants.get(key);
       const status = v?.status || "";
@@ -1474,7 +1572,10 @@ function viewDashboard(runId) {
         el("td", { class: "loc" }, (h.files || []).join(", ") || "—")));
     }
     tbl.append(tb);
-    tabBody.append(el("div", { class: "panel" }, el("div", { class: "table-wrap" }, tbl)));
+    const panel = el("div", { class: "panel" }, el("div", { class: "table-wrap" }, tbl));
+    const pager = pagerBar("history", info);
+    if (pager) panel.append(pager);
+    tabBody.append(panel);
   }
 
   function renderUsage() {
@@ -1540,7 +1641,7 @@ function viewDashboard(runId) {
       case "run_status": setRunStatus(d.status); renderHeader(); break;
       case "metrics": applyMetrics(d); renderHeader(); break;
       case "usage": { const u = cleanUsage(d); const uid = u.id == null ? "" : String(u.id); if (uid && S.usageIds.has(uid)) break; if (uid) S.usageIds.add(uid); S.usageRows.push(u); addUsage(S.usage, u); renderHeader(); renderTabs(); if (activeTab === "usage") renderTab(); break; }
-      case "agent_update": applyAgentUpdate(d); renderHeader(); renderTabs(); if (activeTab === "agents" || activeTab === "health") renderTab(); break;
+      case "agent_update": applyAgentUpdate(d); scheduleAgentRefresh(); break;
       case "candidate_found": { const existed = S.candidateMap.has(candKeyOf(d)); upsertCandidate(d); if (!existed) S.candidates++; renderHeader(); renderTabs(); if (activeTab === "candidates") renderTab(); break; }
       case "finding_confirmed": {
         if (!d.output_ts && ev.ts) d.output_ts = ev.ts / 1000;
@@ -1598,6 +1699,7 @@ function viewDashboard(runId) {
     for (const f of (snap.findings || [])) if (f.id) S.findings.set(f.id, f);
     S.candidateMap.clear();
     S.nonIssueMap.clear();
+    invalidateCandIndex();
     for (const c of (snap.candidates || [])) {
       const k = candKeyOf(c);
       const rec = Object.assign({ key: k, seq: S.candidateMap.size }, c, { key: k });
