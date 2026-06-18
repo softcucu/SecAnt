@@ -263,6 +263,9 @@ function viewDashboard(runId) {
   // 大列表分页:每页只建一页 DOM,切页签与 SSE 重渲都只重建当页,与总量无关。
   const PAGE_SIZE = { findings: 40, candidates: 100, nonissues: 40, history: 50, risks: 50 };
   const pageState = { findings: 1, candidates: 1, nonissues: 1, history: 1, risks: 1 };
+  let candStatusFilter = "all";   // 候选页按状态筛选:all/pending/confirmed/rejected/verify_failed
+  let histStatusFilter = "all";   // 历史问题页按排查状态筛选
+  let riskStatusFilter = "all";   // 风险页按排查状态筛选
   function clampPage(p, total) { return Math.min(Math.max(1, p | 0 || 1), Math.max(1, total)); }
   // 返回当前页应渲染的切片;若 pendingFocus 命中某条,则翻到它所在页。
   function paginate(tabKey, list, focusIndex = -1) {
@@ -709,25 +712,65 @@ function viewDashboard(runId) {
     details.addEventListener("toggle", () => { if (details.open) renderList(); });
     return details;
   }
+  // 通用状态筛选条:items 形如 [[value,label,count],...](含 "all"),current 为当前选中值。
+  function statusChips(current, items, onPick) {
+    const bar = el("div", { class: "filter-bar row", style: "gap:6px;margin:0 0 8px;flex-wrap:wrap" });
+    for (const [value, label, n] of items) {
+      const btn = el("button", { type: "button", class: "seg-btn" + (current === value ? " active" : "") }, `${label} ${n}`);
+      btn.addEventListener("click", () => { if (current !== value) onPick(value); });
+      bar.append(btn);
+    }
+    return bar;
+  }
+  // 仅展示有数据的状态(动态);value→label 由 labelMap 提供。
+  function dynamicStatusChips(current, list, statusOf, order, labelMap, onPick) {
+    const counts = {};
+    for (const x of list) { const s = statusOf(x); counts[s] = (counts[s] || 0) + 1; }
+    const items = [["all", "全部", list.length]];
+    for (const k of order) if (counts[k]) items.push([k, labelMap[k] || k, counts[k]]);
+    return statusChips(current, items, onPick);
+  }
+  const CAND_FILTERS = [["all", "全部"], ["pending", "验证中"], ["confirmed", "已确认"], ["rejected", "已否决"], ["verify_failed", "验证失败"]];
+  function candStatusFilterBar(counts) {
+    const bar = el("div", { class: "filter-bar row", style: "gap:6px;margin-top:8px;flex-wrap:wrap" });
+    for (const [value, label] of CAND_FILTERS) {
+      const btn = el("button", { type: "button", class: "seg-btn" + (candStatusFilter === value ? " active" : "") },
+        `${label} ${counts[value] || 0}`);
+      btn.addEventListener("click", () => {
+        if (candStatusFilter === value) return;
+        candStatusFilter = value;
+        pageState.candidates = 1;   // 切筛选回到第一页
+        renderTab();
+      });
+      bar.append(btn);
+    }
+    return bar;
+  }
   function renderCandidates() {
-    const list = [...S.candidateMap.values()];
-    const pending = list.filter(c => c.status === "pending").length;
-    const confirmed = list.filter(c => c.status === "confirmed").length;
-    const rejected = list.filter(c => c.status === "rejected").length;
-    const failed = list.filter(c => c.status === "verify_failed").length;
+    const all = [...S.candidateMap.values()];
+    const counts = { all: all.length, pending: 0, confirmed: 0, rejected: 0, verify_failed: 0 };
+    for (const c of all) if (counts[c.status] !== undefined) counts[c.status]++;
+    // 若跳转目标被当前筛选隐藏,自动切回「全部」以保证能定位到。
+    const focusKey = pendingFocus?.type === "candidate" ? pendingFocus.key : null;
+    if (focusKey && candStatusFilter !== "all") {
+      const target = all.find(c => (c.key || candKeyOf(c)) === focusKey);
+      if (target && target.status !== candStatusFilter) candStatusFilter = "all";
+    }
     tabBody.append(el("div", { class: "panel" },
       el("div", { class: "row", style: "justify-content:space-between" },
         el("strong", {}, "漏洞候选点"),
-        el("span", { class: "muted" }, `共 ${list.length} · 验证中 ${pending} · 已确认 ${confirmed} · 已否决 ${rejected} · 验证失败 ${failed}`)),
+        el("span", { class: "muted" }, `共 ${counts.all} · 验证中 ${counts.pending} · 已确认 ${counts.confirmed} · 已否决 ${counts.rejected} · 验证失败 ${counts.verify_failed}`)),
       el("p", { class: "muted", style: "margin:6px 0 0;font-size:12px" },
-        "候选点 = 审计/复查 agent 报出、正在正反举证 + 裁决票验证流水线中的疑点;验证通过后升级为「漏洞」,未过则标为已否决。")));
-    if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无候选点(审计开始后会实时出现)。")); return; }
+        "候选点 = 审计/复查 agent 报出、正在正反举证 + 裁决票验证流水线中的疑点;验证通过后升级为「漏洞」,未过则标为已否决。"),
+      candStatusFilterBar(counts)));
+    if (!all.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无候选点(审计开始后会实时出现)。")); return; }
+    const list = candStatusFilter === "all" ? all : all.filter(c => c.status === candStatusFilter);
+    if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "当前筛选下暂无候选点。")); return; }
     const rank = { pending: 0, verify_failed: 1, confirmed: 2, rejected: 3 };
     list.sort((a, b) =>
       (rank[a.status] ?? 9) - (rank[b.status] ?? 9) ||
       (SEVS.indexOf(a.severity) - SEVS.indexOf(b.severity)) ||
       ((a.seq || 0) - (b.seq || 0)));
-    const focusKey = pendingFocus?.type === "candidate" ? pendingFocus.key : null;
     const focusIdx = focusKey ? list.findIndex(c => (c.key || candKeyOf(c)) === focusKey) : -1;
     const info = paginate("candidates", list, focusIdx);
     const tbl = el("table", { class: "cand-table" }, el("thead", {}, el("tr", {},
@@ -1453,6 +1496,9 @@ function viewDashboard(runId) {
   function statusBadge(s) { return el("span", {}, STATUS_TXT[s] || s || "?"); }
 
   const RECHECK_TXT = { none: "—", queued: "排队中", running: "排查中", done: "已排查", failed: "排查失败" };
+  const RISK_STATUS_ORDER = ["none", "queued", "running", "done", "failed"];
+  const RISK_STATUS_LABEL = { none: "未排查", queued: "排队中", running: "排查中", done: "已排查", failed: "排查失败" };
+  const HISTORY_STATUS_ORDER = ["pending", "in-progress", "completed-clean", "completed-findings", "incomplete", "abandoned", "decomposed"];
 
   function severitySelect(r) {
     const sel = el("select", { class: "sevsel" });
@@ -1473,9 +1519,14 @@ function viewDashboard(runId) {
     return sel;
   }
 
+  const riskRecheckOf = (r) => r.recheck_status || "none";
   function renderRisks() {
-    const list = [...S.risks.values()].sort((a, b) => SEVS.indexOf(a.severity_hint) - SEVS.indexOf(b.severity_hint));
-    if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无风险登记。")); return; }
+    const all = [...S.risks.values()].sort((a, b) => SEVS.indexOf(a.severity_hint) - SEVS.indexOf(b.severity_hint));
+    if (!all.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无风险登记。")); return; }
+    tabBody.append(dynamicStatusChips(riskStatusFilter, all, riskRecheckOf, RISK_STATUS_ORDER, RISK_STATUS_LABEL,
+      v => { riskStatusFilter = v; pageState.risks = 1; renderTab(); }));
+    const list = riskStatusFilter === "all" ? all : all.filter(r => riskRecheckOf(r) === riskStatusFilter);
+    if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "当前筛选下暂无风险。")); return; }
     const info = paginate("risks", list);
     const tbl = el("table", { class: "data-table risk-table" }, el("thead", {}, el("tr", {}, el("th", {}, "风险"), el("th", {}, "主题"), el("th", {}, "位置"), el("th", {}, "说明"), el("th", {}, "lens"), el("th", {}, "排查"), el("th", {}, "候选"))));
     const tb = el("tbody");
@@ -1551,7 +1602,12 @@ function viewDashboard(runId) {
       return;
     }
     const variants = variantStatusByPattern();
-    const info = paginate("history", hist);
+    const histStatusOf = (h) => (variants.get(String(h.pattern || "").trim().toLowerCase())?.status) || "pending";
+    tabBody.append(dynamicStatusChips(histStatusFilter, hist, histStatusOf, HISTORY_STATUS_ORDER, STATUS_TXT,
+      v => { histStatusFilter = v; pageState.history = 1; renderTab(); }));
+    const filtered = histStatusFilter === "all" ? hist : hist.filter(h => histStatusOf(h) === histStatusFilter);
+    if (!filtered.length) { tabBody.append(el("div", { class: "panel empty" }, "当前筛选下暂无历史问题模式。")); return; }
+    const info = paginate("history", filtered);
     const tbl = el("table", { class: "data-table history-table" }, el("thead", {}, el("tr", {},
       el("th", {}, "lens"), el("th", {}, "问题模式"), el("th", {}, "是否排查完"),
       el("th", {}, "排查状态"), el("th", {}, "候选"), el("th", {}, "出处"), el("th", {}, "相关文件"))));

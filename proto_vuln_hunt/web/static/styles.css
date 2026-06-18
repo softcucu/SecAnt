@@ -28,6 +28,7 @@ main{padding:20px clamp(12px,1.6vw,24px);max-width:none;margin:0;width:100%}
 .seg-btn:last-child{border-right:0}
 .seg-btn:hover{background:var(--panel2);color:var(--text)}
 .seg-btn.active{background:var(--accent);color:#fff}
+.filter-bar .seg-btn{border:1px solid var(--border);border-radius:6px}
 
 .panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px}
 .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
