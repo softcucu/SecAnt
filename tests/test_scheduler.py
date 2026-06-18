@@ -289,5 +289,37 @@ class TestSchedulerPriority(unittest.TestCase):
             self.assertEqual(work["kind"], "_history_commit")
 
 
+class TestFinderResultShape(unittest.TestCase):
+    def test_consume_accepts_top_level_finding_array(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = _pipe(tmp)
+            item = {"kind": "task", "objective": "audit", "newThisRound": 0}
+            rec = p.ledger_rec(item)
+            finding = {
+                "title": "t",
+                "bug_class": "memory",
+                "file": "a.c",
+                "function": "f",
+                "description": "d",
+                "severity": "high",
+                "confidence": "medium",
+            }
+
+            p._consume([finding], item, rec, "memory")
+
+            self.assertEqual(item["newThisRound"], 1)
+            self.assertEqual(rec["candidates"], 1)
+            self.assertEqual(len(p.pending_findings), 1)
+
+    def test_consume_rejects_non_object_finding_items(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = _pipe(tmp)
+            item = {"kind": "task", "objective": "audit", "newThisRound": 0}
+            rec = p.ledger_rec(item)
+
+            with self.assertRaisesRegex(ValueError, r"findings\[0\] 应为 object"):
+                p._consume({"findings": [[]]}, item, rec, "memory")
+
+
 if __name__ == "__main__":
     unittest.main()

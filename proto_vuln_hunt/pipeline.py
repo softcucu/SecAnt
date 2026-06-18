@@ -1646,12 +1646,40 @@ class Pipeline:
             return
         self._consume(res, item, rec, lens_key, audit_model=meta.get("model"))
 
-    def _consume(self, res: Dict[str, Any], item: Dict[str, Any], rec: Dict[str, Any],
+    @staticmethod
+    def _finder_result(res: Any) -> Dict[str, Any]:
+        if isinstance(res, dict):
+            return res
+        if isinstance(res, list):
+            return {"findings": res}
+        raise ValueError(f"finder 输出应为 JSON object,实际 {type(res).__name__}")
+
+    @staticmethod
+    def _finder_result_array(res: Dict[str, Any], key: str, *, required: bool = False) -> List[Dict[str, Any]]:
+        if key not in res:
+            if required:
+                raise ValueError(f"finder 输出缺少必需字段 {key}")
+            return []
+        value = res.get(key)
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError(f"finder 输出字段 {key} 应为 list,实际 {type(value).__name__}")
+        for i, item in enumerate(value):
+            if not isinstance(item, dict):
+                raise ValueError(f"finder 输出字段 {key}[{i}] 应为 object,实际 {type(item).__name__}")
+        return value
+
+    def _consume(self, res: Any, item: Dict[str, Any], rec: Dict[str, Any],
                  lens_key: str, from_recheck: bool = False, audit_model: Optional[str] = None) -> None:
         """消化一次审计 / 复查 agent 的结果:findings→验证流水线、new_surfaces→主队列、risk_notes→登记。
         from_recheck=True 时,产出的 risk_notes 不再二次回灌优先队列(防自激)。
         audit_model:产出该批 finding 的模型,归因到候选(随候选流转到验证/确认/报告)。"""
-        for f in (res.get("findings") or []):
+        res = self._finder_result(res)
+        findings = self._finder_result_array(res, "findings", required=True)
+        new_surfaces = self._finder_result_array(res, "new_surfaces")
+        risk_notes = self._finder_result_array(res, "risk_notes")
+        for f in findings:
             fk = finding_key(f)
             if fk in self.dedup_keys:
                 continue
@@ -1670,7 +1698,7 @@ class Pipeline:
             self._save_candidate_state(payload)
             self.emit(EV.CANDIDATE_FOUND, payload)
             self._enqueue_finding(f)
-        for s in (res.get("new_surfaces") or []):
+        for s in new_surfaces:
             sk = (s.get("name") or "").strip().lower()
             if not sk or sk in self.seen_surface:
                 continue
@@ -1683,7 +1711,7 @@ class Pipeline:
                      "lens_hint": s.get("lens_hint") or lens_key, "round": self.round, "from": rec.get("name")}
             self.surface_log.append(entry)
             self.emit(EV.SURFACE_ADDED, entry)
-        for n in (res.get("risk_notes") or []):
+        for n in risk_notes:
             if self.record_risk(n, lens_key, self.round, from_recheck=from_recheck):
                 rec["risks"] = rec.get("risks", 0) + 1
 

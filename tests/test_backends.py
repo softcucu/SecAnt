@@ -12,6 +12,7 @@ from proto_vuln_hunt.backends import (
     _extract_opencode_text,
     extract_json,
 )
+from proto_vuln_hunt import schemas as S
 from proto_vuln_hunt.config import BackendSpec, Config
 
 
@@ -696,6 +697,80 @@ class ProcessDrainTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RetryModelSelectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_single_required_array_schema_accepts_top_level_array(self):
+        script = "import json; print(json.dumps([]))"
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Config(
+                target=d,
+                out_dir=os.path.join(d, "out"),
+                backend="dummy",
+                models={"audit": ["unit-model"]},
+                backends={
+                    "dummy": BackendSpec(
+                        name="dummy",
+                        command=[sys.executable, "-c", script],
+                        prompt_mode="stdin",
+                        parse="text",
+                    )
+                },
+            )
+            cfg.health.enabled = False
+            runner = AgentRunner(cfg, logger=lambda *_args, **_kwargs: None)
+
+            parsed = await runner.run("prompt", role="audit", label="unit", schema=S.FINDINGS_SCHEMA, retries=0)
+
+        self.assertEqual(parsed, {"findings": []})
+
+    async def test_schema_shape_rejects_non_object_array_items(self):
+        script = "import json; print(json.dumps({'findings':[[]]}))"
+        fallback = {"fallback": True}
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Config(
+                target=d,
+                out_dir=os.path.join(d, "out"),
+                backend="dummy",
+                models={"audit": ["unit-model"]},
+                backends={
+                    "dummy": BackendSpec(
+                        name="dummy",
+                        command=[sys.executable, "-c", script],
+                        prompt_mode="stdin",
+                        parse="text",
+                    )
+                },
+            )
+            cfg.health.enabled = False
+            runner = AgentRunner(cfg, logger=lambda *_args, **_kwargs: None)
+
+            parsed = await runner.run("prompt", role="audit", label="unit", schema=S.FINDINGS_SCHEMA,
+                                      retries=0, fallback=fallback)
+
+        self.assertIs(parsed, fallback)
+
+    async def test_schema_shape_allows_null_optional_arrays(self):
+        script = "import json; print(json.dumps({'findings': [], 'new_surfaces': None, 'risk_notes': None}))"
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Config(
+                target=d,
+                out_dir=os.path.join(d, "out"),
+                backend="dummy",
+                models={"audit": ["unit-model"]},
+                backends={
+                    "dummy": BackendSpec(
+                        name="dummy",
+                        command=[sys.executable, "-c", script],
+                        prompt_mode="stdin",
+                        parse="text",
+                    )
+                },
+            )
+            cfg.health.enabled = False
+            runner = AgentRunner(cfg, logger=lambda *_args, **_kwargs: None)
+
+            parsed = await runner.run("prompt", role="audit", label="unit", schema=S.FINDINGS_SCHEMA, retries=0)
+
+        self.assertEqual(parsed, {"findings": [], "new_surfaces": None, "risk_notes": None})
+
     def _runner(self, out_dir):
         cfg = Config(
             target=out_dir,

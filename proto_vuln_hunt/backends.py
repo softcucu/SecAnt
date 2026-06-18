@@ -356,6 +356,112 @@ def extract_json(text: str, schema: Optional[Dict[str, Any]] = None) -> Optional
     return candidates[-1][0]
 
 
+def _json_type_name(v: Any) -> str:
+    if isinstance(v, bool):
+        return "boolean"
+    if isinstance(v, dict):
+        return "object"
+    if isinstance(v, list):
+        return "array"
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, int):
+        return "integer"
+    if isinstance(v, float):
+        return "number"
+    if v is None:
+        return "null"
+    return type(v).__name__
+
+
+def _schema_type_matches(v: Any, want: Any) -> bool:
+    if isinstance(want, list):
+        return any(_schema_type_matches(v, one) for one in want)
+    if want == "object":
+        return isinstance(v, dict)
+    if want == "array":
+        return isinstance(v, list)
+    if want == "string":
+        return isinstance(v, str)
+    if want == "boolean":
+        return isinstance(v, bool)
+    if want == "integer":
+        return isinstance(v, int) and not isinstance(v, bool)
+    if want == "number":
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+    if want == "null":
+        return v is None
+    return True
+
+
+def _schema_type_label(want: Any) -> str:
+    if isinstance(want, list):
+        return "|".join(str(x) for x in want)
+    return str(want)
+
+
+def _coerce_schema_value(value: Any, schema: Optional[Dict[str, Any]]) -> Any:
+    """兼容模型把单个必需数组字段直接输出成顶层数组的常见简写。
+
+    例如 FINDINGS_SCHEMA 要求 {"findings": [...]},但有些 CLI/模型会只输出 [...];
+    这类结果语义明确,在边界处归一化,避免进入 pipeline 后才因 list.get 崩掉。
+    """
+    if not isinstance(schema, dict) or not isinstance(value, list):
+        return value
+    if schema.get("type") != "object":
+        return value
+    props = schema.get("properties")
+    req = schema.get("required")
+    if not isinstance(props, dict) or not isinstance(req, list) or len(req) != 1:
+        return value
+    key = req[0]
+    prop = props.get(key)
+    if isinstance(prop, dict) and prop.get("type") == "array":
+        return {key: value}
+    return value
+
+
+def _schema_shape_error(value: Any, schema: Optional[Dict[str, Any]]) -> Optional[str]:
+    """轻量校验结构化输出的外形。
+
+    不做完整 JSON Schema 校验,只检查根类型、必需顶层字段、顶层字段类型,以及数组字段的
+    item object 外形。这样能挡住 list/dict 混用,同时避免因为 line="123" 这类可恢复小偏差过度失败。
+    """
+    if not isinstance(schema, dict):
+        return None
+    want_type = schema.get("type")
+    if want_type and not _schema_type_matches(value, want_type):
+        return f"$ 应为 {_schema_type_label(want_type)},实际 {_json_type_name(value)}"
+    if not isinstance(value, dict):
+        return None
+    req = schema.get("required")
+    required_keys = set()
+    if isinstance(req, list):
+        required_keys = set(req)
+        missing = [str(k) for k in req if k not in value]
+        if missing:
+            return "缺少必需字段:" + ", ".join(missing)
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return None
+    for key, prop in props.items():
+        if key not in value or not isinstance(prop, dict):
+            continue
+        if value[key] is None and key not in required_keys:
+            continue
+        prop_type = prop.get("type")
+        if prop_type and not _schema_type_matches(value[key], prop_type):
+            return f"$.{key} 应为 {_schema_type_label(prop_type)},实际 {_json_type_name(value[key])}"
+        if prop_type == "array" and isinstance(value[key], list):
+            items = prop.get("items")
+            item_type = items.get("type") if isinstance(items, dict) else None
+            if item_type == "object":
+                for i, item in enumerate(value[key]):
+                    if not isinstance(item, dict):
+                        return f"$.{key}[{i}] 应为 object,实际 {_json_type_name(item)}"
+    return None
+
+
 def best_json_candidate(text: str) -> str:
     """返回 extract_json 真正会喂给 json.loads、且最可能是最终答案的那段候选串。
 
@@ -1630,6 +1736,15 @@ class AgentRunner:
                     self.log(f"⚠ {tag} 后端输出无可解析 JSON(共 {len(text or '')} 字符)"
                              f"{(';原始输出已存 ' + path) if path else ''};前 240 字符:{snippet}")
                     raise RuntimeError("CLI 未产出可解析的结构化 JSON(原始输出已存到 run 目录 debug/)")
+                parsed = _coerce_schema_value(parsed, schema)
+                shape_error = _schema_shape_error(parsed, schema)
+                if shape_error:
+                    path = self._dump_failed_output(role, tag, model, attempt_no, text,
+                                                    dump_candidate=True)
+                    snippet = " ".join((text or "").split())[:240]
+                    self.log(f"⚠ {tag} 后端 JSON 结构不符合 schema:{shape_error}"
+                             f"{(';原始输出已存 ' + path) if path else ''};前 240 字符:{snippet}")
+                    raise RuntimeError(f"CLI 结构化 JSON 形状不符合 schema:{shape_error}")
                 emit_agent(
                     "done",
                     model=model,
