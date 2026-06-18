@@ -112,7 +112,6 @@ tr.target-hit td{background:rgba(59,130,246,.18)}
 .vote-card.vote-real{border-color:rgba(22,163,74,.55)}
 .vote-card.vote-invalid{border-color:rgba(217,119,6,.78);background:rgba(217,119,6,.08)}
 .vote-head{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
-.verify-summary{max-width:360px;overflow-wrap:anywhere;color:var(--muted);font-size:12px}
 .related-candidates summary{cursor:pointer;color:var(--accent);font-size:12px}
 .related-list{display:grid;gap:6px;margin-top:8px;min-width:220px}
 .related-item{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:8px;align-items:start}

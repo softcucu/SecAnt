@@ -569,19 +569,6 @@ function viewDashboard(runId) {
     S.nonIssueMap.set(c.key, c);
     return c;
   }
-  function candidateVerifySummary(c) {
-    if (c.status === "verify_failed") {
-      const attempts = c.attempts ? ` · 尝试 ${c.attempts}` : "";
-      return `失败${attempts}: ${c.reason || "未记录原因"}`;
-    }
-    if (c.status === "rejected") {
-      const total = c.vote_total ?? (Array.isArray(c.votes) ? c.votes.filter(v => (v.phase || "") === "judge").length : 0);
-      const falseCount = c.vote_false ?? 0;
-      return `否决 ${falseCount}/${total || "?"}: ${c.rejection_reason || "未记录原因"}`;
-    }
-    if (c.status === "confirmed") return c.id ? `确认编号 ${c.id}` : "已确认";
-    return "验证中";
-  }
   function linkButton(label, onClick, title = "") {
     return el("button", { type: "button", class: "link-btn", title, onclick: onClick }, label);
   }
@@ -661,7 +648,7 @@ function viewDashboard(runId) {
       ((a.seq || 0) - (b.seq || 0)));
     const tbl = el("table", { class: "cand-table" }, el("thead", {}, el("tr", {},
       el("th", {}, "状态"), el("th", {}, "严重度"), el("th", {}, "类别"), el("th", {}, "标题"),
-      el("th", {}, "位置"), el("th", {}, "lens"), el("th", {}, "验证摘要"), el("th", {}, "确认编号"), el("th", {}, "去向"))));
+      el("th", {}, "位置"), el("th", {}, "lens"), el("th", {}, "确认编号"), el("th", {}, "去向"))));
     const tb = el("tbody");
     for (const c of list) {
       const action = (c.status === "confirmed" && c.id) || c.status === "rejected"
@@ -674,7 +661,6 @@ function viewDashboard(runId) {
         el("td", {}, c.title || ""),
         el("td", { class: "loc" }, `${c.file || ""}:${c.line || 0}${c.function ? " · " + c.function : ""}`),
         el("td", {}, c.lens || ""),
-        el("td", { class: "verify-summary" }, candidateVerifySummary(c)),
         el("td", {}, c.id || "—"),
         el("td", {}, action)));
     }

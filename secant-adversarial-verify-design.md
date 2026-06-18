@@ -396,9 +396,8 @@ report agent 应把这些内容提炼进漏洞报告的：
 Web UI 对新验证方案做了同步展示：
 
 - 配置项显示为“裁决票数 verify_votes”。
-- 候选列表增加“验证摘要”列。
-- `verify_failed` 可以看到失败原因和尝试次数。
-- rejected 可以看到多数裁决摘要。
+- 候选列表展示状态和流转入口。
+- rejected 非问题详情可以看到多数裁决摘要。
 - 漏洞详情展示“裁决票 X 确认 / Y 否决 / Z 合格”。
 - 漏洞详情和非问题详情都展示完整“对抗验证记录”。
 - 无效证据票使用独立样式，避免被误读成普通 reject。
@@ -536,7 +535,7 @@ verify_votes: 3
 | `proto_vuln_hunt/prompts.py` | 定义 prover / disprover / judge prompt |
 | `proto_vuln_hunt/pipeline.py` | 编排三阶段验证、证据校验、多数决、保存状态 |
 | `proto_vuln_hunt/exporters.py` | Markdown 导出追加“对抗验证记录” |
-| `proto_vuln_hunt/web/static/app.js` | Web 展示验证摘要和验证记录 |
+| `proto_vuln_hunt/web/static/app.js` | Web 展示验证记录 |
 | `proto_vuln_hunt/web/static/styles.css` | 无效证据票样式 |
 | `proto_vuln_hunt/tests/test_pipeline_verify.py` | 单元测试覆盖确认、否决、无效票、重试、final sweep |
 
