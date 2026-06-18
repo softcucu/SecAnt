@@ -648,11 +648,13 @@ function viewDashboard(runId) {
       ((a.seq || 0) - (b.seq || 0)));
     const tbl = el("table", { class: "cand-table" }, el("thead", {}, el("tr", {},
       el("th", {}, "状态"), el("th", {}, "严重度"), el("th", {}, "类别"), el("th", {}, "标题"),
-      el("th", {}, "位置"), el("th", {}, "lens"), el("th", {}, "确认编号"), el("th", {}, "去向"))));
+      el("th", {}, "位置"), el("th", {}, "lens"), el("th", {}, "确认编号"))));
     const tb = el("tbody");
     for (const c of list) {
-      const action = (c.status === "confirmed" && c.id) || c.status === "rejected"
-        ? linkButton(candidateActionLabel(c), () => jumpToCandidate(c))
+      const confirmedRef = c.status === "confirmed" && c.id
+        ? linkButton(String(c.id), () => jumpToCandidate(c), "查看漏洞")
+        : c.status === "rejected"
+          ? linkButton("非问题", () => jumpToCandidate(c), "查看非问题")
         : el("span", { class: "muted" }, "—");
       tb.append(el("tr", { class: "cand-row cand-" + cssKey(c.status), "data-cand-key": c.key || candKeyOf(c) },
         el("td", {}, candPill(c.status)),
@@ -661,8 +663,7 @@ function viewDashboard(runId) {
         el("td", {}, c.title || ""),
         el("td", { class: "loc" }, `${c.file || ""}:${c.line || 0}${c.function ? " · " + c.function : ""}`),
         el("td", {}, c.lens || ""),
-        el("td", {}, c.id || "—"),
-        el("td", {}, action)));
+        el("td", {}, confirmedRef)));
     }
     tbl.append(tb);
     tabBody.append(el("div", { class: "panel" }, tbl));
