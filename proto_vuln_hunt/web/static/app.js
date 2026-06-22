@@ -665,9 +665,8 @@ function viewDashboard(runId) {
 
   function renderFindings() {
     const all = [...S.findings.values()].sort((a, b) => SEVS.indexOf(a.corrected_severity) - SEVS.indexOf(b.corrected_severity));
-    if (!all.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无疑似漏洞(审计进行中会实时出现)。")); return; }
     const focusId = pendingFocus?.type === "finding" ? pendingFocus.id : null;
-    if (focusId && (findingAuditModelFilter !== "all" || findingFeedbackFilter !== "all")) {
+    if (all.length && focusId && (findingAuditModelFilter !== "all" || findingFeedbackFilter !== "all")) {
       const target = all.find(f => String(f.id) === String(focusId));
       if (target && findingAuditModelFilter !== "all" && auditModelKey(target) !== findingAuditModelFilter) findingAuditModelFilter = "all";
       if (target && findingFeedbackFilter !== "all" && findingFeedbackStatus(target) !== findingFeedbackFilter) findingFeedbackFilter = "all";
@@ -675,6 +674,7 @@ function viewDashboard(runId) {
     const modelFiltered = findingAuditModelFilter === "all" ? all : all.filter(f => auditModelKey(f) === findingAuditModelFilter);
     const list = findingFeedbackFilter === "all" ? modelFiltered : modelFiltered.filter(f => findingFeedbackStatus(f) === findingFeedbackFilter);
     tabBody.append(findingFilterPanel(all, modelFiltered, list));
+    if (!all.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无疑似漏洞(审计进行中会实时出现)。")); return; }
     if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "当前筛选下暂无疑似漏洞。")); return; }
     const focusIdx = pendingFocus?.type === "finding" ? list.findIndex(f => String(f.id) === String(pendingFocus.id)) : -1;
     const info = paginate("findings", list, focusIdx);
