@@ -227,8 +227,13 @@ async function viewNew() {
   const lensChecks = el("div", { class: "checks" }, ...meta.lenses.map(l =>
     el("label", {}, el("input", { type: "checkbox", value: l, class: "lens", checked: (d.lenses || []).includes(l) ? "" : null }), l)));
   const modelRoles = meta.roles.filter(role => role !== "synthesis" && role !== "util");
-  const modelRows = el("div", { class: "grid" }, ...modelRoles.map(role =>
-    f("模型 · " + role, inp("model_" + role, modelText((d.models || {})[role]), "text"))));
+  // history_only 模式只用 recheck/verify/report(+可选 history/poc),其余角色与攻击面相关配置无关
+  const HISTORY_ONLY_HIDDEN_ROLES = new Set(["recon", "audit", "decompose"]);
+  const modelFieldByRole = {};
+  modelRoles.forEach(role => {
+    modelFieldByRole[role] = f("模型 · " + role, inp("model_" + role, modelText((d.models || {})[role]), "text"));
+  });
+  const modelRows = el("div", { class: "grid" }, ...modelRoles.map(role => modelFieldByRole[role]));
   const historyRuns = runs.filter(r => (r.history_count || 0) > 0);
   const historyRunSel = el("select", { id: "history_import_run_id" },
     el("option", { value: "" }, "不导入,重新分析 git commits"),
@@ -238,6 +243,9 @@ async function viewNew() {
     f("导入已有历史模式 run", historyRunSel),
     f("或导入 run 目录 / recon.json", inp("history_import_from", d.history_import_from || "", "text")));
 
+  const lensField = el("label", { class: "field" }, el("span", {}, "lens(攻击面镜头)"), lensChecks);
+  const findersField = f("每 lens finder 数", num("finders_per_lens", d.finders_per_lens));
+  const decomposeLabel = el("label", {}, el("input", { type: "checkbox", id: "decompose", checked: d.decompose ? "" : null }), "区域拆解");
   const left = el("div", {},
     f("目标源码根目录 *", inp("target", "")),
     f("子路径 scope(可选)", inp("scope", "")),
@@ -246,16 +254,16 @@ async function viewNew() {
     f("后端 CLI", backendSel),
     f("并发数", num("concurrency", d.concurrency)),
     f("威胁模型", tmSel),
-    el("label", { class: "field" }, el("span", {}, "lens(攻击面镜头)"), lensChecks),
+    lensField,
   );
   const right = el("div", {},
-    f("每 lens finder 数", num("finders_per_lens", d.finders_per_lens)),
+    findersField,
     f("最大轮数 max_rounds", num("max_rounds", d.max_rounds)),
     f("收敛空轮 dry_rounds", num("dry_rounds", d.dry_rounds)),
     f("兼容参数 verify_votes", num("verify_votes", d.verify_votes)),
     el("div", { class: "checks", style: "margin:8px 0 14px" },
       el("label", {}, el("input", { type: "checkbox", id: "enable_poc", checked: d.enable_poc ? "" : null }), "启用 PoC"),
-      el("label", {}, el("input", { type: "checkbox", id: "decompose", checked: d.decompose ? "" : null }), "区域拆解")),
+      decomposeLabel),
     el("div", { class: "panel", style: "padding:10px" },
       el("div", { class: "muted", style: "margin-bottom:6px" }, "每角色模型(运行中的角色必须填写)"),
       modelRows,
@@ -267,6 +275,13 @@ async function viewNew() {
   function syncRunMode() {
     const historyOnly = runModeSel.value === "history_only";
     historyImportBox.style.display = historyOnly ? "" : "none";
+    // 仅历史模式下隐藏攻击面相关配置(lens / finder 数 / 区域拆解)及不参与的模型角色
+    lensField.style.display = historyOnly ? "none" : "";
+    findersField.style.display = historyOnly ? "none" : "";
+    decomposeLabel.style.display = historyOnly ? "none" : "";
+    modelRoles.forEach(role => {
+      modelFieldByRole[role].style.display = (historyOnly && HISTORY_ONLY_HIDDEN_ROLES.has(role)) ? "none" : "";
+    });
     submit.textContent = historyOnly ? "启动历史排查" : "🚀 启动审计";
   }
   runModeSel.addEventListener("change", syncRunMode);
