@@ -68,6 +68,10 @@ tr:hover td{background:var(--panel2)}
 .output-time{font-size:12px;white-space:nowrap}
 .feedback-control{display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:default}
 .feedback-select{width:auto;min-width:94px;padding:4px 24px 4px 8px;font-size:12px}
+.feedback-save{background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:4px 8px;font-size:12px;line-height:1.2;cursor:pointer}
+.feedback-save:hover{background:var(--bg)}
+.feedback-save:disabled{opacity:.55;cursor:wait}
+.feedback-state{display:inline-block;min-width:42px;font-size:12px;white-space:nowrap}
 .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;color:#fff}
 .sev-critical{background:var(--crit)} .sev-high{background:var(--high)} .sev-medium{background:var(--med)}
 .sev-low{background:var(--low)} .sev-info{background:var(--info)} .sev-none{background:var(--info)}

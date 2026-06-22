@@ -493,37 +493,74 @@ function viewDashboard(runId) {
     showTab("candidates", { type: "candidate", key });
   }
 
+  function applyFindingManualStatus(f, status, feedback = null) {
+    f.manual_feedback = feedback || Object.assign({}, f.manual_feedback || {}, {
+      status,
+      updated_at: Date.now() / 1000,
+    });
+    S.findings.set(f.id, f);
+    renderHeader();
+    renderTabs();
+  }
+
   function renderFindingFeedback(f) {
     const select = el("select", { class: "feedback-select", title: "人工确认反馈" },
       ...FINDING_FEEDBACK_OPTIONS.map(([value, label]) =>
         el("option", { value, selected: value === findingFeedbackStatus(f) ? "" : null }, label)));
-    const wrap = el("label", { class: "feedback-control" },
+    const saveBtn = el("button", { type: "button", class: "feedback-save", title: "保存人工确认反馈" }, "保存");
+    const state = el("span", { class: "muted feedback-state" }, "");
+    const wrap = el("div", { class: "feedback-control" },
       el("span", { class: "muted" }, "人工确认"),
-      select);
+      select,
+      saveBtn,
+      state);
     wrap.addEventListener("click", e => e.stopPropagation());
-    select.addEventListener("change", async e => {
+    let saving = false;
+    let stateTimer = null;
+    const setState = (text) => {
+      if (stateTimer) clearTimeout(stateTimer);
+      state.textContent = text || "";
+      if (text === "已保存") stateTimer = setTimeout(() => { state.textContent = ""; }, 1800);
+    };
+    const save = async (e) => {
       e.stopPropagation();
-      const previous = findingFeedbackStatus(f);
+      if (saving || !f.id) return;
+      saving = true;
+      const previousFeedback = Object.assign({}, f.manual_feedback || {});
+      const previousStatus = findingFeedbackStatus(f);
       const status = select.value;
+      applyFindingManualStatus(f, status);
       select.disabled = true;
+      saveBtn.disabled = true;
+      setState("保存中…");
       try {
         const r = await api("POST", `/api/runs/${encodeURIComponent(runId)}/findings/${encodeURIComponent(f.id)}/feedback`, { status });
         if (r.finding) {
           Object.assign(f, r.finding);
           S.findings.set(f.id, f);
         } else {
-          f.manual_feedback = { status };
+          applyFindingManualStatus(f, status);
         }
         renderHeader();
         renderTabs();
+        setState("已保存");
         flash("人工确认反馈已保存");
       } catch (err) {
-        select.value = previous;
+        f.manual_feedback = previousFeedback;
+        S.findings.set(f.id, f);
+        select.value = previousStatus;
+        renderHeader();
+        renderTabs();
+        setState("保存失败");
         flash("保存反馈失败: " + err.message);
       } finally {
+        saving = false;
         select.disabled = false;
+        saveBtn.disabled = false;
       }
-    });
+    };
+    select.addEventListener("change", save);
+    saveBtn.addEventListener("click", save);
     return wrap;
   }
 
