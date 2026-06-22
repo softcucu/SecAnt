@@ -486,8 +486,22 @@ class Pipeline:
     def _work_sort_key(self, item: Dict[str, Any]) -> tuple[int, int]:
         return (self._work_priority(item), int(item.get("_queue_seq") or 0))
 
+    def _recheck_concurrency_limit(self) -> int:
+        """recheck 专用闸的并发上限。
+        普通模式:走 cfg.recheck.concurrency(默认 1,逐条串行排查)。
+        仅历史问题模式:recheck 即主力管线,解除这道专用闸——改由全局并发 + 模型槽位
+        约束(限额取 role 容量;后续 role 级闸 role_capacity_limit/模型信号量仍会兜底,
+        不会超发)。这样仪表盘里调的全局并发 / 每模型并发就能真正驱动实时 recheck 并行。
+        """
+        if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY:
+            limit_fn = getattr(self.runner, "role_capacity_limit", None)
+            if callable(limit_fn):
+                return max(1, int(limit_fn("recheck")))
+            return max(1, int(self.cfg.concurrency))
+        return max(1, int(self.cfg.recheck.concurrency))
+
     def _can_dispatch_work(self, item: Dict[str, Any]) -> bool:
-        if item.get("kind") == "_recheck" and self._active_roles.get("recheck", 0) >= max(1, self.cfg.recheck.concurrency):
+        if item.get("kind") == "_recheck" and self._active_roles.get("recheck", 0) >= self._recheck_concurrency_limit():
             return False
         role = self._work_role(item)
         if role is None:
@@ -1896,7 +1910,7 @@ class Pipeline:
 
     def _pop_next_work(self) -> Optional[Dict[str, Any]]:
         self._ensure_queue_order()
-        if self.cfg.recheck.enabled and self.pq and self._active_roles.get("recheck", 0) < max(1, self.cfg.recheck.concurrency):
+        if self.cfg.recheck.enabled and self.pq and self._active_roles.get("recheck", 0) < self._recheck_concurrency_limit():
             probe = {"kind": "_recheck"}
             if self._can_dispatch_work(probe):
                 it = self._pop_priority()
