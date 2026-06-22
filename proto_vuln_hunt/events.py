@@ -21,6 +21,7 @@ CANDIDATE_FOUND = "candidate_found"    # {key, title, bug_class, file, line, len
 FINDING_CONFIRMED = "finding_confirmed"  # {finding ...}
 FINDING_REJECTED = "finding_rejected"    # {candidate fields..., votes, rejection_reason}
 CANDIDATE_FAILED = "candidate_failed"    # {key, title, reason, attempts}
+CANDIDATE_DECIDED = "candidate_decided"  # {candidate fields..., status=suppressed_unproven|promoted_to_risk|needs_manual_review, votes}
 SURFACE_ADDED = "surface_added"    # {name, why, files, lens_hint, round, from}
 RISK_ADDED = "risk_added"          # {area, note, file, severity_hint, lens, round}
 RECHECK_ENQUEUED = "recheck_enqueued"  # {kind: variant|risk, id?, pattern?, area?, severity_hint?, lens_hint?}

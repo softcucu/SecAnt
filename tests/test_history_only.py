@@ -129,31 +129,46 @@ class HistoryOnlyImportTests(unittest.IsolatedAsyncioTestCase):
                         "description": "copy length is unchecked",
                         "source_to_sink": "a.c:1 -> a.c:10",
                     }], "new_surfaces": [], "risk_notes": []}
-                if role == "verify" and "prover" in label:
+                if role == "verify" and "witness:" in label:
                     return {
-                        "supports_real": True,
+                        "witness_complete": True,
+                        "witness": "len=512",
                         "evidence_refs": ["a.c:10"],
-                        "source_chain": ["a.c:1", "a.c:10"],
+                        "path_nodes": ["a.c:1", "a.c:10"],
                         "sink_ref": "a.c:10",
-                        "reachability": "reachable",
-                        "controllability": "controlled",
+                        "trigger_condition": "len > dst",
+                        "bad_result": "overflow",
                         "corrected_severity": "high",
+                        "reasoning": "witness",
                     }
-                if role == "verify" and "disprover" in label:
+                if role == "verify" and "blocker:" in label:
                     return {
-                        "refutes_real": False,
-                        "evidence_refs": ["a.c:10"],
-                        "clearing_checks": ["a.c:2"],
-                        "non_issue_reason": "not refuted",
+                        "blocker_found": False,
+                        "blocker_scope": "none",
+                        "evidence_refs": [],
+                        "missing_evidence": "none",
+                        "reasoning": "not refuted",
                     }
-                if role == "verify":
+                if role == "verify" and "witness-judge" in label:
                     return {
-                        "decision": "confirm",
+                        "witness_verdict": "accepted",
                         "evidence_refs": ["a.c:10"],
-                        "source_chain": ["a.c:1", "a.c:10"],
-                        "sink_ref": "a.c:10",
-                        "reachability": "reachable",
-                        "controllability": "controlled",
+                        "reviewed_checks": ["a.c:10"],
+                        "reasoning": "accepted",
+                    }
+                if role == "verify" and "blocker-judge" in label:
+                    return {
+                        "blocker_verdict": "invalid",
+                        "evidence_refs": ["a.c:10"],
+                        "failed_checks": ["no blocker"],
+                        "reasoning": "invalid",
+                    }
+                if role == "verify" and "final" in label:
+                    return {
+                        "epistemic_verdict": "proven_real",
+                        "operational_decision": "confirmed",
+                        "deciding_facts_checked": ["a.c:10"],
+                        "final_reason": "confirmed",
                         "corrected_severity": "high",
                         "exploitability": "remote",
                         "verdict_confidence": "high",

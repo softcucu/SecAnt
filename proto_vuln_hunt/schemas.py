@@ -173,6 +173,97 @@ VERDICT_SCHEMA = {
     },
 }
 
+VERIFY_WITNESS_SCHEMA = {
+    "type": "object",
+    "required": ["witness_complete", "evidence_refs", "reasoning"],
+    "properties": {
+        "witness_complete": {"type": "boolean", "description": "正方是否构造出满足攻击者能力、输入合法域、程序状态、代码约束的触发 witness"},
+        "witness": {"type": "string", "description": "最小合法触发见证:输入/状态/顺序/关键值;没有完整 witness 时留空"},
+        "attack_preconditions": {"type": "array", "items": {"type": "string"}, "description": "攻击者能力与前置条件,path:line + 说明优先"},
+        "input_domain_constraints": {"type": "array", "items": {"type": "string"}, "description": "协议字段宽度、格式语法、配置上限等合法输入域约束"},
+        "state_constraints": {"type": "array", "items": {"type": "string"}, "description": "认证态、连接态、对象生命周期、锁状态等程序状态约束"},
+        "code_constraints": {"type": "array", "items": {"type": "string"}, "description": "沿途 if/clamp/return/assert/check 等代码约束"},
+        "path_nodes": {"type": "array", "items": {"type": "string"}, "description": "从入口到坏结果的最小路径节点,path:line + 一句话"},
+        "trigger_condition": {"type": "string", "description": "坏条件如何被 witness 触发,例如越界不等式/状态序列/payload 语义"},
+        "bad_result": {"type": "string", "description": "触发后的安全坏结果"},
+        "sink_ref": {"type": "string", "description": "危险 sink 位置,path:line - sink 说明"},
+        "evidence_refs": {"type": "array", "items": {"type": "string"}, "description": "支持 witness 的代码证据,每项格式:path:line - 证据说明"},
+        "missing_evidence": {"type": "string", "description": "witness 不完整时缺什么"},
+        "corrected_severity": {"type": "string", "enum": ["critical", "high", "medium", "low", "info"]},
+        "exploitability": {"type": "string"},
+        "verdict_confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "reasoning": {"type": "string"},
+    },
+}
+
+VERIFY_BLOCKER_SCHEMA = {
+    "type": "object",
+    "required": ["blocker_found", "blocker_scope", "evidence_refs", "reasoning"],
+    "properties": {
+        "blocker_found": {"type": "boolean", "description": "反方是否找到能打掉 finding 的 blocker 或不可满足证明"},
+        "blocker_scope": {"type": "string", "enum": ["global", "path_local", "branch_local", "config_local", "partial", "unknown", "none"], "description": "blocker 覆盖范围;只有 global 才能直接否决"},
+        "blocker_type": {"type": "string", "description": "例如 domain_bound/guard_dominance/state_gate/type_width/not_sink/not_visible"},
+        "blocker_description": {"type": "string"},
+        "evidence_refs": {"type": "array", "items": {"type": "string"}, "description": "支持 blocker 的代码证据,每项格式:path:line - 证据说明"},
+        "blocking_checks": {"type": "array", "items": {"type": "string"}, "description": "具体阻断点/约束/path:line"},
+        "impossibility_proof": {"type": "string", "description": "为什么合法输入/状态空间里坏条件不可满足"},
+        "affected_witness": {"type": "string", "description": "该 blocker 打掉的是所有 witness 还是某个局部 witness"},
+        "non_issue_reason": {"type": "string", "description": "若 blocker_found=true,最终非问题原因"},
+        "missing_evidence": {"type": "string", "description": "找不到决定性 blocker 时缺什么"},
+        "verdict_confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "reasoning": {"type": "string"},
+    },
+}
+
+WITNESS_REVIEW_SCHEMA = {
+    "type": "object",
+    "required": ["witness_verdict", "evidence_refs", "reasoning"],
+    "properties": {
+        "witness_verdict": {"type": "string", "enum": ["accepted", "weakened", "rejected", "inconclusive"], "description": "对正方 witness 的质询结论"},
+        "evidence_refs": {"type": "array", "items": {"type": "string"}, "description": "复核 witness 时采用的代码证据"},
+        "reviewed_checks": {"type": "array", "items": {"type": "string"}, "description": "已核对的合法输入域/状态/代码约束"},
+        "failed_checks": {"type": "array", "items": {"type": "string"}, "description": "witness 不满足的约束或被削弱之处"},
+        "missing_evidence": {"type": "string"},
+        "verdict_confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "reasoning": {"type": "string"},
+    },
+}
+
+BLOCKER_REVIEW_SCHEMA = {
+    "type": "object",
+    "required": ["blocker_verdict", "evidence_refs", "reasoning"],
+    "properties": {
+        "blocker_verdict": {"type": "string", "enum": ["global_decisive", "partial", "invalid", "unknown_scope"], "description": "对反方 blocker 的质询结论"},
+        "evidence_refs": {"type": "array", "items": {"type": "string"}, "description": "复核 blocker 时采用的代码证据"},
+        "reviewed_checks": {"type": "array", "items": {"type": "string"}, "description": "已核对的支配关系/状态门/约束范围"},
+        "failed_checks": {"type": "array", "items": {"type": "string"}, "description": "blocker 作用域不足或无效之处"},
+        "missing_evidence": {"type": "string"},
+        "verdict_confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "reasoning": {"type": "string"},
+    },
+}
+
+FINAL_ADJUDICATION_SCHEMA = {
+    "type": "object",
+    "required": ["epistemic_verdict", "operational_decision", "reasoning"],
+    "properties": {
+        "epistemic_verdict": {"type": "string", "enum": ["proven_real", "proven_false", "unresolved"], "description": "证据层结论"},
+        "operational_decision": {"type": "string", "enum": ["confirmed", "rejected", "suppressed_unproven", "promoted_to_risk", "needs_manual_review"], "description": "流水线工程决策"},
+        "deciding_facts_checked": {"type": "array", "items": {"type": "string"}, "description": "第 5 agent 定向补查的 1-2 个关键事实,path:line + 说明优先"},
+        "final_reason": {"type": "string", "description": "最终工程决策理由"},
+        "rejection_reason": {"type": "string", "description": "operational_decision=rejected 时的非问题原因"},
+        "risk_note": {"type": "string", "description": "operational_decision=promoted_to_risk 时写入风险登记的说明"},
+        "residual_uncertainty": {"type": "string"},
+        "why_not_confirmed": {"type": "string"},
+        "why_not_rejected": {"type": "string"},
+        "recommended_next_action": {"type": "string"},
+        "corrected_severity": {"type": "string", "enum": ["critical", "high", "medium", "low", "info"]},
+        "exploitability": {"type": "string"},
+        "verdict_confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "reasoning": {"type": "string"},
+    },
+}
+
 POC_SCHEMA = {
     "type": "object",
     "required": ["approach", "compiled", "triggered"],

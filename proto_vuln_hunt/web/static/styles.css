@@ -97,9 +97,14 @@ tr:hover td{background:var(--panel2)}
 .health-checking{background:var(--run)} .health-unavailable{background:var(--info)} .health-unknown{background:var(--info)}
 .agent-running{background:var(--run)} .agent-queued{background:var(--info)} .agent-retrying{background:var(--warn)}
 .agent-failed-attempt{background:var(--warn)} .agent-done{background:var(--ok)} .agent-failed{background:var(--crit)}
-.cand-pending{background:var(--run)} .cand-confirmed{background:var(--ok)} .cand-rejected{background:var(--info)}
-.cand-verify-failed{background:var(--crit)}
-.cand-table tr.cand-rejected{opacity:.55}
+	.cand-pending{background:var(--run)} .cand-confirmed{background:var(--ok)} .cand-rejected{background:var(--info)}
+	.cand-suppressed-unproven{background:#64748b} .cand-promoted-to-risk{background:var(--warn)}
+	.cand-needs-manual-review{background:#9333ea}
+	.cand-verify-failed{background:var(--crit)}
+	.cand-table tr.cand-rejected{opacity:.55}
+	.candidate-detail summary{cursor:pointer;font-weight:600}
+	.candidate-detail .detail-line{grid-template-columns:minmax(120px,18%) 1fr}
+	.candidate-detail .vote-list{margin:10px 0}
 .cand-table tr.cand-verify-failed td:first-child{font-weight:600}
 .cand-table tr.cand-confirmed td:first-child{font-weight:600}
 

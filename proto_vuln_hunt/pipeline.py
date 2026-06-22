@@ -24,12 +24,13 @@ from .backends import AgentRunner
 from .common import (class_code, finalize_findings, finding_key, item_key,
                      most_severe, pad3, slim_finding)
 from .config import RUN_MODE_HISTORY_ONLY, Config, normalize_model_time_windows_with_errors, normalize_models
-from .prompts import VERIFY_LENSES, PromptBuilder
+from .prompts import PromptBuilder
 from .store import RunStore, STATUS_DONE, STATUS_ERROR, STATUS_INCOMPLETE, STATUS_RUNNING, STATUS_STOPPED
 
 _CODE_REF_RE = re.compile(r"\S+:\d+")
 _SOURCE_EXTS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inc", ".ipp", ".s", ".S"}
 _COUNT_SKIP_DIRS = {".git", ".proto-vuln-hunt", "pvh-runs"}
+_FINAL_DECISIONS = {"confirmed", "rejected", "suppressed_unproven", "promoted_to_risk", "needs_manual_review"}
 
 
 def _noop_emit(etype: str, data: Optional[Dict[str, Any]] = None, persist: bool = True) -> None:
@@ -510,7 +511,7 @@ class Pipeline:
         self._enqueue_work({"kind": "_finding", "finding_key": fk, "finding": finding})
 
     # 风险点 severity_hint 排序(用于判断是否够格自动入排查队列)
-    _RISK_SEV_ORDER = {"high": 3, "medium": 2, "low": 1, "info": 0}
+    _RISK_SEV_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 
     def _risk_sev_ok(self, sev: Optional[str]) -> bool:
         """severity_hint 是否达到自动入排查队列的阈值(cfg.recheck.risk_min_severity)。"""
@@ -867,11 +868,17 @@ class Pipeline:
             payload["verify_models"] = sorted({v.get("model") for v in votes if v.get("model")})
         return payload
 
-    def _candidate_rejected_payload(self, f: Dict[str, Any], votes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _candidate_rejected_payload(self, f: Dict[str, Any], votes: List[Dict[str, Any]],
+                                    final: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         judge_votes = [v for v in votes if v.get("phase") == "judge" and v.get("validation_ok", True)]
         counted_votes = judge_votes or votes
         false_votes = [v for v in counted_votes if self._vote_decision(v) == "reject"]
         reason_bits = []
+        if isinstance(final, dict):
+            for key in ("rejection_reason", "final_reason", "non_issue_reason", "reasoning"):
+                r = (final.get(key) or "").strip()
+                if r and r not in reason_bits:
+                    reason_bits.append(r)
         for v in false_votes:
             r = (v.get("non_issue_reason") or v.get("reasoning") or "").strip()
             clearing = " / ".join(self._text_list(v.get("clearing_checks")))
@@ -881,7 +888,9 @@ class Pipeline:
                 reason_bits.append(r)
         total = len(counted_votes)
         false_count = len(false_votes)
-        summary = f"多数裁决票判定为非问题({false_count}/{total})"
+        summary = "终局裁判判定为非问题"
+        if total:
+            summary += f"(反证记录 {false_count}/{total})"
         if reason_bits:
             summary += ": " + " / ".join(reason_bits)
         slim_votes = self._slim_verify_votes(votes)
@@ -896,6 +905,31 @@ class Pipeline:
             "vote_real": total - false_count,
             "rejection_reason": summary,
         }
+
+    def _candidate_decision_payload(self, f: Dict[str, Any], status: str, votes: List[Dict[str, Any]],
+                                    final: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        final = final if isinstance(final, dict) else {}
+        slim_votes = self._slim_verify_votes(votes)
+        verify_models = sorted({v["model"] for v in slim_votes if v.get("model")})
+        reason = (final.get("final_reason") or final.get("reasoning") or final.get("residual_uncertainty")
+                  or final.get("why_not_confirmed") or "").strip()
+        payload = {
+            **self._candidate_payload(f),
+            "status": status,
+            "votes": slim_votes,
+            "verify_models": verify_models,
+            "epistemic_verdict": final.get("epistemic_verdict") or "",
+            "operational_decision": status,
+            "decision_reason": reason,
+            "residual_uncertainty": final.get("residual_uncertainty") or "",
+            "recommended_next_action": final.get("recommended_next_action") or "",
+            "vote_total": 0,
+            "vote_false": 0,
+            "vote_real": 0,
+        }
+        if final.get("risk_note"):
+            payload["risk_note"] = final.get("risk_note")
+        return payload
 
     def _slim_verify_votes(self, votes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return [{
@@ -918,6 +952,35 @@ class Pipeline:
             "verdict_confidence": v.get("verdict_confidence") or "",
             "reasoning": v.get("reasoning") or "",
             "non_issue_reason": v.get("non_issue_reason") or "",
+            "witness_complete": v.get("witness_complete"),
+            "witness": v.get("witness") or "",
+            "attack_preconditions": self._text_list(v.get("attack_preconditions")),
+            "input_domain_constraints": self._text_list(v.get("input_domain_constraints")),
+            "state_constraints": self._text_list(v.get("state_constraints")),
+            "code_constraints": self._text_list(v.get("code_constraints")),
+            "path_nodes": self._text_list(v.get("path_nodes")),
+            "trigger_condition": v.get("trigger_condition") or "",
+            "bad_result": v.get("bad_result") or "",
+            "blocker_found": v.get("blocker_found"),
+            "blocker_scope": v.get("blocker_scope") or "",
+            "blocker_type": v.get("blocker_type") or "",
+            "blocker_description": v.get("blocker_description") or "",
+            "blocking_checks": self._text_list(v.get("blocking_checks")),
+            "impossibility_proof": v.get("impossibility_proof") or "",
+            "affected_witness": v.get("affected_witness") or "",
+            "witness_verdict": v.get("witness_verdict") or "",
+            "blocker_verdict": v.get("blocker_verdict") or "",
+            "reviewed_checks": self._text_list(v.get("reviewed_checks")),
+            "failed_checks": self._text_list(v.get("failed_checks")),
+            "epistemic_verdict": v.get("epistemic_verdict") or "",
+            "operational_decision": v.get("operational_decision") or "",
+            "deciding_facts_checked": self._text_list(v.get("deciding_facts_checked")),
+            "final_reason": v.get("final_reason") or "",
+            "residual_uncertainty": v.get("residual_uncertainty") or "",
+            "why_not_confirmed": v.get("why_not_confirmed") or "",
+            "why_not_rejected": v.get("why_not_rejected") or "",
+            "recommended_next_action": v.get("recommended_next_action") or "",
+            "risk_note": v.get("risk_note") or "",
         } for v in votes]
 
     @staticmethod
@@ -937,6 +1000,13 @@ class Pipeline:
 
     @staticmethod
     def _vote_decision(v: Dict[str, Any]) -> str:
+        op = (v.get("operational_decision") or "").strip().lower()
+        if op == "confirmed":
+            return "confirm"
+        if op == "rejected":
+            return "reject"
+        if op in ("suppressed_unproven", "promoted_to_risk", "needs_manual_review"):
+            return "inconclusive"
         d = (v.get("decision") or "").strip().lower()
         if d in ("confirm", "reject", "inconclusive"):
             return d
@@ -1022,6 +1092,107 @@ class Pipeline:
             missing.append(f"未知裁决:{decision}")
         return missing
 
+    @classmethod
+    def _validate_witness(cls, witness: Optional[Dict[str, Any]]) -> List[str]:
+        if not isinstance(witness, dict):
+            return ["正方无结构化 witness 输出"]
+        missing = []
+        complete = bool(witness.get("witness_complete"))
+        if complete:
+            if not cls._text(witness.get("witness")):
+                missing.append("witness_complete=true 但缺少 witness")
+            if not cls._has_code_ref(witness.get("evidence_refs")):
+                missing.append("witness 缺少 path:line 代码证据")
+            if not cls._has_code_ref(witness.get("path_nodes")):
+                missing.append("witness 缺少 path_nodes")
+            if not cls._has_code_ref(witness.get("sink_ref")):
+                missing.append("witness 缺少 sink_ref")
+            if not cls._text(witness.get("trigger_condition")):
+                missing.append("witness 缺少 trigger_condition")
+            if not cls._text(witness.get("bad_result")):
+                missing.append("witness 缺少 bad_result")
+        elif not cls._text(witness.get("missing_evidence") or witness.get("reasoning")):
+            missing.append("witness 不完整但未说明缺口")
+        return missing
+
+    @classmethod
+    def _validate_blocker(cls, blocker: Optional[Dict[str, Any]]) -> List[str]:
+        if not isinstance(blocker, dict):
+            return ["反方无结构化 blocker 输出"]
+        missing = []
+        found = bool(blocker.get("blocker_found"))
+        scope = (blocker.get("blocker_scope") or "").strip()
+        if found:
+            if scope not in ("global", "path_local", "branch_local", "config_local", "partial", "unknown"):
+                missing.append("blocker_found=true 但 blocker_scope 无效")
+            if not cls._has_code_ref(blocker.get("evidence_refs") or blocker.get("blocking_checks")):
+                missing.append("blocker 缺少 path:line 代码证据")
+            if not cls._text(blocker.get("non_issue_reason") or blocker.get("impossibility_proof")
+                             or blocker.get("blocker_description")):
+                missing.append("blocker 缺少非问题原因或不可满足证明")
+        elif scope and scope not in ("none", "unknown"):
+            missing.append("blocker_found=false 时 blocker_scope 应为 none/unknown")
+        elif not cls._text(blocker.get("missing_evidence") or blocker.get("reasoning")):
+            missing.append("未找到 blocker 但未说明缺口")
+        return missing
+
+    @classmethod
+    def _validate_witness_review(cls, review: Optional[Dict[str, Any]]) -> List[str]:
+        if not isinstance(review, dict):
+            return ["witness 裁判无结构化输出"]
+        verdict = (review.get("witness_verdict") or "").strip()
+        if verdict not in ("accepted", "weakened", "rejected", "inconclusive"):
+            return ["witness_verdict 无效"]
+        missing = []
+        if verdict == "accepted" and not cls._has_code_ref(review.get("evidence_refs") or review.get("reviewed_checks")):
+            missing.append("accepted 缺少 path:line 复核证据")
+        if verdict in ("weakened", "rejected") and not cls._text(review.get("failed_checks") or review.get("reasoning")):
+            missing.append(f"{verdict} 未说明 witness 问题")
+        if verdict == "inconclusive" and not cls._text(review.get("missing_evidence") or review.get("reasoning")):
+            missing.append("inconclusive 未说明缺口")
+        return missing
+
+    @classmethod
+    def _validate_blocker_review(cls, review: Optional[Dict[str, Any]]) -> List[str]:
+        if not isinstance(review, dict):
+            return ["blocker 裁判无结构化输出"]
+        verdict = (review.get("blocker_verdict") or "").strip()
+        if verdict not in ("global_decisive", "partial", "invalid", "unknown_scope"):
+            return ["blocker_verdict 无效"]
+        missing = []
+        if verdict == "global_decisive" and not cls._has_code_ref(review.get("evidence_refs") or review.get("reviewed_checks")):
+            missing.append("global_decisive 缺少 path:line 复核证据")
+        if verdict in ("partial", "invalid") and not cls._text(review.get("failed_checks") or review.get("reasoning")):
+            missing.append(f"{verdict} 未说明 blocker 作用域/有效性问题")
+        if verdict == "unknown_scope" and not cls._text(review.get("missing_evidence") or review.get("reasoning")):
+            missing.append("unknown_scope 未说明缺口")
+        return missing
+
+    @classmethod
+    def _validate_final_adjudication(cls, final: Optional[Dict[str, Any]]) -> List[str]:
+        if not isinstance(final, dict):
+            return ["终局裁判无结构化输出"]
+        epistemic = (final.get("epistemic_verdict") or "").strip()
+        decision = (final.get("operational_decision") or "").strip()
+        missing = []
+        if epistemic not in ("proven_real", "proven_false", "unresolved"):
+            missing.append("epistemic_verdict 无效")
+        if decision not in _FINAL_DECISIONS:
+            missing.append("operational_decision 无效")
+        if not cls._text(final.get("reasoning") or final.get("final_reason")):
+            missing.append("终局裁判缺少 reasoning/final_reason")
+        if decision == "confirmed" and epistemic != "proven_real":
+            missing.append("confirmed 必须对应 proven_real")
+        if decision == "rejected" and epistemic != "proven_false":
+            missing.append("rejected 必须对应 proven_false")
+        if decision == "rejected" and not cls._text(final.get("rejection_reason") or final.get("final_reason")
+                                                    or final.get("reasoning")):
+            missing.append("rejected 缺少 rejection_reason")
+        if decision == "promoted_to_risk" and not cls._text(final.get("risk_note") or final.get("recommended_next_action")
+                                                           or final.get("reasoning")):
+            missing.append("promoted_to_risk 缺少 risk_note/next_action")
+        return missing
+
     @staticmethod
     def _mark_vote(v: Optional[Dict[str, Any]], *, phase: str, lens: str,
                    model: str = "", validation_errors: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -1083,104 +1254,134 @@ class Pipeline:
             self.dedup_keys.add(k)
 
             title = (f.get("title") or "")[:24]
-            proof_meta: Dict[str, Any] = {}
-            disproof_meta: Dict[str, Any] = {}
-            raw_proof, raw_disproof = await asyncio.gather(
-                self.runner.run(self.pb.verify_prover(f, S.VERIFY_PROOF_SCHEMA),
-                                role="verify", label=f"verify-prover:{title}",
-                                schema=S.VERIFY_PROOF_SCHEMA, meta=proof_meta),
-                self.runner.run(self.pb.verify_disprover(f, S.VERIFY_DISPROOF_SCHEMA),
-                                role="verify", label=f"verify-disprover:{title}",
-                                schema=S.VERIFY_DISPROOF_SCHEMA, meta=disproof_meta),
+            witness_meta: Dict[str, Any] = {}
+            raw_witness = await self.runner.run(
+                self.pb.verify_witness(f, S.VERIFY_WITNESS_SCHEMA),
+                role="verify", label=f"verify-witness:{title}",
+                schema=S.VERIFY_WITNESS_SCHEMA, meta=witness_meta,
             )
-            proof_errors = self._validate_verify_proof(raw_proof)
-            disproof_errors = self._validate_verify_disproof(raw_disproof)
-            proof_ok = not proof_errors
-            disproof_ok = not disproof_errors
-            proof_obj = raw_proof if isinstance(raw_proof, dict) else {}
-            disproof_obj = raw_disproof if isinstance(raw_disproof, dict) else {}
+            witness_errors = self._validate_witness(raw_witness)
+            witness_obj = raw_witness if isinstance(raw_witness, dict) else {}
+            witness_vote = self._mark_vote(raw_witness, phase="witness", lens="正方 witness",
+                                           model=witness_meta.get("model") or "",
+                                           validation_errors=witness_errors)
+            witness_vote["decision"] = "confirm" if witness_obj.get("witness_complete") else "inconclusive"
+            witness_vote["is_real"] = bool(witness_obj.get("witness_complete"))
 
-            proof_vote = self._mark_vote(raw_proof, phase="prover", lens="正方举证",
-                                         model=proof_meta.get("model") or "",
-                                         validation_errors=proof_errors)
-            proof_vote["decision"] = "confirm" if proof_obj.get("supports_real") else "inconclusive"
-            proof_vote["is_real"] = bool(proof_obj.get("supports_real"))
-            disproof_vote = self._mark_vote(raw_disproof, phase="disprover", lens="反方证伪",
-                                            model=disproof_meta.get("model") or "",
-                                            validation_errors=disproof_errors)
-            disproof_vote["decision"] = "reject" if disproof_obj.get("refutes_real") else "inconclusive"
-            disproof_vote["is_real"] = not bool(disproof_obj.get("refutes_real"))
-            votes = [proof_vote, disproof_vote]
+            blocker_meta: Dict[str, Any] = {}
+            raw_blocker = await self.runner.run(
+                self.pb.verify_blocker(f, witness_vote, S.VERIFY_BLOCKER_SCHEMA),
+                role="verify", label=f"verify-blocker:{title}",
+                schema=S.VERIFY_BLOCKER_SCHEMA, meta=blocker_meta,
+            )
+            blocker_errors = self._validate_blocker(raw_blocker)
+            blocker_obj = raw_blocker if isinstance(raw_blocker, dict) else {}
+            blocker_vote = self._mark_vote(raw_blocker, phase="blocker", lens="反方 blocker",
+                                           model=blocker_meta.get("model") or "",
+                                           validation_errors=blocker_errors)
+            blocker_vote["decision"] = "reject" if blocker_obj.get("blocker_found") else "inconclusive"
+            blocker_vote["is_real"] = False
+            votes = [witness_vote, blocker_vote]
 
-            if not proof_ok and not disproof_ok:
-                self._handle_candidate_verify_failure(
-                    f,
-                    "正反举证均无合格证据"
-                    f"(正方:{';'.join(proof_errors)};反方:{';'.join(disproof_errors)})",
-                    votes,
-                )
-                return
-
-            lenses = [VERIFY_LENSES[i % len(VERIFY_LENSES)] for i in range(self.cfg.verify_votes)]
-            judge_metas = [{} for _ in lenses]
-            judge_tasks = [
+            witness_judge_meta: Dict[str, Any] = {}
+            blocker_judge_meta: Dict[str, Any] = {}
+            raw_witness_review, raw_blocker_review = await asyncio.gather(
                 self.runner.run(
-                    self.pb.verify_judge(f, proof_vote, disproof_vote, lens, S.VERDICT_SCHEMA),
-                    role="verify", label=f"verify-judge:{title}#{i + 1}",
-                    schema=S.VERDICT_SCHEMA, meta=judge_metas[i],
-                )
-                for i, lens in enumerate(lenses)
-            ]
-            raw_judges = await asyncio.gather(*judge_tasks)
-            valid_judges: List[Dict[str, Any]] = []
-            invalid_reasons: List[str] = []
-            for i, v in enumerate(raw_judges):
-                if not v:
-                    invalid_reasons.append(f"#{i + 1}:无输出或解析失败")
-                    continue
-                judge = self._normalize_judge_vote(v)
-                errs = self._validate_judge_vote(judge, proof_ok=proof_ok, disproof_ok=disproof_ok)
-                if errs:
-                    invalid_reasons.append(f"#{i + 1}:{';'.join(errs)}")
-                if judge_metas[i].get("model"):
-                    judge["model"] = judge_metas[i]["model"]
-                judge["phase"] = "judge"
-                judge["verify_lens"] = lenses[i]
-                judge["validation_ok"] = not errs
-                if errs:
-                    judge["validation_reason"] = ";".join(errs)
-                votes.append(judge)
-                if not errs:
-                    valid_judges.append(judge)
+                    self.pb.verify_witness_judge(f, witness_vote, blocker_vote, S.WITNESS_REVIEW_SCHEMA),
+                    role="verify", label=f"verify-witness-judge:{title}",
+                    schema=S.WITNESS_REVIEW_SCHEMA, meta=witness_judge_meta,
+                ),
+                self.runner.run(
+                    self.pb.verify_blocker_judge(f, witness_vote, blocker_vote, S.BLOCKER_REVIEW_SCHEMA),
+                    role="verify", label=f"verify-blocker-judge:{title}",
+                    schema=S.BLOCKER_REVIEW_SCHEMA, meta=blocker_judge_meta,
+                ),
+            )
+            witness_review_errors = self._validate_witness_review(raw_witness_review)
+            witness_review_obj = raw_witness_review if isinstance(raw_witness_review, dict) else {}
+            witness_review_vote = self._mark_vote(raw_witness_review, phase="witness_judge",
+                                                  lens="质询 witness",
+                                                  model=witness_judge_meta.get("model") or "",
+                                                  validation_errors=witness_review_errors)
+            wv = witness_review_obj.get("witness_verdict")
+            witness_review_vote["decision"] = "confirm" if wv in ("accepted", "weakened") else ("reject" if wv == "rejected" else "inconclusive")
+            witness_review_vote["is_real"] = wv in ("accepted", "weakened")
 
-            required_votes = max(1, -(-self.cfg.verify_votes // 2))
-            if len(valid_judges) < required_votes:
-                detail = ";".join(invalid_reasons[:3])
+            blocker_review_errors = self._validate_blocker_review(raw_blocker_review)
+            blocker_review_obj = raw_blocker_review if isinstance(raw_blocker_review, dict) else {}
+            blocker_review_vote = self._mark_vote(raw_blocker_review, phase="blocker_judge",
+                                                  lens="质询 blocker",
+                                                  model=blocker_judge_meta.get("model") or "",
+                                                  validation_errors=blocker_review_errors)
+            bv = blocker_review_obj.get("blocker_verdict")
+            blocker_review_vote["decision"] = "reject" if bv == "global_decisive" else "inconclusive"
+            blocker_review_vote["is_real"] = False
+            votes.extend([witness_review_vote, blocker_review_vote])
+
+            final_meta: Dict[str, Any] = {}
+            raw_final = await self.runner.run(
+                self.pb.verify_final_adjudicator(
+                    f, witness_vote, blocker_vote, witness_review_vote, blocker_review_vote,
+                    S.FINAL_ADJUDICATION_SCHEMA,
+                ),
+                role="verify", label=f"verify-final:{title}",
+                schema=S.FINAL_ADJUDICATION_SCHEMA, meta=final_meta,
+            )
+            final_errors = self._validate_final_adjudication(raw_final)
+            final_obj = raw_final if isinstance(raw_final, dict) else {}
+            final_vote = self._mark_vote(raw_final, phase="final_adjudicator", lens="终局裁判",
+                                         model=final_meta.get("model") or "",
+                                         validation_errors=final_errors)
+            decision = (final_obj.get("operational_decision") or "").strip()
+            final_vote["decision"] = "confirm" if decision == "confirmed" else ("reject" if decision == "rejected" else "inconclusive")
+            final_vote["is_real"] = decision == "confirmed"
+            votes.append(final_vote)
+            if final_errors:
                 self._handle_candidate_verify_failure(
                     f,
-                    f"有效裁决票不足({len(valid_judges)}/{self.cfg.verify_votes})"
-                    + (f":{detail}" if detail else ""),
+                    "终局裁判无有效工程决策:" + ";".join(final_errors),
                     votes,
                 )
                 return
-            real = sum(1 for v in valid_judges if self._vote_decision(v) == "confirm")
-            false = sum(1 for v in valid_judges if self._vote_decision(v) == "reject")
-            majority = len(valid_judges) // 2 + 1
-            if real < majority:
-                if false < majority:
-                    self._handle_candidate_verify_failure(f, "裁决票未形成多数", votes)
-                    return
+
+            if decision == "rejected":
                 self.processed_keys.add(k)
                 self.pending_findings.pop(k, None)
-                payload = self._candidate_rejected_payload(f, votes)
+                f["verify_status"] = "rejected"
+                payload = self._candidate_rejected_payload(f, votes, final_vote)
                 self._save_candidate_state(payload)
                 self.emit(EV.FINDING_REJECTED, payload)
                 return
 
-            corrected = most_severe([v.get("corrected_severity") for v in valid_judges]
-                                    + [proof_vote.get("corrected_severity")]) or f.get("severity")
-            exploit = next((v.get("exploitability") for v in valid_judges if v.get("exploitability")),
-                           proof_vote.get("exploitability") or "")
+            if decision in ("suppressed_unproven", "promoted_to_risk", "needs_manual_review"):
+                self.processed_keys.add(k)
+                self.pending_findings.pop(k, None)
+                f["verify_status"] = decision
+                if decision == "promoted_to_risk":
+                    risk_note = (final_vote.get("risk_note") or final_vote.get("recommended_next_action")
+                                 or final_vote.get("final_reason") or final_vote.get("reasoning") or "").strip()
+                    if risk_note:
+                        before = len(self.risk_notes)
+                        self.record_risk({
+                            "area": f.get("risk_area") or f.get("title") or f.get("bug_class") or "验证后风险",
+                            "note": risk_note,
+                            "file": f.get("file") or "",
+                            "severity_hint": final_vote.get("corrected_severity") or f.get("severity") or "medium",
+                        }, f.get("lens") or "unknown", self.round)
+                        if len(self.risk_notes) > before:
+                            f["risk_id"] = self.risk_notes[-1].get("id")
+                payload = self._candidate_decision_payload(f, decision, votes, final_vote)
+                self._save_candidate_state(payload)
+                self.emit(EV.CANDIDATE_DECIDED, payload)
+                self.log(f"候选 {k} 终局决策:{decision} {f.get('title')}")
+                self.checkpoint(self.round)
+                return
+
+            corrected = (final_vote.get("corrected_severity")
+                         or witness_vote.get("corrected_severity")
+                         or f.get("severity"))
+            corrected = most_severe([corrected]) or f.get("severity")
+            exploit = (final_vote.get("exploitability") or witness_vote.get("exploitability") or "")
             self.seq += 1
             fid = f"{class_code(f.get('bug_class'))}-{pad3(self.seq)}"
             verify_models = sorted({v["model"] for v in votes if v.get("model")})
@@ -2197,7 +2398,7 @@ class Pipeline:
         self.emit(EV.RUN_STATUS, {"status": STATUS_RUNNING})
         self.log(f"目标={self.cfg.target}{sn} 模式={self.cfg.run_mode} 后端={self.cfg.backend} 并发={self.cfg.concurrency} "
                  f"每lens finder={self.cfg.finders_per_lens} dryRounds={self.cfg.dry_rounds} "
-                 f"maxRounds={self.cfg.max_rounds} 裁决票={self.cfg.verify_votes} PoC={self.cfg.enable_poc} "
+                 f"maxRounds={self.cfg.max_rounds} 验证=witness/blocker(5-agent) PoC={self.cfg.enable_poc} "
                  f"resume={self.cfg.resume} 威胁模型={self.cfg.threat_model}")
         self.log(f"启用 lens: {', '.join(self.cfg.lenses)} | run 目录: {self.store.dir} | "
                  f"方法库: {self.cfg.methods_abs} ({'就绪' if self.cfg.methods_ok() else '不可用→内联兜底'})")

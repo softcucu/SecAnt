@@ -315,6 +315,158 @@ class PromptBuilder:
             f"- 变体来源:{f.get('variant_of') or '(无)'}\n"
         )
 
+    @staticmethod
+    def _proof_obligation(f: Dict[str, Any]) -> str:
+        bc = (f.get("bug_class") or f.get("lens") or "").lower()
+        if any(x in bc for x in ["integer", "overflow", "trunc", "signed"]):
+            return (
+                "整数类证明义务:不要把“可控”当成“可溢出”。必须同时核对协议/字段宽度/配置上限、"
+                "代码 guard、运算位宽/有符号语义、溢出/截断条件是否可满足,并给出合法 witness 或不可满足证明。"
+            )
+        if any(x in bc for x in ["memory", "oob", "uaf", "buffer", "heap", "stack"]):
+            return (
+                "内存类证明义务:必须证明合法输入能让访问范围超出对象边界,或对象生命周期进入释放后使用/重复释放状态;"
+                "只看到 memcpy/数组访问/free 不足以确认。"
+            )
+        if any(x in bc for x in ["auth", "state", "bypass", "credential"]):
+            return (
+                "认证/状态机类证明义务:必须证明未授权或错误状态能到达 protected action,且没有统一 auth/state gate 支配该路径。"
+            )
+        if any(x in bc for x in ["inject", "path", "format", "command", "symlink"]):
+            return (
+                "注入/路径类证明义务:必须证明 payload 穿过 normalization/filter 后仍进入解释器语义边界或逃出 base dir;"
+                "字符串靠近 sink 不足以确认。"
+            )
+        if any(x in bc for x in ["race", "toctou", "double-fetch", "concurr"]):
+            return (
+                "竞态类证明义务:必须给出可行 interleaving,并证明锁/引用/事务没有覆盖 check-use 或共享状态访问区间。"
+            )
+        if any(x in bc for x in ["crypto", "cipher", "cert", "nonce", "random", "iv"]):
+            return (
+                "密码类证明义务:必须先证明该 primitive 承担安全属性,再证明攻击者能力可破坏该属性;"
+                "坏味道或弱算法名本身不足以确认。"
+            )
+        if any(x in bc for x in ["dos", "resource", "exhaust", "deadlock", "watchdog"]):
+            return (
+                "DoS/资源类证明义务:必须证明低成本输入可重复导致资源超过配额/预算,影响服务整体可用性,而非单请求失败。"
+            )
+        if any(x in bc for x in ["leak", "disclosure", "uninit", "padding"]):
+            return (
+                "信息泄露类证明义务:必须证明敏感/未初始化/OOB 数据进入攻击者可见输出通道,且长度/权限允许观察。"
+            )
+        return (
+            "通用证明义务:在攻击者能力、输入合法域、程序状态、代码约束的交集下,必须存在可触发坏结果的 witness。"
+        )
+
+    # ── Witness / blocker 对抗性验证:正方构造合法触发 witness ──
+    def verify_witness(self, f: Dict[str, Any], schema) -> str:
+        return (
+            f"你是漏洞验证的**正方 witness builder**。当前威胁模型:{self.threat}。\n"
+            "目标不是泛泛同意 finding,而是构造一个合法触发 witness:攻击者能力 ∩ 输入合法域 ∩ 程序状态 ∩ 代码约束 下,"
+            "是否存在可触发坏结果的点。构造不出来就 witness_complete=false。\n\n"
+            f"{self.verify_methods()}Finding:\n{self._finding_brief(f)}\n"
+            f"专项证明义务:{self._proof_obligation(f)}\n\n"
+            "请用 Read/rg 看真实代码,只追踪关键路径。若 witness_complete=true,必须同时给出:\n"
+            "- witness:最小合法输入/状态/顺序/关键值;\n"
+            "- attack_preconditions、input_domain_constraints、state_constraints、code_constraints;\n"
+            "- path_nodes:入口到 sink/坏结果的 path:line 节点;\n"
+            "- trigger_condition:合法 witness 如何满足坏条件;\n"
+            "- sink_ref 与 bad_result;\n"
+            "- evidence_refs、corrected_severity、exploitability。\n"
+            "若任一关键约束没闭合,不要硬判真,把缺口写进 missing_evidence。"
+            + must_struct(schema)
+        )
+
+    # ── Witness / blocker 对抗性验证:反方构造 blocker / 不可满足证明 ──
+    def verify_blocker(self, f: Dict[str, Any], witness: Dict[str, Any], schema) -> str:
+        witness_s = json.dumps(witness or {}, ensure_ascii=False)
+        return (
+            f"你是漏洞验证的**反方 blocker builder**。当前威胁模型:{self.threat}。\n"
+            "目标不是泛泛说它像误报,而是构造 decisive blocker 或不可满足证明:证明所有合法 witness 都被约束排除,"
+            "或所有相关路径都被 guard/state gate 阻断。找不到决定性 blocker 就 blocker_found=false。\n\n"
+            f"{self.verify_methods()}Finding:\n{self._finding_brief(f)}\n"
+            f"专项证明义务:{self._proof_obligation(f)}\n\n"
+            f"正方 witness JSON(可攻击它的合法性,但不要只攻击一个局部 witness 后直接全局否决):\n```json\n{witness_s}\n```\n"
+            "请用 Read/rg 看真实代码,重点找:\n"
+            "- 输入域/协议/配置/类型宽度让坏条件不可满足;\n"
+            "- guard/clamp/auth/state/lock/refcount 是否支配所有到 sink 的路径;\n"
+            "- sink 语义是否并不危险,或影响/输出通道不成立。\n"
+            "必须标注 blocker_scope:global/path_local/branch_local/config_local/partial/unknown/none。"
+            "只有覆盖所有相关合法输入或所有相关路径时才写 global。"
+            + must_struct(schema)
+        )
+
+    # ── Witness / blocker 对抗性验证:质询 witness ──
+    def verify_witness_judge(self, f: Dict[str, Any], witness: Dict[str, Any],
+                             blocker: Dict[str, Any], schema) -> str:
+        witness_s = json.dumps(witness or {}, ensure_ascii=False)
+        blocker_s = json.dumps(blocker or {}, ensure_ascii=False)
+        return (
+            f"你是漏洞验证的**witness 裁判**。当前威胁模型:{self.threat}。\n"
+            "只质询正方 witness:它是否真的满足攻击者能力、输入合法域、程序状态、代码约束,并触发坏结果。"
+            "不要重新做大范围审计,只核对会影响 witness 成立的 1-3 个关键事实。\n\n"
+            f"{self.verify_methods()}Finding:\n{self._finding_brief(f)}\n"
+            f"专项证明义务:{self._proof_obligation(f)}\n"
+            f"正方 witness JSON:\n```json\n{witness_s}\n```\n"
+            f"反方 blocker JSON(供参考):\n```json\n{blocker_s}\n```\n"
+            "输出 witness_verdict:\n"
+            "- accepted: witness 合法且关键约束闭合;\n"
+            "- weakened: witness 基本可行但有非致命缺口;\n"
+            "- rejected: witness 违反关键约束或无法触发坏结果;\n"
+            "- inconclusive:证据不足。\n"
+            "所有采用/反驳的事实都写进 evidence_refs 或 failed_checks。"
+            + must_struct(schema)
+        )
+
+    # ── Witness / blocker 对抗性验证:质询 blocker ──
+    def verify_blocker_judge(self, f: Dict[str, Any], witness: Dict[str, Any],
+                             blocker: Dict[str, Any], schema) -> str:
+        witness_s = json.dumps(witness or {}, ensure_ascii=False)
+        blocker_s = json.dumps(blocker or {}, ensure_ascii=False)
+        return (
+            f"你是漏洞验证的**blocker 裁判**。当前威胁模型:{self.threat}。\n"
+            "只质询反方 blocker:它是否全局/决定性,还是只打掉某条路径、某个分支、某个配置或某个局部 witness。"
+            "不要重新做大范围审计,只核对支配关系、作用域和不可满足证明的关键事实。\n\n"
+            f"{self.verify_methods()}Finding:\n{self._finding_brief(f)}\n"
+            f"专项证明义务:{self._proof_obligation(f)}\n"
+            f"正方 witness JSON:\n```json\n{witness_s}\n```\n"
+            f"反方 blocker JSON:\n```json\n{blocker_s}\n```\n"
+            "输出 blocker_verdict:\n"
+            "- global_decisive: blocker 覆盖所有相关合法输入或所有到 sink 路径,可以否决;\n"
+            "- partial: blocker 只覆盖局部路径/分支/配置/witness;\n"
+            "- invalid: blocker 被代码证据推翻;\n"
+            "- unknown_scope:作用域无法核实。\n"
+            "声称 global_decisive 时必须给 evidence_refs 和 reviewed_checks。"
+            + must_struct(schema)
+        )
+
+    # ── Witness / blocker 对抗性验证:终局裁判 + 定向补查 ──
+    def verify_final_adjudicator(self, f: Dict[str, Any], witness: Dict[str, Any],
+                                 blocker: Dict[str, Any], witness_review: Dict[str, Any],
+                                 blocker_review: Dict[str, Any], schema) -> str:
+        payload = json.dumps({
+            "witness": witness or {},
+            "blocker": blocker or {},
+            "witness_review": witness_review or {},
+            "blocker_review": blocker_review or {},
+        }, ensure_ascii=False)
+        return (
+            f"你是漏洞验证的**终局裁判 + 定向补查员**。当前威胁模型:{self.threat}。\n"
+            "你不是重新审计整仓。你的任务是读取正反和两个裁判结果,找出最影响最终决策的 1-2 个缺口,"
+            "用 Read/rg 做限时补查,然后必须输出一个 operational_decision。\n\n"
+            f"{self.verify_methods()}Finding:\n{self._finding_brief(f)}\n"
+            f"专项证明义务:{self._proof_obligation(f)}\n"
+            f"前四阶段 JSON:\n```json\n{payload}\n```\n"
+            "决策口径:\n"
+            "- confirmed: witness 被基本验证,且没有 verified global blocker;\n"
+            "- rejected: blocker 被验证为 global/decisive,或坏条件在合法输入/状态/代码约束下不可满足;\n"
+            "- suppressed_unproven: witness 不完整,blocker 也不决定性,低/中风险且不值得作为风险种子继续追;\n"
+            "- promoted_to_risk: witness 不完整,但存在可复用风险模式、调用方约束分散、边界不清或值得变体排查的危险原语;\n"
+            "- needs_manual_review: high/critical 潜在影响且证据冲突,补查后仍无法闭合。\n"
+            "同时输出 epistemic_verdict(proven_real/proven_false/unresolved)。不要用 unknown 作为 operational_decision。"
+            + must_struct(schema)
+        )
+
     # ── 对抗性验证:正方举证 ──
     def verify_prover(self, f: Dict[str, Any], schema) -> str:
         return (

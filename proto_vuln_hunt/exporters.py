@@ -153,6 +153,42 @@ def _render_verify_votes_md(votes: List[Dict[str, Any]]) -> str:
         rows.append(f"- 证据有效性: {valid}\n")
         if v.get("verdict_confidence"):
             rows.append(f"- 置信度: {v.get('verdict_confidence')}\n")
+        if v.get("operational_decision"):
+            rows.append(f"- 工程决策: {v.get('operational_decision')}\n")
+        if v.get("epistemic_verdict"):
+            rows.append(f"- 证据结论: {v.get('epistemic_verdict')}\n")
+        if v.get("witness"):
+            rows.append(f"- Witness: {_nl(str(v.get('witness')))}\n")
+        if v.get("attack_preconditions"):
+            rows.append(f"- 攻击前置条件:\n{_as_md(v.get('attack_preconditions'))}\n")
+        if v.get("input_domain_constraints"):
+            rows.append(f"- 输入域约束:\n{_as_md(v.get('input_domain_constraints'))}\n")
+        if v.get("state_constraints"):
+            rows.append(f"- 状态约束:\n{_as_md(v.get('state_constraints'))}\n")
+        if v.get("code_constraints"):
+            rows.append(f"- 代码约束:\n{_as_md(v.get('code_constraints'))}\n")
+        if v.get("path_nodes"):
+            rows.append(f"- 路径节点:\n{_as_md(v.get('path_nodes'))}\n")
+        if v.get("trigger_condition"):
+            rows.append(f"- 触发条件: {_nl(str(v.get('trigger_condition')))}\n")
+        if v.get("bad_result"):
+            rows.append(f"- 坏结果: {_nl(str(v.get('bad_result')))}\n")
+        if v.get("blocker_description") or v.get("impossibility_proof"):
+            rows.append(f"- Blocker: {_nl(str(v.get('blocker_description') or v.get('impossibility_proof')))}\n")
+        if v.get("blocker_scope"):
+            rows.append(f"- Blocker 作用域: {v.get('blocker_scope')}\n")
+        if v.get("blocking_checks"):
+            rows.append(f"- 阻断点:\n{_as_md(v.get('blocking_checks'))}\n")
+        if v.get("witness_verdict"):
+            rows.append(f"- Witness 裁决: {v.get('witness_verdict')}\n")
+        if v.get("blocker_verdict"):
+            rows.append(f"- Blocker 裁决: {v.get('blocker_verdict')}\n")
+        if v.get("reviewed_checks"):
+            rows.append(f"- 已复核事实:\n{_as_md(v.get('reviewed_checks'))}\n")
+        if v.get("failed_checks"):
+            rows.append(f"- 失败/削弱点:\n{_as_md(v.get('failed_checks'))}\n")
+        if v.get("deciding_facts_checked"):
+            rows.append(f"- 终局补查事实:\n{_as_md(v.get('deciding_facts_checked'))}\n")
         if v.get("evidence_refs"):
             rows.append(f"- 代码证据:\n{_as_md(v.get('evidence_refs'))}\n")
         if v.get("source_chain"):
@@ -170,6 +206,16 @@ def _render_verify_votes_md(votes: List[Dict[str, Any]]) -> str:
             rows.append(f"- 理由: {_nl(str(reason))}\n")
         if v.get("missing_evidence"):
             rows.append(f"- 缺失证据: {_nl(str(v.get('missing_evidence')))}\n")
+        if v.get("residual_uncertainty"):
+            rows.append(f"- 剩余不确定性: {_nl(str(v.get('residual_uncertainty')))}\n")
+        if v.get("why_not_confirmed"):
+            rows.append(f"- 为何不确认: {_nl(str(v.get('why_not_confirmed')))}\n")
+        if v.get("why_not_rejected"):
+            rows.append(f"- 为何不否决: {_nl(str(v.get('why_not_rejected')))}\n")
+        if v.get("recommended_next_action"):
+            rows.append(f"- 建议动作: {_nl(str(v.get('recommended_next_action')))}\n")
+        if v.get("risk_note"):
+            rows.append(f"- 风险说明: {_nl(str(v.get('risk_note')))}\n")
     return "".join(rows)
 
 

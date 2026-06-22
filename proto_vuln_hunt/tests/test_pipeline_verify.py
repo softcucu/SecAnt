@@ -1,6 +1,6 @@
-"""process_finding 对抗举证/裁决 + final failed sweep 的单元测试。
+"""process_finding witness/blocker 对抗验证 + final failed sweep 的单元测试。
 
-不触碰真实后端 CLI:用 FakeRunner 直接喂正方/反方/裁决票/报告正文,
+不触碰真实后端 CLI:用 FakeRunner 直接喂 witness/blocker/裁判/终局裁判/报告正文,
 用临时目录里的真实 RunStore 落盘(避免再去 stub 一堆 store 方法)。
 
 运行:  python3 -m unittest proto_vuln_hunt.tests.test_pipeline_verify
@@ -39,80 +39,148 @@ def _finding(**over):
     return f
 
 
-def _proof(ok=True, sev="high", **over):
-    if ok:
+def _witness(complete=True, sev="high", **over):
+    if complete:
         v = {
-            "supports_real": True,
-            "evidence_refs": ["a.c:1 - recv 读入攻击者长度", "a.c:10 - memcpy 使用该长度"],
-            "source_chain": ["a.c:1 - recv_packet", "a.c:8 - fn 传入 len", "a.c:10 - memcpy"],
+            "witness_complete": True,
+            "witness": "len=512 reaches memcpy with dst_size=128",
+            "attack_preconditions": ["a.c:1 - REMOTE packet controls len"],
+            "input_domain_constraints": ["a.c:2 - len is uint16, 0..65535"],
+            "state_constraints": ["a.c:3 - authenticated state is not required"],
+            "code_constraints": ["a.c:4 - no clamp before call"],
+            "path_nodes": ["a.c:1 - recv_packet", "a.c:8 - fn passes len", "a.c:10 - memcpy"],
+            "trigger_condition": "512 > sizeof(dst)=128",
+            "bad_result": "stack buffer overflow",
             "sink_ref": "a.c:10 - memcpy(dst, src, len)",
-            "reachability": "REMOTE 入口可达 fn",
-            "controllability": "len 由报文字段控制且未夹紧",
+            "evidence_refs": ["a.c:1 - recv 读入攻击者长度", "a.c:10 - memcpy 使用该长度"],
             "corrected_severity": sev,
             "exploitability": "exploitable",
             "verdict_confidence": "high",
-            "reasoning": "source 到 sink 链路完整且缺校验",
+            "reasoning": "合法输入能触发越界写",
         }
     else:
-        v = {"supports_real": False, "evidence_refs": [], "source_chain": [], "sink_ref": "",
-             "missing_evidence": "未找到真实入口", "reasoning": "正方无法坐实"}
+        v = {"witness_complete": False, "evidence_refs": [], "missing_evidence": "未找到真实入口",
+             "reasoning": "正方无法构造合法 witness"}
     v.update(over)
     return v
 
 
-def _disproof(refutes=False, **over):
-    if refutes:
+def _blocker(found=False, scope="none", **over):
+    if found:
         v = {
-            "refutes_real": True,
+            "blocker_found": True,
+            "blocker_scope": scope,
+            "blocker_type": "guard_dominance",
+            "blocker_description": "入口已把长度夹紧到缓冲区容量以内",
             "evidence_refs": ["a.c:4 - len 被夹紧到缓冲区容量以内"],
-            "clearing_checks": ["a.c:4 - if (len > sizeof(dst)) return -1"],
+            "blocking_checks": ["a.c:4 - if (len > sizeof(dst)) return -1"],
+            "impossibility_proof": "所有到 memcpy 的路径均先执行该检查",
             "non_issue_reason": "入口已把长度夹紧到缓冲区容量以内",
             "verdict_confidence": "high",
             "reasoning": "caller trace 证伪可达危险长度",
         }
     else:
-        v = {"refutes_real": False, "evidence_refs": [], "clearing_checks": [],
+        v = {"blocker_found": False, "blocker_scope": "none", "evidence_refs": [],
              "missing_evidence": "未找到上游证伪点", "reasoning": "反方未能证伪"}
     v.update(over)
     return v
 
 
-def _judge(decision="confirm", sev="high", **over):
-    if decision == "confirm":
+def _witness_review(verdict="accepted", **over):
+    if verdict == "accepted":
         v = {
-            "decision": "confirm",
-            "is_real": True,
-            "evidence_refs": ["a.c:1 - recv 读入攻击者长度", "a.c:10 - memcpy 使用该长度"],
-            "source_chain": ["a.c:1 - recv_packet", "a.c:8 - fn 传入 len", "a.c:10 - memcpy"],
-            "sink_ref": "a.c:10 - memcpy(dst, src, len)",
-            "reachability": "REMOTE 入口可达 fn",
-            "controllability": "len 由报文字段控制且未夹紧",
-            "corrected_severity": sev,
-            "exploitability": "exploitable",
+            "witness_verdict": "accepted",
+            "evidence_refs": ["a.c:10 - memcpy 使用 len"],
+            "reviewed_checks": ["a.c:1 - len 来自报文", "a.c:10 - sink 可达"],
             "verdict_confidence": "high",
-            "reasoning": "正方证据完整,反方未证伪",
+            "reasoning": "witness 满足关键约束",
         }
-    elif decision == "reject":
+    elif verdict == "rejected":
         v = {
-            "decision": "reject",
-            "is_real": False,
-            "evidence_refs": ["a.c:4 - len 被夹紧到缓冲区容量以内"],
-            "clearing_checks": ["a.c:4 - if (len > sizeof(dst)) return -1"],
-            "non_issue_reason": "入口已把长度夹紧到缓冲区容量以内",
+            "witness_verdict": "rejected",
+            "evidence_refs": ["a.c:2 - len 最大只有 64"],
+            "failed_checks": ["witness 的 len=512 不合法"],
             "verdict_confidence": "high",
-            "reasoning": "反方证伪点成立",
+            "reasoning": "witness 违反协议约束",
         }
     else:
         v = {
-            "decision": "inconclusive",
-            "is_real": False,
-            "evidence_refs": ["a.c:10 - 仅定位到 sink"],
-            "missing_evidence": "source_chain 和 clearing_checks 均不足",
+            "witness_verdict": verdict,
+            "evidence_refs": ["a.c:10 - 仅核对到 sink"],
+            "missing_evidence": "输入域未闭合",
             "reasoning": "证据不足",
         }
     v.update(over)
     return v
 
+
+def _blocker_review(verdict="invalid", **over):
+    if verdict == "global_decisive":
+        v = {
+            "blocker_verdict": "global_decisive",
+            "evidence_refs": ["a.c:4 - if (len > sizeof(dst)) return -1"],
+            "reviewed_checks": ["a.c:4 - guard 支配 memcpy"],
+            "verdict_confidence": "high",
+            "reasoning": "blocker 覆盖所有路径",
+        }
+    elif verdict == "invalid":
+        v = {
+            "blocker_verdict": "invalid",
+            "evidence_refs": ["a.c:4 - guard 只在另一个分支"],
+            "failed_checks": ["guard 不支配 witness 路径"],
+            "verdict_confidence": "high",
+            "reasoning": "反方 blocker 无效",
+        }
+    else:
+        v = {
+            "blocker_verdict": verdict,
+            "evidence_refs": ["a.c:4 - 找到局部 guard"],
+            "failed_checks": ["作用域不是全局"],
+            "missing_evidence": "无法证明支配所有路径",
+            "reasoning": "blocker 作用域不足",
+        }
+    v.update(over)
+    return v
+
+
+def _final(decision="confirmed", sev="high", **over):
+    if decision == "confirmed":
+        v = {
+            "epistemic_verdict": "proven_real",
+            "operational_decision": "confirmed",
+            "deciding_facts_checked": ["a.c:10 - memcpy 使用 witness 长度"],
+            "final_reason": "witness 被接受且 blocker 无效",
+            "corrected_severity": sev,
+            "exploitability": "exploitable",
+            "verdict_confidence": "high",
+            "reasoning": "可作为静态确认漏洞",
+        }
+    elif decision == "rejected":
+        v = {
+            "epistemic_verdict": "proven_false",
+            "operational_decision": "rejected",
+            "deciding_facts_checked": ["a.c:4 - guard 支配 sink"],
+            "final_reason": "global blocker 成立",
+            "rejection_reason": "入口已把长度夹紧到缓冲区容量以内",
+            "verdict_confidence": "high",
+            "reasoning": "坏条件不可满足",
+        }
+    else:
+        v = {
+            "epistemic_verdict": "unresolved",
+            "operational_decision": decision,
+            "deciding_facts_checked": ["a.c:10 - sink 存在但 witness 未闭合"],
+            "final_reason": "witness 不完整且 blocker 不决定性",
+            "residual_uncertainty": "输入域未闭合",
+            "recommended_next_action": "后续变体排查",
+            "reasoning": "不确认也不强否决",
+        }
+        if decision == "promoted_to_risk":
+            v["risk_note"] = "共享 helper 依赖调用方校验,值得变体排查"
+        if decision == "needs_manual_review":
+            v["final_reason"] = "高危潜在影响但正反证据冲突"
+    v.update(over)
+    return v
 
 class _PipelineTestBase(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -125,9 +193,11 @@ class _PipelineTestBase(unittest.IsolatedAsyncioTestCase):
         p = Pipeline(cfg, store=RunStore(self._tmp.name).ensure(),
                      emitter=lambda etype, data, persist=True: events.append((etype, data)))
         p.runner = FakeRunner()
-        p.pb.verify_prover = lambda *a, **k: "PROVER_PROMPT"
-        p.pb.verify_disprover = lambda *a, **k: "DISPROVER_PROMPT"
-        p.pb.verify_judge = lambda *a, **k: "JUDGE_PROMPT"
+        p.pb.verify_witness = lambda *a, **k: "WITNESS_PROMPT"
+        p.pb.verify_blocker = lambda *a, **k: "BLOCKER_PROMPT"
+        p.pb.verify_witness_judge = lambda *a, **k: "WITNESS_JUDGE_PROMPT"
+        p.pb.verify_blocker_judge = lambda *a, **k: "BLOCKER_JUDGE_PROMPT"
+        p.pb.verify_final_adjudicator = lambda *a, **k: "FINAL_PROMPT"
         p.pb.report_body = lambda *a, **k: "REPORT_PROMPT"
         p.events = events
         return p
@@ -142,10 +212,10 @@ class _PipelineTestBase(unittest.IsolatedAsyncioTestCase):
 
 
 class TestAdversarialVerify(_PipelineTestBase):
-    async def test_majority_confirm_judges_confirm(self):
-        """正方证据合格 + 3 张裁决票里 2 confirm → 确认为漏洞。"""
+    async def test_verified_witness_and_invalid_blocker_confirms(self):
+        """witness 被接受 + blocker 无效 + 终局 confirmed → 确认为漏洞。"""
         p = self.make_pipeline(verify_votes=3)
-        p.runner.verify_responses = [_proof(), _disproof(False), _judge("confirm"), _judge("confirm"), _judge("inconclusive")]
+        p.runner.verify_responses = [_witness(), _blocker(False), _witness_review("accepted"), _blocker_review("invalid"), _final("confirmed")]
         f = _finding()
         await p.process_finding(f)
 
@@ -158,17 +228,17 @@ class TestAdversarialVerify(_PipelineTestBase):
         self.assertEqual(cands[0]["status"], "confirmed")
         self.assertEqual(cands[0]["id"], "MEM-001")
         self.assertEqual(len(p.confirmed[0]["votes"]), 5)
-        self.assertTrue(any(v.get("phase") == "prover" for v in p.confirmed[0]["votes"]))
+        self.assertTrue(any(v.get("phase") == "witness" for v in p.confirmed[0]["votes"]))
 
-    async def test_majority_reject_judges_rejects(self):
-        """反方证伪合格 + 3 张裁决票里 3 reject → 标记 rejected,不入 confirmed。"""
+    async def test_global_blocker_rejects(self):
+        """global blocker 被终局确认 → 标记 rejected,不入 confirmed。"""
         p = self.make_pipeline(verify_votes=3)
         p.runner.verify_responses = [
-            _proof(False),
-            _disproof(True),
-            _judge("reject"),
-            _judge("reject"),
-            _judge("reject"),
+            _witness(False),
+            _blocker(True, "global"),
+            _witness_review("rejected"),
+            _blocker_review("global_decisive"),
+            _final("rejected"),
         ]
         f = _finding(description="候选声称长度可控导致溢出", source_to_sink="recv len -> copy")
         await p.process_finding(f)
@@ -181,81 +251,83 @@ class TestAdversarialVerify(_PipelineTestBase):
         payload = self._last_event(p, EV.FINDING_REJECTED)
         self.assertEqual(payload["description"], "候选声称长度可控导致溢出")
         self.assertEqual(payload["source_to_sink"], "recv len -> copy")
-        self.assertEqual(payload["vote_false"], 3)
         self.assertEqual(len(payload["votes"]), 5)
-        self.assertEqual(payload["votes"][2]["phase"], "judge")
+        self.assertEqual(payload["votes"][2]["phase"], "witness_judge")
         self.assertIn("入口已把长度夹紧", payload["rejection_reason"])
         cands = p.store.load_candidates()
         self.assertEqual(len(cands), 1)
         self.assertEqual(cands[0]["status"], "rejected")
-        self.assertEqual(cands[0]["vote_false"], 3)
 
-    async def test_tie_no_majority_is_not_a_rejection(self):
-        """偶数裁决票打平(1 confirm / 1 reject)→ 正常阶段回队重试。"""
-        p = self.make_pipeline(verify_votes=2)
-        p.runner.verify_responses = [_proof(), _disproof(True), _judge("confirm"), _judge("reject")]
-        f = _finding()
-        await p.process_finding(f)
-
-        self.assertEqual(p.confirmed, [])
-        self.assertNotIn(finding_key(f), p.processed_keys)       # 未终结
-        self.assertIn(finding_key(f), p.pending_findings)        # 留在候选池
-        self.assertEqual(f["verify_status"], "pending")
-        self.assertEqual(f["verify_attempts"], 1)
-        self.assertTrue(any(it.get("kind") == "_finding" for it in p.queue))  # 已回队
-        self.assertNotIn(EV.CANDIDATE_FAILED, self._event_types(p))
-        self.assertNotIn(EV.FINDING_REJECTED, self._event_types(p))
-
-    async def test_insufficient_valid_votes_is_not_a_rejection(self):
-        """3 张裁决票里仅 1 张有效(2 张 CLI/解析失败)→ 票数不足 → 回队重试。"""
+    async def test_suppressed_unproven_is_terminal_candidate(self):
+        """witness 不完整 + blocker 不决定性 + 终局压制 → 不回队、不确认。"""
         p = self.make_pipeline(verify_votes=3)
-        p.runner.verify_responses = [_proof(), _disproof(False), _judge("confirm"), None, None]
+        p.runner.verify_responses = [
+            _witness(False),
+            _blocker(True, "partial"),
+            _witness_review("inconclusive"),
+            _blocker_review("partial"),
+            _final("suppressed_unproven"),
+        ]
         f = _finding()
         await p.process_finding(f)
 
         self.assertEqual(p.confirmed, [])
-        self.assertNotIn(finding_key(f), p.processed_keys)
-        self.assertEqual(f["verify_attempts"], 1)
-        self.assertIn("裁决票不足", f.get("verify_failure_reason", ""))
-        self.assertNotIn(EV.FINDING_REJECTED, self._event_types(p))
+        self.assertIn(finding_key(f), p.processed_keys)
+        self.assertEqual(p.pending_findings, {})
+        self.assertEqual(f["verify_status"], "suppressed_unproven")
+        self.assertNotIn(EV.CANDIDATE_FAILED, self._event_types(p))
+        self.assertIn(EV.CANDIDATE_DECIDED, self._event_types(p))
+        self.assertEqual(p.store.load_candidates()[0]["status"], "suppressed_unproven")
 
-    async def test_confirm_judge_without_source_chain_is_invalid(self):
-        """confirm 裁决缺 source_chain → 无证据票不算票。"""
-        p = self.make_pipeline(verify_votes=1)
-        p.runner.verify_responses = [_proof(), _disproof(False), _judge("confirm", source_chain=[])]
+    async def test_promoted_to_risk_records_risk(self):
+        """终局 promoted_to_risk → 候选终态 + 风险登记。"""
+        p = self.make_pipeline(verify_votes=3)
+        p.runner.verify_responses = [
+            _witness(False),
+            _blocker(False),
+            _witness_review("inconclusive"),
+            _blocker_review("unknown_scope"),
+            _final("promoted_to_risk"),
+        ]
         f = _finding()
         await p.process_finding(f)
 
         self.assertEqual(p.confirmed, [])
-        self.assertNotIn(finding_key(f), p.processed_keys)
-        self.assertIn("有效裁决票不足", f.get("verify_failure_reason", ""))
-        self.assertIn("source_chain", f.get("verify_failure_reason", ""))
+        self.assertIn(finding_key(f), p.processed_keys)
+        self.assertEqual(p.store.load_candidates()[0]["status"], "promoted_to_risk")
+        self.assertEqual(len(p.risk_notes), 1)
+        self.assertIn("共享 helper", p.risk_notes[0]["note"])
 
-    async def test_reject_judge_without_clearing_check_is_invalid(self):
-        """reject 裁决缺 clearing_checks → 无证据票不算票。"""
-        p = self.make_pipeline(verify_votes=1)
-        p.runner.verify_responses = [_proof(False), _disproof(True), _judge("reject", clearing_checks=[])]
+    async def test_high_conflict_needs_manual_review_is_terminal(self):
+        """高危冲突无法闭合 → needs_manual_review 终态,不确认不否决。"""
+        p = self.make_pipeline(verify_votes=3)
+        p.runner.verify_responses = [
+            _witness(),
+            _blocker(True, "unknown"),
+            _witness_review("accepted"),
+            _blocker_review("unknown_scope"),
+            _final("needs_manual_review"),
+        ]
         f = _finding()
         await p.process_finding(f)
 
         self.assertEqual(p.confirmed, [])
-        self.assertNotIn(finding_key(f), p.processed_keys)
-        self.assertIn("有效裁决票不足", f.get("verify_failure_reason", ""))
-        self.assertIn("clearing_checks", f.get("verify_failure_reason", ""))
+        self.assertIn(finding_key(f), p.processed_keys)
+        self.assertEqual(p.store.load_candidates()[0]["status"], "needs_manual_review")
 
-    async def test_retry_exhaustion_marks_verify_failed(self):
-        """连续打平,耗尽 retry.max_attempts 后 → 终态 verify_failed + 发 CANDIDATE_FAILED。"""
+    async def test_final_adjudicator_parse_failure_retries_then_verify_failed(self):
+        """终局裁判无结构化输出,耗尽 retry.max_attempts 后 → verify_failed。"""
         p = self.make_pipeline(verify_votes=2)
         p.cfg.retry.max_attempts = 1   # 总共允许 1 次失败回队,第 2 次失败即终态
         f = _finding()
 
-        p.runner.verify_responses = [_proof(), _disproof(True), _judge("confirm"), _judge("reject")]
+        p.runner.verify_responses = [_witness(), _blocker(False), _witness_review("accepted"), _blocker_review("invalid"), None]
         await p.process_finding(f)                        # 第 1 次:回队
         self.assertEqual(f["verify_status"], "pending")
         self.assertEqual(f["verify_attempts"], 1)
         self.assertNotIn(EV.CANDIDATE_FAILED, self._event_types(p))
 
-        p.runner.verify_responses = [_proof(), _disproof(True), _judge("confirm"), _judge("reject")]
+        p.runner.verify_responses = [_witness(), _blocker(False), _witness_review("accepted"), _blocker_review("invalid"), None]
         await p.process_finding(f)                        # 第 2 次:超限 → verify_failed
         self.assertEqual(f["verify_status"], "verify_failed")
         self.assertEqual(f["verify_attempts"], 2)
@@ -268,7 +340,7 @@ class TestAdversarialVerify(_PipelineTestBase):
         """final sweep 模式:一次额外机会,失败即终态 verify_failed(不再回队重试)。"""
         p = self.make_pipeline(verify_votes=2)
         p._in_final_failed_sweep = True
-        p.runner.verify_responses = [_proof(), _disproof(True), _judge("confirm"), _judge("reject")]
+        p.runner.verify_responses = [_witness(), _blocker(False), _witness_review("accepted"), _blocker_review("invalid"), None]
         f = _finding()
         await p.process_finding(f)
 
