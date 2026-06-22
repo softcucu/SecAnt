@@ -22,7 +22,8 @@ import os
 import random
 import hashlib
 import time
-from typing import Any, Dict, List, Optional
+from collections import deque
+from typing import Any, Dict, Iterator, List, Optional
 
 STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
@@ -329,10 +330,18 @@ class RunStore:
         with open(self.usage_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    def load_usage(self) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
+    def load_usage(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        max_rows: Optional[int] = None
+        if limit is not None:
+            try:
+                max_rows = max(0, int(limit))
+            except (TypeError, ValueError):
+                max_rows = None
+        if max_rows == 0:
+            return []
+        out = deque(maxlen=max_rows) if max_rows else []
         if not os.path.isfile(self.usage_path):
-            return out
+            return []
         with open(self.usage_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -342,7 +351,7 @@ class RunStore:
                     out.append(json.loads(line))
                 except Exception:
                     continue
-        return out
+        return list(out)
 
     # ── 事件 ──
     def append_event(self, ev: Dict[str, Any]) -> None:
@@ -385,10 +394,15 @@ class RunStore:
                 pass
         return last
 
-    def read_events(self, after_seq: int = 0) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
+    def iter_events(self, after_seq: int = 0) -> Iterator[Dict[str, Any]]:
+        try:
+            after_seq = max(0, int(after_seq or 0))
+        except (TypeError, ValueError):
+            after_seq = 0
+        if after_seq and after_seq >= self.last_event_seq():
+            return
         if not os.path.isfile(self.events_path):
-            return out
+            return
         with open(self.events_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -398,9 +412,15 @@ class RunStore:
                     ev = json.loads(line)
                 except Exception:
                     continue
-                if ev.get("seq", 0) > after_seq:
-                    out.append(ev)
-        return out
+                try:
+                    seq = int(ev.get("seq", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if seq > after_seq:
+                    yield ev
+
+    def read_events(self, after_seq: int = 0) -> List[Dict[str, Any]]:
+        return list(self.iter_events(after_seq))
 
 
 class RunRegistry:

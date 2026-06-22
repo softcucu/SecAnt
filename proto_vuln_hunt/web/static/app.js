@@ -255,7 +255,7 @@ async function viewNew() {
 // ──────────────────────── view: dashboard ────────────────────────
 function viewDashboard(runId) {
   app.innerHTML = "";
-  const S = { findings: new Map(), risks: new Map(), health: new Map(), agentMap: new Map(), candidateMap: new Map(), nonIssueMap: new Map(), coverage: null, recon: null, log: [], usageRows: [], usageIds: new Set(), usage: emptyUsage(), manifest: null, meta: null, candidates: 0, status: "queued", round: 0, dry: 0, agents: 0, elapsed: 0 };
+  const S = { findings: new Map(), risks: new Map(), health: new Map(), agentMap: new Map(), candidateMap: new Map(), nonIssueMap: new Map(), coverage: null, recon: null, log: [], usageRows: [], usageIds: new Set(), usage: emptyUsage(), manifest: null, meta: null, candidates: 0, candidateTotal: 0, nonIssueTotal: 0, usageTotal: 0, riskTotal: 0, status: "queued", round: 0, dry: 0, agents: 0, elapsed: 0 };
   let activeTab = "findings";
   const nonIssueOpenKeys = new Set();
   let tabRenderTimer = null;
@@ -299,6 +299,10 @@ function viewDashboard(runId) {
   const agentOutputStoreKey = `pvh.agentOutputsExpanded:${runId}`;
   let collapsedAgentGroups = loadLocalSet(agentGroupStoreKey);
   let expandedAgentOutputs = loadLocalSet(agentOutputStoreKey);
+  let candidatesLoaded = false;
+  let candidatesLoading = null;
+  let usageLoaded = false;
+  let usageLoading = null;
   let elapsedBase = 0;
   let elapsedBaseAt = Date.now();
   // 候选列表缓存:仅在新增/清空候选时失效,渲染期间复用同一数组,
@@ -344,7 +348,11 @@ function viewDashboard(runId) {
     if (agents != null) S.agents = Math.max(S.agents || 0, agents);
     const elapsed = finiteNumber(d.elapsed_s);
     if (elapsed != null) resetElapsedClock(elapsed);
-    if (d.candidates != null) S.candidates = d.candidates;
+    if (d.candidates != null) {
+      S.candidates = d.candidates;
+      S.candidateTotal = Math.max(S.candidateTotal || 0, tokenCount(d.candidates));
+    }
+    if (d.risks != null) S.riskTotal = Math.max(S.riskTotal || 0, tokenCount(d.risks));
     if (d.token_usage) setUsage(S.usage, d.token_usage);
   }
   function setRunStatus(status) {
@@ -387,7 +395,16 @@ function viewDashboard(runId) {
   function renderTabs() {
     tabsBar.innerHTML = "";
     const activeAgents = [...S.agentMap.values()].filter(a => isAgentActive(a) && isVisibleAgentCategory(agentCategory(a))).length;
-    const counts = { findings: S.findings.size, candidates: S.candidateMap.size, nonissues: S.nonIssueMap.size, risks: S.risks.size, usage: S.usageRows.length, health: S.health.size, agents: activeAgents, history: (S.recon?.history || []).length };
+    const counts = {
+      findings: S.findings.size,
+      candidates: Math.max(S.candidateTotal || 0, S.candidateMap.size),
+      nonissues: Math.max(S.nonIssueTotal || 0, S.nonIssueMap.size),
+      risks: Math.max(S.riskTotal || 0, S.risks.size),
+      usage: Math.max(S.usageTotal || 0, S.usageRows.length),
+      health: S.health.size,
+      agents: activeAgents,
+      history: (S.recon?.history || []).length,
+    };
     for (const [key, label] of TABS) {
       const t = el("div", { class: "tab" + (key === activeTab ? " active" : "") }, label);
       if (counts[key]) t.append(el("span", { class: "tabcount" }, String(counts[key])));
@@ -780,6 +797,7 @@ function viewDashboard(runId) {
     return [c.title || c.key, c.bug_class, loc !== ":0" ? loc : ""].filter(Boolean).join(" · ");
   }
   function candidatesForHistory(h) {
+    if (!candidatesLoaded) return [];
     const pattern = normRel(h.pattern);
     const source = normRel(h.source);
     if (!pattern && !source) return [];
@@ -789,6 +807,7 @@ function viewDashboard(runId) {
     });
   }
   function candidatesForRisk(r) {
+    if (!candidatesLoaded) return [];
     const rid = normRel(r.id);
     const area = normRel(r.area);
     return candidateList().filter(c => {
@@ -873,6 +892,11 @@ function viewDashboard(runId) {
     return bar;
   }
   function renderCandidates() {
+    if (!candidatesLoaded) {
+      tabBody.append(el("div", { class: "panel empty" }, "候选数据加载中…"));
+      fetchCandidates();
+      return;
+    }
     const all = [...S.candidateMap.values()];
     const counts = { all: all.length, pending: 0, confirmed: 0, rejected: 0, verify_failed: 0 };
     for (const c of all) if (counts[c.status] !== undefined) counts[c.status]++;
@@ -980,6 +1004,11 @@ function viewDashboard(runId) {
     return body;
   }
   function renderNonIssues() {
+    if (!candidatesLoaded) {
+      tabBody.append(el("div", { class: "panel empty" }, "非问题数据加载中…"));
+      fetchCandidates();
+      return;
+    }
     const list = [...S.nonIssueMap.values()];
     tabBody.append(el("div", { class: "panel" },
       el("div", { class: "row", style: "justify-content:space-between" },
@@ -1521,6 +1550,7 @@ function viewDashboard(runId) {
   function renderCoverage() {
     const c = S.coverage;
     if (!c) { tabBody.append(el("div", { class: "panel empty" }, "暂无覆盖数据(运行开始后会出现攻击面审计进度与拆解的子任务)。")); return; }
+    if (!candidatesLoaded) fetchCandidates();
     const p = c.progress || { done: 0, clean: 0, total: 0 };
     const pct = p.total ? Math.round(100 * p.done / p.total) : 0;
     tabBody.append(el("div", { class: "panel" },
@@ -1576,7 +1606,7 @@ function viewDashboard(runId) {
       const vtb = el("tbody");
       for (const v of variants) {
         const related = candidatesForHistory({ pattern: v.pattern || v.name, source: v.source });
-        const empty = v.candidates ? `候选 ${v.candidates}(旧数据未保存关联)` : "—";
+        const empty = !candidatesLoaded ? "候选关联加载中…" : (v.candidates ? `候选 ${v.candidates}(旧数据未保存关联)` : "—");
         vtb.append(el("tr", {}, el("td", {}, statusBadge(v.status)), el("td", {}, v.name || ""),
           el("td", {}, v.source || "—"), el("td", {}, String(v.passes || 0)), el("td", {}, renderRelatedCandidates(related, empty))));
       }
@@ -1647,6 +1677,7 @@ function viewDashboard(runId) {
 
   const riskRecheckOf = (r) => r.recheck_status || "none";
   function renderRisks() {
+    if (!candidatesLoaded) fetchCandidates();
     const all = [...S.risks.values()].sort((a, b) => SEVS.indexOf(a.severity_hint) - SEVS.indexOf(b.severity_hint));
     if (!all.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无风险登记。")); return; }
     tabBody.append(dynamicStatusChips(riskStatusFilter, all, riskRecheckOf, RISK_STATUS_ORDER, RISK_STATUS_LABEL,
@@ -1660,7 +1691,7 @@ function viewDashboard(runId) {
       const sevCell = r.id ? severitySelect(r) : sevPill(r.severity_hint);
       const related = candidatesForRisk(r);
       const ledger = r.id ? ledgerByKey("risk:" + r.id) : null;
-      const empty = ledger?.candidates ? `候选 ${ledger.candidates}(旧数据未保存关联)` : "—";
+      const empty = !candidatesLoaded ? "候选关联加载中…" : (ledger?.candidates ? `候选 ${ledger.candidates}(旧数据未保存关联)` : "—");
       tb.append(el("tr", {}, el("td", {}, sevCell), el("td", {}, r.area || ""), el("td", { class: "loc" }, r.file || "—"), el("td", {}, r.note || ""), el("td", {}, r.lens || ""), el("td", {}, RECHECK_TXT[r.recheck_status] || r.recheck_status || "—"), el("td", {}, renderRelatedCandidates(related, empty))));
     }
     tbl.append(tb);
@@ -1722,6 +1753,7 @@ function viewDashboard(runId) {
     return "否";
   }
   function renderHistory() {
+    if (!candidatesLoaded) fetchCandidates();
     const hist = (S.recon || {}).history || [];
     if (!hist.length) {
       tabBody.append(el("div", { class: "panel empty" }, "暂无历史问题模式。"));
@@ -1743,7 +1775,7 @@ function viewDashboard(runId) {
       const v = variants.get(key);
       const status = v?.status || "";
       const related = candidatesForHistory(h);
-      const empty = v?.candidates ? `候选 ${v.candidates}(旧数据未保存关联)` : "—";
+      const empty = !candidatesLoaded ? "候选关联加载中…" : (v?.candidates ? `候选 ${v.candidates}(旧数据未保存关联)` : "—");
       tb.append(el("tr", {},
         el("td", {}, el("span", { class: "tag" }, h.lens_hint || "—")),
         el("td", {}, h.pattern || ""),
@@ -1761,6 +1793,11 @@ function viewDashboard(runId) {
   }
 
   function renderUsage() {
+    if (!usageLoaded) {
+      tabBody.append(el("div", { class: "panel empty" }, "用量数据加载中…"));
+      fetchUsage();
+      return;
+    }
     const rows = [...S.usageRows].map(cleanUsage).slice(-80).reverse();
     if (!rows.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无 token 用量数据。")); return; }
     const tbl = el("table", {}, el("thead", {}, el("tr", {},
@@ -1822,9 +1859,9 @@ function viewDashboard(runId) {
     switch (ev.type) {
       case "run_status": setRunStatus(d.status); renderHeader(); break;
       case "metrics": applyMetrics(d); renderHeader(); break;
-      case "usage": { const u = cleanUsage(d); const uid = u.id == null ? "" : String(u.id); if (uid && S.usageIds.has(uid)) break; if (uid) S.usageIds.add(uid); S.usageRows.push(u); addUsage(S.usage, u); renderHeader(); renderTabs(); if (activeTab === "usage") renderTab(); break; }
+      case "usage": { const u = cleanUsage(d); const uid = u.id == null ? "" : String(u.id); if (uid && S.usageIds.has(uid)) break; if (uid) S.usageIds.add(uid); S.usageRows.push(u); S.usageTotal = Math.max((S.usageTotal || 0) + 1, S.usageRows.length); addUsage(S.usage, u); renderHeader(); renderTabs(); if (activeTab === "usage") renderTab(); break; }
       case "agent_update": applyAgentUpdate(d); scheduleAgentRefresh(); break;
-      case "candidate_found": { const existed = S.candidateMap.has(candKeyOf(d)); upsertCandidate(d); if (!existed) S.candidates++; renderHeader(); renderTabs(); if (activeTab === "candidates") renderTab(); break; }
+      case "candidate_found": { const existed = S.candidateMap.has(candKeyOf(d)); upsertCandidate(d); if (!existed) { S.candidates++; S.candidateTotal = Math.max(S.candidateTotal || 0, S.candidates); } renderHeader(); renderTabs(); if (activeTab === "candidates") renderTab(); break; }
       case "finding_confirmed": {
         if (!d.output_ts && ev.ts) d.output_ts = ev.ts / 1000;
         if (d.id && !S.findings.has(d.id)) { S.findings.set(d.id, d); flash("✔ 疑似漏洞 " + d.id + " [" + d.corrected_severity + "]"); }
@@ -1832,10 +1869,13 @@ function viewDashboard(runId) {
         const cc = upsertCandidate(d);
         cc.status = "confirmed"; cc.id = d.id; cc.severity = d.corrected_severity || cc.severity;
         S.nonIssueMap.delete(cc.key);
+        S.candidateTotal = Math.max(S.candidateTotal || 0, S.candidateMap.size, S.candidates || 0);
         renderHeader(); renderTabs(); if (activeTab === "findings" || activeTab === "candidates" || activeTab === "nonissues") renderTab(); break;
       }
       case "finding_rejected": {
+        const existed = S.nonIssueMap.has(candKeyOf(d));
         upsertNonIssue(d);
+        if (!existed) S.nonIssueTotal = Math.max(S.nonIssueTotal || 0, S.nonIssueMap.size);
         renderTabs(); if (activeTab === "candidates") renderTab(); else if (activeTab === "nonissues") scheduleRenderTab(); break;
       }
       case "candidate_failed": {
@@ -1843,7 +1883,7 @@ function viewDashboard(runId) {
         cf.status = "verify_failed"; cf.reason = d.reason || ""; cf.attempts = d.attempts || cf.attempts;
         renderHeader(); renderTabs(); if (activeTab === "candidates") renderTab(); break;
       }
-      case "risk_added": { const k = (d.area || "") + "::" + (d.file || ""); S.risks.set(k, d); renderHeader(); renderTabs(); if (activeTab === "risks") renderTab(); break; }
+      case "risk_added": { const k = (d.area || "") + "::" + (d.file || ""); S.risks.set(k, d); S.riskTotal = Math.max(S.riskTotal || 0, S.risks.size); renderHeader(); renderTabs(); if (activeTab === "risks") renderTab(); break; }
       case "recheck_enqueued": case "recheck_done": case "risk_severity_changed":
         fetchRisks(); fetchCoverage(); break;
       case "surface_added": case "coverage_update":
@@ -1870,25 +1910,19 @@ function viewDashboard(runId) {
   }
   async function fetchRecon() { try { S.recon = await api("GET", `/api/runs/${encodeURIComponent(runId)}/recon`); renderTabs(); if (activeTab === "recon" || activeTab === "history") renderTab(); } catch (e) {} }
   async function fetchCoverage() { try { const c = await api("GET", `/api/runs/${encodeURIComponent(runId)}/coverage`); if (c) { S.coverage = Object.assign({}, S.coverage, c); if (activeTab === "coverage" || activeTab === "history") renderTab(); } } catch (e) {} }
-  async function fetchRisks() { try { const list = await api("GET", `/api/runs/${encodeURIComponent(runId)}/risks`); for (const r of (list || [])) { const k = (r.area || "") + "::" + (r.file || ""); S.risks.set(k, r); } renderHeader(); renderTabs(); if (activeTab === "risks") renderTab(); } catch (e) {} }
+  async function fetchRisks() { try { const list = await api("GET", `/api/runs/${encodeURIComponent(runId)}/risks`); for (const r of (list || [])) { const k = (r.area || "") + "::" + (r.file || ""); S.risks.set(k, r); } S.riskTotal = Math.max(S.riskTotal || 0, S.risks.size); renderHeader(); renderTabs(); if (activeTab === "risks") renderTab(); } catch (e) {} }
   async function fetchHealth() { try { const h = await api("GET", `/api/runs/${encodeURIComponent(runId)}/health`); for (const r of (h.models || [])) if (r.model) S.health.set(r.model, r); renderTabs(); if (activeTab === "health") renderTab(); } catch (e) {} }
   async function fetchMeta() { try { S.meta = await api("GET", "/api/meta"); if (activeTab === "health") renderTab(); } catch (e) {} }
 
-  function applySnapshot(snap) {
-    if (!snap) return 0;
-    S.manifest = snap.manifest || S.manifest || {};
-    S.findings.clear();
-    for (const f of (snap.findings || [])) if (f.id) S.findings.set(f.id, f);
-    S.candidateMap.clear();
-    S.nonIssueMap.clear();
+  function applyCandidateRows(candidates, nonissues) {
     invalidateCandIndex();
-    for (const c of (snap.candidates || [])) {
+    for (const c of (candidates || [])) {
       const k = candKeyOf(c);
-      const rec = Object.assign({ key: k, seq: S.candidateMap.size }, c, { key: k });
+      const rec = S.candidateMap.get(k) || { key: k, seq: S.candidateMap.size };
+      Object.assign(rec, c, { key: k });
       S.candidateMap.set(k, rec);
-      if (rec.status === "rejected") S.nonIssueMap.set(k, rec);
     }
-    for (const c of (snap.nonissues || [])) {
+    for (const c of (nonissues || [])) {
       const k = candKeyOf(c);
       const rec = S.candidateMap.get(k) || Object.assign({ key: k, seq: S.candidateMap.size }, c, { key: k });
       rec.status = "rejected";
@@ -1897,20 +1931,76 @@ function viewDashboard(runId) {
       if (Array.isArray(c.verify_models)) rec.verify_models = c.verify_models;
       for (const k2 of ["rejection_reason", "vote_total", "vote_false", "vote_real"]) if (c[k2] != null) rec[k2] = c[k2];
       S.candidateMap.set(k, rec);
-      S.nonIssueMap.set(k, rec);
     }
+    S.nonIssueMap.clear();
+    for (const [k, rec] of S.candidateMap) if (rec.status === "rejected") S.nonIssueMap.set(k, rec);
+    S.candidateTotal = Math.max(S.candidateTotal || 0, S.candidateMap.size);
+    S.nonIssueTotal = Math.max(S.nonIssueTotal || 0, S.nonIssueMap.size);
+    candidatesLoaded = true;
+  }
+
+  async function fetchCandidates(force = false) {
+    if (candidatesLoaded && !force) return;
+    if (candidatesLoading) return candidatesLoading;
+    candidatesLoading = (async () => {
+      const r = await api("GET", `/api/runs/${encodeURIComponent(runId)}/candidates`);
+      applyCandidateRows(r.candidates || [], r.nonissues || []);
+      renderHeader();
+      renderTabs();
+      if (["candidates", "nonissues", "coverage", "history", "risks"].includes(activeTab)) renderTab();
+    })().catch(e => {
+      flash("加载候选失败: " + e.message);
+    }).finally(() => { candidatesLoading = null; });
+    return candidatesLoading;
+  }
+
+  function applyUsageRows(rows) {
+    S.usageRows = (rows || []).map(cleanUsage);
+    S.usageIds = new Set(S.usageRows.map(u => u.id == null ? "" : String(u.id)).filter(Boolean));
+    usageLoaded = true;
+  }
+
+  async function fetchUsage(force = false) {
+    if (usageLoaded && !force) return;
+    if (usageLoading) return usageLoading;
+    usageLoading = (async () => {
+      applyUsageRows(await api("GET", `/api/runs/${encodeURIComponent(runId)}/usage?limit=80`));
+      renderTabs();
+      if (activeTab === "usage") renderTab();
+    })().catch(e => {
+      flash("加载用量失败: " + e.message);
+    }).finally(() => { usageLoading = null; });
+    return usageLoading;
+  }
+
+  function applySnapshot(snap) {
+    if (!snap) return 0;
+    S.manifest = snap.manifest || S.manifest || {};
+    const snapCounts = snap.counts || {};
+    S.candidateTotal = tokenCount(snapCounts.candidates);
+    S.nonIssueTotal = tokenCount(snapCounts.nonissues);
+    S.usageTotal = tokenCount(snapCounts.usage);
+    S.riskTotal = tokenCount(snapCounts.risks);
+    S.findings.clear();
+    for (const f of (snap.findings || [])) if (f.id) S.findings.set(f.id, f);
+    applyCandidateRows(Array.isArray(snap.candidates) ? snap.candidates : [], Array.isArray(snap.nonissues) ? snap.nonissues : []);
+    candidatesLoaded = !snap.lite && Array.isArray(snap.candidates);
     S.risks.clear();
     for (const r of (snap.risks || [])) S.risks.set((r.area || "") + "::" + (r.file || ""), r);
+    S.riskTotal = Math.max(S.riskTotal || 0, S.risks.size);
     S.health.clear();
     for (const h of ((snap.health || {}).models || [])) if (h.model) S.health.set(h.model, h);
     S.coverage = snap.coverage || null;
     S.recon = snap.recon || null;
-    S.usageRows = (snap.usage || []).map(cleanUsage);
-    S.usageIds = new Set(S.usageRows.map(u => u.id == null ? "" : String(u.id)).filter(Boolean));
+    applyUsageRows(snap.usage || []);
+    usageLoaded = !snap.lite && Array.isArray(snap.usage);
     Object.assign(S.usage, emptyUsage());
     for (const u of S.usageRows) addUsage(S.usage, u);
     applyMetrics((S.manifest && S.manifest.summary) || {});
     if (S.candidates == null || S.candidates === 0) S.candidates = S.candidateMap.size;
+    S.candidateTotal = Math.max(S.candidateTotal || 0, S.candidates || 0, S.candidateMap.size);
+    S.nonIssueTotal = Math.max(S.nonIssueTotal || 0, S.nonIssueMap.size);
+    S.usageTotal = Math.max(S.usageTotal || 0, S.usageRows.length);
     S.round = snap.round ?? S.round;
     setRunStatus(S.manifest.running ? "running" : S.manifest.status);
     return Number(snap.last_seq || 0);
@@ -1919,7 +2009,7 @@ function viewDashboard(runId) {
   async function boot() {
     let lastSeq = 0;
     try {
-      lastSeq = applySnapshot(await api("GET", `/api/runs/${encodeURIComponent(runId)}/snapshot`));
+      lastSeq = applySnapshot(await api("GET", `/api/runs/${encodeURIComponent(runId)}/snapshot?lite=1`));
     } catch (e) {}
     renderHeader(); renderTabs(); renderTab();
     fetchMeta();

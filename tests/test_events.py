@@ -1,12 +1,15 @@
 import asyncio
+import builtins
+import os
 import tempfile
 import unittest
+from unittest import mock
 
 from proto_vuln_hunt import events as EV
 from proto_vuln_hunt.events import EventBus
 from proto_vuln_hunt.pipeline import Pipeline
 from proto_vuln_hunt.config import Config
-from proto_vuln_hunt.server import _candidate_snapshot_from_events, _response_findings
+from proto_vuln_hunt.server import _candidate_snapshot_from_events, _dashboard_snapshot, _response_findings
 from proto_vuln_hunt.store import RunStore
 
 
@@ -43,6 +46,47 @@ class EventBusPersistTests(unittest.TestCase):
             store = RunStore(td).ensure()
             store.append_event({"seq": 7, "ts": 0, "type": EV.LOG, "data": {}})
             self.assertEqual(store.last_event_seq(), 7)
+
+    def test_iter_events_skips_events_file_when_after_seq_reaches_tail(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = RunStore(td).ensure()
+            store.append_event({"seq": 1, "ts": 0, "type": EV.LOG, "data": {}})
+            events_path = os.path.abspath(store.events_path)
+            real_open = builtins.open
+
+            def guarded_open(path, *args, **kwargs):
+                if os.path.abspath(path) == events_path:
+                    raise AssertionError("events.jsonl should not be opened when after_seq is current")
+                return real_open(path, *args, **kwargs)
+
+            with mock.patch("builtins.open", guarded_open):
+                self.assertEqual(list(store.iter_events(1)), [])
+
+    def test_dashboard_snapshot_limits_usage_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = RunStore(td).ensure()
+            store.init_manifest({"target": "."})
+            for i in range(100):
+                store.append_usage({"id": i, "role": "audit", "input_tokens": i})
+
+            snap = _dashboard_snapshot(store, running=False, last_seq=0)
+            self.assertEqual(len(snap["usage"]), 80)
+            self.assertEqual(snap["usage"][0]["id"], 20)
+
+    def test_lite_dashboard_snapshot_skips_heavy_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = RunStore(td).ensure()
+            store.init_manifest({"target": "."})
+            store.update_summary({"candidates": 3, "risks": 2, "token_usage": {"calls": 100}})
+            store.save_candidate({"key": "a.c::1::memory", "status": "pending"})
+            store.append_usage({"id": 1, "role": "audit"})
+
+            snap = _dashboard_snapshot(store, running=True, last_seq=0, lite=True)
+            self.assertEqual(snap["candidates"], [])
+            self.assertEqual(snap["usage"], [])
+            self.assertEqual(snap["counts"]["candidates"], 3)
+            self.assertEqual(snap["counts"]["risks"], 2)
+            self.assertEqual(snap["counts"]["usage"], 100)
 
     def test_start_seq_respects_higher_backlog_tail(self):
         # start_seq 与 backlog 尾部取较大者,二者都给时不回退。

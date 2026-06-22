@@ -21,6 +21,7 @@ from .events import EventBus
 from .store import (RunRegistry, RunStore, STATUS_INTERRUPTED, STATUS_QUEUED, STATUS_RUNNING)
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "static")
+_DASHBOARD_USAGE_LIMIT = 80
 
 # 允许从 Web 表单覆盖的 Config 字段(白名单,防注入任意字段)
 _RUN_FIELDS = {
@@ -35,6 +36,13 @@ _RUN_FIELDS = {
 _RESUME_FROM_BASE_FIELDS = {"backend", "models", "model_concurrency", "concurrency"}
 
 _FINDING_FEEDBACK_STATUSES = {"unreviewed", "confirmed", "false_positive", "needs_review"}
+
+
+def _int_count(v: Any) -> int:
+    try:
+        return max(0, int(v or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _meta_from_manifest(m: Dict[str, Any]) -> Dict[str, Any]:
@@ -237,7 +245,7 @@ def _apply_finding_output_times(store: RunStore, findings: List[Dict[str, Any]])
     if not missing:
         return findings
     by_id: Dict[str, float] = {}
-    for ev in store.read_events(0):
+    for ev in store.iter_events(0):
         if ev.get("type") != EV.FINDING_CONFIRMED:
             continue
         d = ev.get("data") or {}
@@ -260,7 +268,7 @@ def _candidate_snapshot_from_events(store: RunStore) -> List[Dict[str, Any]]:
     """旧 run 兼容:只重放候选相关事件,迁移成 candidates/*.json 后续直接读结构化态。"""
     rank = {"pending": 0, "verify_failed": 1, "confirmed": 2, "rejected": 3}
     candidates: Dict[str, Dict[str, Any]] = {}
-    for ev in store.read_events(0):
+    for ev in store.iter_events(0):
         et = ev.get("type")
         if et not in (EV.CANDIDATE_FOUND, EV.FINDING_CONFIRMED, EV.FINDING_REJECTED, EV.CANDIDATE_FAILED):
             continue
@@ -287,35 +295,49 @@ def _candidate_snapshot_from_events(store: RunStore) -> List[Dict[str, Any]]:
     return out
 
 
-def _dashboard_snapshot(store: RunStore, running: bool, last_seq: int,
-                        manifest: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    manifest = manifest or store.load_manifest() or {}
-    manifest["running"] = running
-    asf = store.load_attack_surface()
-    regions = asf.get("regions") or (store.load_recon() or {}).get("regions") or []
+def _response_candidates(store: RunStore, manifest: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     candidates = store.load_candidates()
-    summary = manifest.get("summary") or {}
-    try:
-        candidate_total = int(summary.get("candidates") or 0)
-    except (TypeError, ValueError):
-        candidate_total = 0
+    summary = (manifest or store.load_manifest() or {}).get("summary") or {}
+    candidate_total = _int_count(summary.get("candidates"))
     if not candidates and candidate_total > 0:
         candidates = _candidate_snapshot_from_events(store)
+    return candidates
+
+
+def _dashboard_snapshot(store: RunStore, running: bool, last_seq: int,
+                        manifest: Optional[Dict[str, Any]] = None,
+                        lite: bool = False) -> Dict[str, Any]:
+    manifest = manifest or store.load_manifest() or {}
+    manifest["running"] = running
+    last_seq = max(last_seq, store.last_event_seq())
+    asf = store.load_attack_surface()
+    regions = asf.get("regions") or (store.load_recon() or {}).get("regions") or []
+    summary = manifest.get("summary") or {}
+    candidate_total = _int_count(summary.get("candidates"))
+    candidates = [] if lite else _response_candidates(store, manifest)
+    nonissues = [] if lite else [c for c in candidates if c.get("status") == "rejected"]
     health = store.load_health()
     health["running"] = running
     return {
         "last_seq": last_seq,
+        "lite": lite,
+        "counts": {
+            "candidates": candidate_total or len(candidates),
+            "nonissues": None if lite else len(nonissues),
+            "risks": _int_count(summary.get("risks")),
+            "usage": _int_count((summary.get("token_usage") or {}).get("calls")),
+        },
         "round": asf.get("round") or (store.load_checkpoint() or {}).get("round") or 0,
         "manifest": manifest,
         "findings": _response_findings(store),
         "candidates": candidates,
-        "nonissues": [c for c in candidates if c.get("status") == "rejected"],
+        "nonissues": nonissues,
         "risks": store.load_risks(),
         "coverage": {"ledger": asf.get("ledger") or [], "surfaces": asf.get("surfaces") or [],
                      "regions": regions, "progress": asf.get("progress") or {"done": 0, "clean": 0, "total": 0}},
         "recon": store.load_recon(),
         "health": health,
-        "usage": store.load_usage(),
+        "usage": [] if lite else store.load_usage(limit=_DASHBOARD_USAGE_LIMIT),
     }
 
 
@@ -387,12 +409,12 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
         return m
 
     @app.get("/api/runs/{run_id}/snapshot")
-    async def dashboard_snapshot(run_id: str):
+    async def dashboard_snapshot(run_id: str, lite: bool = False):
         store = _store_or_404(run_id)
         running = manager.is_running(run_id)
         bus = manager.get_bus(run_id) if running else None
         last_seq = bus.last_seq if bus else 0
-        return _dashboard_snapshot(store, running, last_seq, manager.manifest_for_display(store))
+        return _dashboard_snapshot(store, running, last_seq, manager.manifest_for_display(store), lite=lite)
 
     @app.post("/api/runs/{run_id}/stop")
     async def stop_run(run_id: str):
@@ -434,6 +456,12 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
         _apply_finding_output_times(store, [rec])
         return {"ok": True, "finding": slim_finding(rec)}
 
+    @app.get("/api/runs/{run_id}/candidates")
+    async def candidates(run_id: str):
+        store = _store_or_404(run_id)
+        rows = _response_candidates(store)
+        return {"candidates": rows, "nonissues": [c for c in rows if c.get("status") == "rejected"]}
+
     @app.get("/api/runs/{run_id}/coverage")
     async def coverage(run_id: str):
         store = _store_or_404(run_id)
@@ -445,6 +473,14 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
     @app.get("/api/runs/{run_id}/risks")
     async def risks(run_id: str):
         return _store_or_404(run_id).load_risks()
+
+    @app.get("/api/runs/{run_id}/usage")
+    async def usage(run_id: str, limit: int = _DASHBOARD_USAGE_LIMIT):
+        try:
+            n = max(1, min(1000, int(limit)))
+        except (TypeError, ValueError):
+            n = _DASHBOARD_USAGE_LIMIT
+        return _store_or_404(run_id).load_usage(limit=n)
 
     @app.post("/api/runs/{run_id}/risks/{rid}/severity")
     async def set_risk_severity(run_id: str, rid: str, req: Request):
@@ -523,10 +559,12 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
         async def gen():
             sent = last_id
             # 1) 先从磁盘补齐已落盘的历史事件
-            for ev in store.read_events(sent):
-                if ev.get("seq", 0) > sent:
-                    yield _sse(ev)
-                    sent = ev["seq"]
+            last_persisted = store.last_event_seq()
+            if sent < last_persisted:
+                for ev in store.iter_events(sent):
+                    if ev.get("seq", 0) > sent:
+                        yield _sse(ev)
+                        sent = ev["seq"]
             # 2) 若 run 仍在跑,接活动流(内存 backlog>sent 部分 + 实时)
             bus = manager.get_bus(run_id)
             if bus:
