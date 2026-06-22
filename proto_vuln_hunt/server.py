@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 from . import exporters
 from . import events as EV
 from .common import finalize_findings, slim_finding
-from .config import ALL_LENSES, DEFAULT_BACKENDS, ROLES, Config, load_config
+from .config import ALL_LENSES, DEFAULT_BACKENDS, ROLES, RUN_MODES, Config, load_config
 from .events import EventBus
 from .store import (RunRegistry, RunStore, STATUS_INTERRUPTED, STATUS_QUEUED, STATUS_RUNNING)
 
@@ -25,7 +25,7 @@ _DASHBOARD_USAGE_LIMIT = 80
 
 # 允许从 Web 表单覆盖的 Config 字段(白名单,防注入任意字段)
 _RUN_FIELDS = {
-    "target", "scope", "backend", "concurrency", "threat_model", "lenses",
+    "target", "scope", "backend", "concurrency", "run_mode", "history_import_from", "threat_model", "lenses",
     "finders_per_lens", "max_rounds", "dry_rounds", "verify_votes",
     "enable_poc", "decompose", "unit_line_budget", "max_files_per_unit", "max_subtasks_per_region",
     "methods_dir", "models", "model_concurrency", "model_time_windows", "resume", "fresh",
@@ -48,7 +48,8 @@ def _int_count(v: Any) -> int:
 def _meta_from_manifest(m: Dict[str, Any]) -> Dict[str, Any]:
     cfg = (m or {}).get("config") or {}
     return {"target": cfg.get("target"), "scope": cfg.get("scope") or "", "threat_model": cfg.get("threat_model"),
-            "backend": cfg.get("backend"), "methods_ok": cfg.get("methods_ok"), "methods_dir": cfg.get("methods_dir")}
+            "backend": cfg.get("backend"), "run_mode": cfg.get("run_mode"),
+            "methods_ok": cfg.get("methods_ok"), "methods_dir": cfg.get("methods_dir")}
 
 
 def build_run_config(base: Config, payload: Dict[str, Any]) -> Config:
@@ -369,9 +370,10 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
     async def meta():
         return {
             "backends": sorted(set(list(DEFAULT_BACKENDS) + list(cfg.backends))),
-            "lenses": ALL_LENSES, "roles": ROLES,
+            "lenses": ALL_LENSES, "roles": ROLES, "run_modes": RUN_MODES,
             "defaults": {
                 "backend": cfg.backend, "concurrency": cfg.concurrency, "models": cfg.models,
+                "run_mode": cfg.run_mode, "history_import_from": cfg.history_import_from,
                 "model_concurrency": cfg.model_concurrency,
                 "model_time_windows": cfg.model_time_windows,
                 "threat_model": cfg.threat_model, "lenses": cfg.lenses,
@@ -397,6 +399,13 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
     @app.post("/api/runs")
     async def create_run(req: Request):
         payload = await req.json()
+        import_run_id = (payload or {}).get("history_import_run_id")
+        if import_run_id and not (payload or {}).get("history_import_from"):
+            src_store = registry.get(str(import_run_id))
+            if not src_store:
+                raise HTTPException(400, "history import run not found")
+            payload = dict(payload or {})
+            payload["history_import_from"] = src_store.dir
         if not (payload.get("target") or cfg.target):
             raise HTTPException(400, "target is required")
         run_cfg = build_run_config(cfg, payload)

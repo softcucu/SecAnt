@@ -187,7 +187,7 @@ async function viewRuns() {
   try { runs = await api("GET", "/api/runs"); } catch (e) { app.append(el("div", { class: "empty" }, "加载失败: " + e.message)); return; }
   if (!runs.length) { app.append(el("div", { class: "panel empty" }, "还没有运行。点击「新建审计」开始。")); return; }
   const tbl = el("table", { class: "data-table run-table" }, el("thead", {}, el("tr", {},
-    el("th", {}, "状态"), el("th", {}, "目标"), el("th", {}, "后端"),
+    el("th", {}, "状态"), el("th", {}, "目标"), el("th", {}, "模式"), el("th", {}, "后端"),
     el("th", {}, "确认"), el("th", {}, "轮数"), el("th", {}, "创建时间"), el("th", {}, ""))));
   const tb = el("tbody");
   for (const r of runs) {
@@ -195,6 +195,7 @@ async function viewRuns() {
     tb.append(el("tr", {},
       el("td", {}, stPill(r.running ? "running" : r.status)),
       el("td", { html: `<a href="#/run/${encodeURIComponent(r.id)}">${esc(r.target || r.id)}</a>` + (r.scope ? `<div class="muted" style="font-size:12px">${esc(r.scope)}</div>` : "")}),
+      el("td", {}, r.run_mode === "history_only" ? "仅历史" : "完整"),
       el("td", {}, r.backend || "—"),
       el("td", {}, String(s.confirmed ?? 0)),
       el("td", {}, String(s.rounds ?? 0)),
@@ -209,13 +210,18 @@ async function viewRuns() {
 async function viewNew() {
   app.innerHTML = "";
   let meta;
+  let runs = [];
   try { meta = await api("GET", "/api/meta"); } catch (e) { app.append(el("div", { class: "empty" }, "加载失败: " + e.message)); return; }
+  try { runs = await api("GET", "/api/runs"); } catch (_) { runs = []; }
   const d = meta.defaults;
   const f = (label, node) => el("label", { class: "field" }, el("span", {}, label), node);
   const inp = (id, val, type = "text") => el("input", { id, type, value: val == null ? "" : val });
   const area = (id, val, rows = 3) => el("textarea", { id, rows }, val == null ? "" : val);
   const num = (id, val) => inp(id, val, "number");
 
+  const runModeSel = el("select", { id: "run_mode" },
+    el("option", { value: "full", selected: (d.run_mode || "full") === "full" ? "" : null }, "完整审计"),
+    el("option", { value: "history_only", selected: d.run_mode === "history_only" ? "" : null }, "仅历史漏洞排查"));
   const backendSel = el("select", { id: "backend" }, ...meta.backends.map(b => el("option", { value: b, selected: b === d.backend ? "" : null }, b)));
   const tmSel = el("select", { id: "threat_model" }, ...["REMOTE", "LOCAL_UNPRIVILEGED", "BOTH"].map(t => el("option", { value: t, selected: t === d.threat_model ? "" : null }, t)));
   const lensChecks = el("div", { class: "checks" }, ...meta.lenses.map(l =>
@@ -223,10 +229,20 @@ async function viewNew() {
   const modelRoles = meta.roles.filter(role => role !== "synthesis" && role !== "util");
   const modelRows = el("div", { class: "grid" }, ...modelRoles.map(role =>
     f("模型 · " + role, inp("model_" + role, modelText((d.models || {})[role]), "text"))));
+  const historyRuns = runs.filter(r => (r.history_count || 0) > 0);
+  const historyRunSel = el("select", { id: "history_import_run_id" },
+    el("option", { value: "" }, "不导入,重新分析 git commits"),
+    ...historyRuns.map(r => el("option", { value: r.id },
+      `${r.id} · 历史 ${r.history_count || 0} · ${r.target || ""}`)));
+  const historyImportBox = el("div", { id: "history_import_box" },
+    f("导入已有历史模式 run", historyRunSel),
+    f("或导入 run 目录 / recon.json", inp("history_import_from", d.history_import_from || "", "text")));
 
   const left = el("div", {},
     f("目标源码根目录 *", inp("target", "")),
     f("子路径 scope(可选)", inp("scope", "")),
+    f("运行模式", runModeSel),
+    historyImportBox,
     f("后端 CLI", backendSel),
     f("并发数", num("concurrency", d.concurrency)),
     f("威胁模型", tmSel),
@@ -248,6 +264,13 @@ async function viewNew() {
   );
 
   const submit = el("button", { class: "btn" }, "🚀 启动审计");
+  function syncRunMode() {
+    const historyOnly = runModeSel.value === "history_only";
+    historyImportBox.style.display = historyOnly ? "" : "none";
+    submit.textContent = historyOnly ? "启动历史排查" : "🚀 启动审计";
+  }
+  runModeSel.addEventListener("change", syncRunMode);
+  syncRunMode();
   submit.addEventListener("click", async () => {
     const target = document.getElementById("target").value.trim();
     if (!target) { flash("请填写目标目录"); return; }
@@ -260,6 +283,7 @@ async function viewNew() {
     const payload = {
       target, scope: document.getElementById("scope").value.trim(),
       backend: document.getElementById("backend").value, concurrency: +document.getElementById("concurrency").value,
+      run_mode: document.getElementById("run_mode").value,
       threat_model: document.getElementById("threat_model").value, lenses,
       finders_per_lens: +document.getElementById("finders_per_lens").value, max_rounds: +document.getElementById("max_rounds").value,
       dry_rounds: +document.getElementById("dry_rounds").value, verify_votes: +document.getElementById("verify_votes").value,
@@ -267,6 +291,10 @@ async function viewNew() {
       models, model_concurrency: parseKvInts(document.getElementById("model_concurrency").value),
       model_time_windows: parseModelWindows(document.getElementById("model_time_windows").value),
     };
+    const importRunId = document.getElementById("history_import_run_id").value;
+    const importPath = document.getElementById("history_import_from").value.trim();
+    if (payload.run_mode === "history_only" && importRunId) payload.history_import_run_id = importRunId;
+    else if (payload.run_mode === "history_only" && importPath) payload.history_import_from = importPath;
     submit.disabled = true;
     try { const r = await api("POST", "/api/runs", payload); location.hash = "#/run/" + encodeURIComponent(r.run_id); }
     catch (e) { flash("启动失败: " + e.message); submit.disabled = false; }
@@ -281,6 +309,7 @@ function viewDashboard(runId) {
   app.innerHTML = "";
   const S = { findings: new Map(), risks: new Map(), health: new Map(), agentMap: new Map(), candidateMap: new Map(), nonIssueMap: new Map(), coverage: null, recon: null, log: [], usageRows: [], usageIds: new Set(), usage: emptyUsage(), manifest: null, meta: null, candidates: 0, candidateTotal: 0, nonIssueTotal: 0, usageTotal: 0, riskTotal: 0, status: "queued", round: 0, dry: 0, agents: 0, elapsed: 0 };
   let activeTab = "findings";
+  let initialModeTabApplied = false;
   const nonIssueOpenKeys = new Set();
   let tabRenderTimer = null;
   let pendingFocus = null;
@@ -361,6 +390,32 @@ function viewDashboard(runId) {
     if (!isRunClockActive()) return finiteNumber(S.elapsed) || 0;
     return Math.max(finiteNumber(S.elapsed) || 0, elapsedBase + (Date.now() - elapsedBaseAt) / 1000);
   }
+  function runConfig() { return (S.manifest && S.manifest.config) || {}; }
+  function isHistoryOnly() { return runConfig().run_mode === "history_only"; }
+  function historyVariantLedger() {
+    return (((S.coverage || {}).ledger || []).filter(r => r.kind === "variant"));
+  }
+  function historyModeStats() {
+    const hist = (S.recon || {}).history || [];
+    const variants = historyVariantLedger();
+    const counts = {};
+    for (const v of variants) counts[v.status || "pending"] = (counts[v.status || "pending"] || 0) + 1;
+    const completedClean = counts["completed-clean"] || 0;
+    const completedFindings = counts["completed-findings"] || 0;
+    const failed = (counts.incomplete || 0) + (counts.abandoned || 0);
+    const running = counts["in-progress"] || 0;
+    const pending = (counts.pending || 0) + Math.max(0, hist.length - variants.length);
+    const total = Math.max(hist.length, variants.length);
+    return {
+      total,
+      pending,
+      running,
+      completed: completedClean + completedFindings,
+      clean: completedClean,
+      hits: completedFindings,
+      failed,
+    };
+  }
   function resetElapsedClock(seconds) {
     const n = finiteNumber(seconds);
     S.elapsed = Math.max(0, n == null ? (finiteNumber(S.elapsed) || 0) : n);
@@ -394,13 +449,32 @@ function viewDashboard(runId) {
     const suspectedCount = S.findings.size;
     const manualConfirmed = [...S.findings.values()].filter(f => findingFeedbackStatus(f) === "confirmed").length;
     header.innerHTML = "";
-    const m = S.manifest || {}; const cfg = m.config || {};
+    const cfg = runConfig();
     const agentCount = Math.max(S.agents || 0, S.agentMap.size, S.usageRows.length);
     const elapsed = Math.round(currentElapsed());
+    if (isHistoryOnly()) {
+      const hs = historyModeStats();
+      const source = cfg.history_import_from ? `导入 ${cfg.history_import_from}` : "git commit";
+      header.append(el("div", { class: "row", style: "justify-content:space-between;margin-bottom:10px" },
+        el("div", { class: "row" }, stPill(S.status),
+          el("span", { class: "muted" }, `${esc(cfg.target || "")}${cfg.scope ? " · " + esc(cfg.scope) : ""}`),
+          el("span", { class: "muted" }, `仅历史漏洞排查 · ${esc(source)} · 后端 ${esc(cfg.backend || "?")}`)),
+        el("div", { class: "muted" }, `排查 ${hs.completed}/${hs.total || "?"} · 用时 ${elapsed}s`)));
+      header.append(el("div", { class: "stats history-stats" },
+        el("div", { class: "stat" }, el("div", { class: "n" }, String(hs.total)), el("div", { class: "l" }, "历史模式")),
+        el("div", { class: "stat" }, el("div", { class: "n" }, String(hs.completed)), el("div", { class: "l" }, "已排查")),
+        el("div", { class: "stat" }, el("div", { class: "n" }, String(hs.hits)), el("div", { class: "l" }, "命中模式")),
+        el("div", { class: "stat" }, el("div", { class: "n" }, String(hs.failed)), el("div", { class: "l" }, "失败/未覆盖")),
+        el("div", { class: "stat" }, el("div", { class: "n" }, String(S.candidates)), el("div", { class: "l" }, "候选")),
+        el("div", { class: "stat" }, el("div", { class: "n" }, String(S.findings.size)), el("div", { class: "l" }, "确认漏洞")),
+        el("div", { class: "stat" }, el("div", { class: "n" }, String(agentCount)), el("div", { class: "l" }, "agent 调用")),
+        el("div", { class: "stat" }, el("div", { class: "n" }, fmtTok(S.usage.total_tokens)), el("div", { class: "l" }, "总 token"))));
+      return;
+    }
     header.append(el("div", { class: "row", style: "justify-content:space-between;margin-bottom:10px" },
       el("div", { class: "row" }, stPill(S.status),
         el("span", { class: "muted" }, `${esc(cfg.target || "")}${cfg.scope ? " · " + esc(cfg.scope) : ""}`),
-        el("span", { class: "muted" }, `后端 ${esc(cfg.backend || "?")} · 威胁 ${esc(cfg.threat_model || "?")}`)),
+        el("span", { class: "muted" }, `模式 ${cfg.run_mode === "history_only" ? "仅历史" : "完整"} · 后端 ${esc(cfg.backend || "?")} · 威胁 ${esc(cfg.threat_model || "?")}`)),
       el("div", { class: "muted" }, `轮 ${S.round}/${cfg.max_rounds ?? "?"} · dry ${S.dry} · 用时 ${elapsed}s`)));
     const stats = el("div", { class: "stats" },
       el("div", { class: "stat" }, el("div", { class: "n" }, String(suspectedCount)), el("div", { class: "l" }, "疑似漏洞")),
@@ -416,9 +490,18 @@ function viewDashboard(runId) {
     header.append(stats);
   }
 
-  const TABS = [["findings", "漏洞"], ["candidates", "候选"], ["nonissues", "非问题"], ["agents", "实时Agent"], ["health", "模型"], ["coverage", "攻击面覆盖"], ["history", "历史问题"], ["risks", "潜在风险点"], ["usage", "历史任务"], ["recon", "侦察"], ["activity", "活动"], ["exports", "导出"]];
+  const FULL_TABS = [["findings", "漏洞"], ["candidates", "候选"], ["nonissues", "非问题"], ["agents", "实时Agent"], ["health", "模型"], ["coverage", "攻击面覆盖"], ["history", "历史问题"], ["risks", "潜在风险点"], ["usage", "历史任务"], ["recon", "侦察"], ["activity", "活动"], ["exports", "导出"]];
+  function visibleTabs() {
+    if (!isHistoryOnly()) return FULL_TABS;
+    const tabs = [["coverage", "排查进度"], ["history", "历史模式"], ["findings", "漏洞"], ["candidates", "候选"], ["nonissues", "非问题"], ["agents", "实时Agent"], ["health", "模型"]];
+    if ((S.riskTotal || 0) > 0 || S.risks.size) tabs.push(["risks", "风险线索"]);
+    tabs.push(["usage", "调用记录"], ["activity", "活动"], ["exports", "导出"]);
+    return tabs;
+  }
   function renderTabs() {
     tabsBar.innerHTML = "";
+    const tabs = visibleTabs();
+    if (!tabs.some(([key]) => key === activeTab)) activeTab = tabs[0][0];
     const activeAgents = [...S.agentMap.values()].filter(a => isAgentActive(a) && isVisibleAgentCategory(agentCategory(a))).length;
     const counts = {
       findings: S.findings.size,
@@ -429,8 +512,9 @@ function viewDashboard(runId) {
       health: S.health.size,
       agents: activeAgents,
       history: (S.recon?.history || []).length,
+      coverage: isHistoryOnly() ? historyModeStats().total : 0,
     };
-    for (const [key, label] of TABS) {
+    for (const [key, label] of tabs) {
       const t = el("div", { class: "tab" + (key === activeTab ? " active" : "") }, label);
       if (counts[key]) t.append(el("span", { class: "tabcount" }, String(counts[key])));
       t.addEventListener("click", () => { activeTab = key; renderTabs(); renderTab(); });
@@ -1143,10 +1227,15 @@ function viewDashboard(runId) {
     return counts;
   }
   function renderConfigPanel() {
-    const cfg = (S.manifest && S.manifest.config) || {};
+    const cfg = runConfig();
     const running = isRunClockActive();
-    const roles = ((S.meta && S.meta.roles) || ["recon", "history", "recheck", "decompose", "audit", "verify", "report", "poc"])
+    let roles = ((S.meta && S.meta.roles) || ["recon", "history", "recheck", "decompose", "audit", "verify", "report", "poc"])
       .filter(r => r !== "synthesis" && r !== "util");
+    if (isHistoryOnly()) {
+      const allowed = new Set(["recheck", "verify", "report", "poc"]);
+      if (!cfg.history_import_from) allowed.add("history");
+      roles = roles.filter(r => allowed.has(r));
+    }
     const f = (label, node) => el("label", { class: "field" }, el("span", {}, label), node);
     const inputs = {};
     const modelGrid = el("div", { class: "grid" }, ...roles.map(role => {
@@ -1602,7 +1691,7 @@ function viewDashboard(runId) {
       if (!byRole.has(k)) byRole.set(k, []);
       byRole.get(k).push(a);
     }
-    const roles = [...AGENT_REAL_ROLES];
+    const roles = isHistoryOnly() ? ["history", "recheck", "verify", "report", "poc"] : [...AGENT_REAL_ROLES];
     for (const k of byRole.keys()) if (!roles.includes(k)) roles.push(k);
     for (const key of roles) {
       tabBody.append(renderAgentGroup({ key, agents: (byRole.get(key) || []).sort(agentSort) }));
@@ -1622,7 +1711,58 @@ function viewDashboard(runId) {
       el("span", { class: "smeta" }, meta));
   }
 
+  function renderHistoryProgress() {
+    const c = S.coverage;
+    const hist = (S.recon || {}).history || [];
+    if (!c && !hist.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无历史排查数据。")); return; }
+    if (!candidatesLoaded) fetchCandidates();
+    const hs = historyModeStats();
+    const pct = hs.total ? Math.round(100 * hs.completed / hs.total) : 0;
+    tabBody.append(el("div", { class: "panel history-progress-panel" },
+      el("div", { class: "row", style: "justify-content:space-between" },
+        el("strong", {}, `历史模式排查:${hs.completed}/${hs.total} 已完成`),
+        el("span", { class: "muted" }, pct + "%")),
+      el("div", { class: "bar" }, el("span", { style: `width:${pct}%;background:var(--ok)` })),
+      el("div", { class: "history-progress-grid" },
+        el("div", {}, el("div", { class: "n" }, String(hs.pending)), el("div", { class: "l" }, "待排查")),
+        el("div", {}, el("div", { class: "n" }, String(hs.running)), el("div", { class: "l" }, "排查中")),
+        el("div", {}, el("div", { class: "n" }, String(hs.clean)), el("div", { class: "l" }, "未命中")),
+        el("div", {}, el("div", { class: "n" }, String(hs.hits)), el("div", { class: "l" }, "有候选")),
+        el("div", {}, el("div", { class: "n" }, String(hs.failed)), el("div", { class: "l" }, "失败")))));
+
+    const variants = variantStatusByPattern();
+    const rows = hist.length ? hist : historyVariantLedger().map(v => ({
+      pattern: v.pattern || v.name,
+      source: v.source || "",
+      lens_hint: (v.lenses || [])[0] || "",
+      files: [],
+    }));
+    if (!rows.length) return;
+    const tbl = el("table", { class: "data-table history-progress-table" }, el("thead", {}, el("tr", {},
+      el("th", {}, "状态"), el("th", {}, "lens"), el("th", {}, "问题模式"), el("th", {}, "候选"),
+      el("th", {}, "pass"), el("th", {}, "出处"), el("th", {}, "相关文件"))));
+    const tb = el("tbody");
+    for (const h of rows) {
+      const key = String(h.pattern || "").trim().toLowerCase();
+      const v = variants.get(key);
+      const status = v?.status || "pending";
+      const related = candidatesForHistory(h);
+      const empty = !candidatesLoaded ? "候选关联加载中…" : (v?.candidates ? `候选 ${v.candidates}(旧数据未保存关联)` : "—");
+      tb.append(el("tr", {},
+        el("td", {}, statusBadge(status)),
+        el("td", {}, el("span", { class: "tag" }, h.lens_hint || (v?.lenses || [])[0] || "—")),
+        el("td", {}, h.pattern || v?.name || ""),
+        el("td", {}, renderRelatedCandidates(related, empty)),
+        el("td", {}, String(v?.passes || 0)),
+        el("td", {}, h.source || v?.source || "—"),
+        el("td", { class: "loc" }, (h.files || []).join(", ") || "—")));
+    }
+    tbl.append(tb);
+    tabBody.append(el("div", { class: "panel" }, el("div", { class: "table-wrap" }, tbl)));
+  }
+
   function renderCoverage() {
+    if (isHistoryOnly()) { renderHistoryProgress(); return; }
     const c = S.coverage;
     if (!c) { tabBody.append(el("div", { class: "panel empty" }, "暂无覆盖数据(运行开始后会出现攻击面审计进度与拆解的子任务)。")); return; }
     if (!candidatesLoaded) fetchCandidates();
@@ -2079,6 +2219,10 @@ function viewDashboard(runId) {
     S.usageTotal = Math.max(S.usageTotal || 0, S.usageRows.length);
     S.round = snap.round ?? S.round;
     setRunStatus(S.manifest.running ? "running" : S.manifest.status);
+    if (!initialModeTabApplied && isHistoryOnly()) {
+      activeTab = "coverage";
+      initialModeTabApplied = true;
+    }
     return Number(snap.last_seq || 0);
   }
 

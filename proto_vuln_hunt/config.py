@@ -27,6 +27,9 @@ BUNDLED_METHODS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 
 # 审计 lens(9 类)
 ALL_LENSES = ["memory", "integer", "race", "injection", "authn", "crypto", "dos", "infoleak", "resource-realtime"]
+RUN_MODE_FULL = "full"
+RUN_MODE_HISTORY_ONLY = "history_only"
+RUN_MODES = [RUN_MODE_FULL, RUN_MODE_HISTORY_ONLY]
 
 # 流水线里会用到的 agent 角色;每个会运行的角色都必须在 models 里显式指定模型。
 # history:统一调度队列中的「git 历史问题模式挖掘」(每条提交一个 agent,与 high audit finder 同级)。
@@ -191,6 +194,8 @@ class Config:
     artifact_retain: int = 10
 
     # 流水线参数(对齐 proto-vuln-hunt)
+    run_mode: str = RUN_MODE_FULL
+    history_import_from: str = ""           # 可选:从既有 run 目录或 recon.json 导入 history[] 模式,跳过 commit 分析
     finders_per_lens: int = 2
     dry_rounds: int = 2
     max_rounds: int = 6
@@ -222,6 +227,8 @@ class Config:
     # ── 派生 ──
     def __post_init__(self):
         self.target = (self.target or ".").rstrip("/") or "."
+        self.run_mode = self.run_mode if self.run_mode in RUN_MODES else RUN_MODE_FULL
+        self.history_import_from = str(self.history_import_from or "").strip()
         if not self.out_dir:
             self.out_dir = f"{self.target}/.proto-vuln-hunt"
         self.out_dir = self.out_dir.rstrip("/")
@@ -339,8 +346,15 @@ class Config:
         return seen
 
     def required_model_roles(self) -> List[str]:
+        if self.run_mode == RUN_MODE_HISTORY_ONLY:
+            roles = ["recheck", "verify", "report"]
+            if self.history.enabled and not self.history_import_from:
+                roles.append("history")
+            if self.enable_poc:
+                roles.append("poc")
+            return [r for r in TASK_MODEL_ROLES if r in roles]
         roles = ["recon", "audit", "verify", "report"]
-        if self.history.enabled:
+        if self.history.enabled and not self.history_import_from:
             roles.append("history")
         if self.recheck.enabled:
             roles.append("recheck")
@@ -358,6 +372,10 @@ class Config:
 
     def model_config_error(self) -> str:
         problems: List[str] = []
+        if self.run_mode == RUN_MODE_HISTORY_ONLY and not self.recheck.enabled:
+            problems.append("history_only 模式需要 recheck.enabled=true")
+        if self.run_mode == RUN_MODE_HISTORY_ONLY and not self.history_import_from and not self.history.enabled:
+            problems.append("history_only 未指定 history_import_from 时需要 history.enabled=true")
         unsupported = self.unsupported_model_keys()
         if unsupported:
             problems.append("models.default 已不支持;请为每个任务 role 显式配置模型")

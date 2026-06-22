@@ -70,6 +70,8 @@ params:
   dry_rounds: 2                 # 连续几轮无新增即收敛
   max_rounds: 6                 # 审计循环硬上限
   verify_votes: 3               # 每条候选的 judge 裁决票数(先正方举证+反方证伪,再对合格裁决票多数决)
+  run_mode: full                # full | history_only;history_only 只做历史模式/导入模式 → recheck → verify/report/PoC
+  # history_import_from: ./pvh-runs/<run_id>  # 可选:从既有 run 目录或 recon.json 导入 history[];导入后跳过 git commit 分析
   threat_model: REMOTE          # REMOTE | LOCAL_UNPRIVILEGED | BOTH
   enable_poc: true              # 高危项是否进隔离 worktree 编译 PoC
   lenses: [memory, integer, race, injection, authn, crypto, dos, infoleak, resource-realtime]

@@ -464,11 +464,13 @@ class RunRegistry:
             if not m:
                 continue
             cfg = m.get("config") or {}
+            history_count = len((store.load_recon() or {}).get("history") or [])
             out.append({
                 "id": m.get("id", name), "status": m.get("status"),
                 "created_at": m.get("created_at"), "updated_at": m.get("updated_at"),
                 "target": cfg.get("target"), "scope": cfg.get("scope"),
-                "backend": cfg.get("backend"), "summary": m.get("summary") or {},
+                "backend": cfg.get("backend"), "run_mode": cfg.get("run_mode"),
+                "history_count": history_count, "summary": m.get("summary") or {},
             })
         out.sort(key=lambda r: r.get("created_at") or 0, reverse=True)
         return out

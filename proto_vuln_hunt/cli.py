@@ -25,6 +25,10 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--concurrency", type=int, help="同时运行的 agent 上限")
     p.add_argument("--model", help="为所有会运行的任务 role 显式设置同一组模型(多个模型可用逗号分隔)")
     p.add_argument("--model-concurrency", dest="model_concurrency", help="每个模型自己的并发上限,如 default=1,openai/gpt-5=2")
+    p.add_argument("--history-only", dest="run_mode", action="store_const", const="history_only",
+                   help="仅运行历史漏洞排查:history 模式/导入模式 → recheck → verify/report")
+    p.add_argument("--history-import-from", dest="history_import_from",
+                   help="从已有 run 目录或 recon.json 导入已分析好的历史问题模式,并跳过 git commit 分析")
     p.add_argument("--threat-model", dest="threat_model", choices=["REMOTE", "LOCAL_UNPRIVILEGED", "BOTH"])
     p.add_argument("--lenses", help="逗号分隔的 lens 子集,如 memory,integer,dos")
     p.add_argument("--finders-per-lens", dest="finders_per_lens", type=int)
@@ -60,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _overrides_from_args(args) -> dict:
     overrides = {}
-    for k in ("target", "scope", "out_dir", "backend", "concurrency", "threat_model",
+    for k in ("target", "scope", "out_dir", "backend", "concurrency", "run_mode", "history_import_from", "threat_model",
               "finders_per_lens", "max_rounds", "dry_rounds", "verify_votes",
               "unit_line_budget", "max_files_per_unit", "max_subtasks_per_region",
               "enable_poc", "decompose", "fresh", "methods_dir", "host", "port", "runs_dir"):
@@ -86,6 +90,7 @@ def cmd_run(args) -> int:
     if getattr(args, "print_config", False):
         print(json.dumps({
             "target": cfg.target, "scope": cfg.scope, "out_dir": cfg.out_dir, "backend": cfg.backend,
+            "run_mode": cfg.run_mode, "history_import_from": cfg.history_import_from,
             "models": cfg.models, "model_concurrency": cfg.model_concurrency,
             "model_time_windows": cfg.model_time_windows,
             "concurrency": cfg.concurrency, "lenses": cfg.lenses,

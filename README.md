@@ -74,6 +74,13 @@ python -m proto_vuln_hunt run --config my.yaml --target /repo --backend codex \
 python -m proto_vuln_hunt run --config my.yaml --target /repo --scope src/x.c \
   --lenses memory,integer --finders-per-lens 1 --max-rounds 1 --dry-rounds 1 --verify-votes 1 --no-poc
 
+# 仅历史漏洞排查:只用历史问题模式做同类变体排查,命中后仍走 verify/report/PoC
+python -m proto_vuln_hunt run --config my.yaml --target /repo --history-only
+
+# 从已有 run 目录或 recon.json 导入已分析好的历史问题模式;导入后跳过 git commit 分析
+python -m proto_vuln_hunt run --config my.yaml --target /repo --history-only \
+  --history-import-from ./pvh-runs/20260622-120000-abcd
+
 # run 结束默认把 MD/SARIF 导出到 out_dir;--no-export 关闭。中断后重跑同命令自动续跑;--fresh 从头来;--print-config 看配置
 ```
 
@@ -85,6 +92,8 @@ python -m proto_vuln_hunt run --config my.yaml --target /repo --scope src/x.c \
 
 ```yaml
 backend: claude                       # claude | opencode | codex
+run_mode: full                        # full | history_only
+# history_import_from: ./pvh-runs/<run_id>  # 可选:导入既有 run/recon.json 的历史问题模式,跳过 git commit 分析
 
 models:                               # 按 role 显式配模型;不支持 models.default 回落;列表会轮换使用
   recon:   claude-opus-4-8            # 常用 role: recon/history/recheck/decompose/audit/verify/report/poc

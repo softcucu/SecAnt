@@ -9,6 +9,7 @@ attack-surface.json / findings/<id>.json / risks/<id>.json / usage.jsonl)并发�
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -22,7 +23,7 @@ from . import schemas as S
 from .backends import AgentRunner
 from .common import (class_code, finalize_findings, finding_key, item_key,
                      most_severe, pad3, slim_finding)
-from .config import Config, normalize_model_time_windows_with_errors, normalize_models
+from .config import RUN_MODE_HISTORY_ONLY, Config, normalize_model_time_windows_with_errors, normalize_models
 from .prompts import VERIFY_LENSES, PromptBuilder
 from .store import RunStore, STATUS_DONE, STATUS_ERROR, STATUS_INCOMPLETE, STATUS_RUNNING, STATUS_STOPPED
 
@@ -232,7 +233,8 @@ class Pipeline:
     def meta_dict(self) -> Dict[str, Any]:
         return {
             "target": self.cfg.target, "scope": self.cfg.scope, "threat_model": self.cfg.threat_model,
-            "backend": self.cfg.backend, "methods_ok": self.cfg.methods_ok(), "methods_dir": self.cfg.methods_abs,
+            "backend": self.cfg.backend, "run_mode": self.cfg.run_mode,
+            "methods_ok": self.cfg.methods_ok(), "methods_dir": self.cfg.methods_abs,
         }
 
     def _abs_target(self) -> str:
@@ -664,6 +666,7 @@ class Pipeline:
         """写入 run.json 的配置快照。"""
         return {
             "target": cfg.target, "scope": cfg.scope, "backend": cfg.backend,
+            "run_mode": cfg.run_mode, "history_import_from": cfg.history_import_from,
             "models": cfg.models, "model_concurrency": cfg.model_concurrency,
             "model_time_windows": cfg.model_time_windows,
             "concurrency": cfg.concurrency, "threat_model": cfg.threat_model,
@@ -1290,6 +1293,113 @@ class Pipeline:
             return await self.runner.run(self.pb.poc(rec, self.build_hint, S.POC_SCHEMA),
                                          role="poc", label=f"poc:{rec['id']}", schema=S.POC_SCHEMA, cwd=cwd)
 
+    # ──────────────────────── 历史模式导入 / history-only 初始化 ────────────────────────
+    @staticmethod
+    def _read_json_obj(path: str) -> Optional[Dict[str, Any]]:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else None
+        except Exception:
+            return None
+
+    def _history_import_payload(self, source: str) -> List[Dict[str, Any]]:
+        raw = os.path.abspath(os.path.expanduser(source or ""))
+        if not raw:
+            raise ValueError("history_import_from 为空")
+        docs: List[Dict[str, Any]] = []
+        if os.path.isdir(raw):
+            for fn in ("recon.json", "state.json"):
+                d = self._read_json_obj(os.path.join(raw, fn))
+                if d:
+                    docs.append(d)
+        elif os.path.isfile(raw):
+            d = self._read_json_obj(raw)
+            if d:
+                docs.append(d)
+        else:
+            raise ValueError(f"history_import_from 不存在: {source}")
+
+        for d in docs:
+            hist = d.get("history")
+            if isinstance(hist, list):
+                return hist
+            recon = d.get("recon")
+            if isinstance(recon, dict) and isinstance(recon.get("history"), list):
+                return recon["history"]
+        return []
+
+    def _normalize_history_entry(self, raw: Dict[str, Any], *, source_hint: str = "") -> Optional[Dict[str, Any]]:
+        if not isinstance(raw, dict):
+            return None
+        pattern = (raw.get("pattern") or "").strip()
+        if not pattern:
+            return None
+        lens = raw.get("lens_hint") if raw.get("lens_hint") in self.cfg.lenses else "memory"
+        files = raw.get("files") if isinstance(raw.get("files"), list) else []
+        return {
+            "pattern": pattern,
+            "source": (raw.get("source") or source_hint or "imported").strip(),
+            "lens_hint": lens,
+            "files": [str(f) for f in files if str(f).strip()],
+            "rationale": raw.get("rationale") or "",
+        }
+
+    def _record_history_entry(self, entry: Dict[str, Any], *, imported: bool = False) -> bool:
+        entry = self._normalize_history_entry(entry, source_hint="imported") or {}
+        pattern = (entry.get("pattern") or "").strip()
+        if not pattern:
+            return False
+        pk = pattern.lower()
+        if pk in self.history_keys:
+            return False
+        self.history_keys.add(pk)
+        self.history.append(entry)
+        self.surface_data["history"] = self.history
+        self._enqueue_variant(entry)
+        self.emit(EV.HISTORY_ADDED, {**entry, "total": len(self.history), "imported": imported})
+        self.persist_recon()
+        prefix = "导入历史模式" if imported else "历史模式"
+        self.log(f"🕮 {prefix} +1[{entry['lens_hint']}]:{pattern[:60]} ← {str(entry.get('source') or '')[:40]}")
+        return True
+
+    def import_history_patterns(self) -> int:
+        source = self.cfg.history_import_from
+        raw_items = self._history_import_payload(source)
+        added = 0
+        source_hint = f"imported:{os.path.basename(os.path.abspath(os.path.expanduser(source)).rstrip(os.sep)) or 'history'}"
+        for raw in raw_items:
+            entry = self._normalize_history_entry(raw, source_hint=source_hint)
+            if entry and self._record_history_entry(entry, imported=True):
+                added += 1
+        if not raw_items or added == 0:
+            raise ValueError(f"未能从 {source} 导入任何历史问题模式")
+        self._history_enqueued = True
+        self.persist_recon()
+        self.checkpoint(self.round)
+        self.emit_coverage()
+        self.log(f"🕮 已从 {source} 导入 {added} 条历史问题模式;跳过 git commit 分析")
+        return added
+
+    def init_history_only_surface(self) -> None:
+        self.surface_data = {
+            "purpose": "仅历史漏洞排查",
+            "threat_summary": ["本次 run 只基于历史安全修复模式做同类变体排查。"],
+            "repo_knowledge": [],
+            "regions": [],
+            "history": self.history,
+            "build_hint": "",
+        }
+        self.regions = []
+        self.build_hint = ""
+        self.persist_recon()
+        self.emit(EV.RECON_DONE, {"resumed": False, "regions": 0, "history": len(self.history),
+                                  "purpose": self.surface_data["purpose"],
+                                  "threat_summary": self.surface_data["threat_summary"],
+                                  "history_only": True})
+        self.checkpoint(0)
+        self.emit_coverage()
+
     # ──────────────────────── 阶段 ① 侦察 / 断点恢复 ────────────────────────
     def restore_checkpoint(self) -> bool:
         """恢复断点机制态。成功后 history 挖掘可立即跳过已分析提交。"""
@@ -1443,6 +1553,9 @@ class Pipeline:
 
     def _enqueue_history_commits(self) -> None:
         """把 git log 分析任务投进统一优先级队列,与 high audit finder 同级排队。"""
+        if self.cfg.history_import_from:
+            self._history_enqueued = True
+            return
         if self._history_enqueued or not self.cfg.history.enabled:
             return
         self._history_enqueued = True
@@ -1474,21 +1587,11 @@ class Pipeline:
         pattern = (res.get("pattern") or "").strip()
         if not pattern:
             return
-        pk = pattern.lower()
-        if pk in self.history_keys:
-            return
-        self.history_keys.add(pk)
         lens = res.get("lens_hint") if res.get("lens_hint") in self.cfg.lenses else None
         source = (f"{c['hash'][:10]} {c['subject']}").strip()[:120]
         entry = {"pattern": pattern, "source": source, "lens_hint": lens or "memory",
                  "files": res.get("files") or [], "rationale": res.get("rationale") or ""}
-        self.history.append(entry)
-        self.surface_data["history"] = self.history
-        # 回灌为「同类变体排查」项,放进优先排查队列(最高优先,由 recheck 角色处理)
-        self._enqueue_variant(entry)
-        self.emit(EV.HISTORY_ADDED, {**entry, "total": len(self.history)})
-        self.persist_recon()
-        self.log(f"🕮 历史模式 +1[{entry['lens_hint']}]:{pattern[:60]} ← {source[:40]}")
+        self._record_history_entry(entry)
 
     def _start_audit_pass(self, item: Dict[str, Any]) -> None:
         ik = item_key(item)
@@ -2092,7 +2195,7 @@ class Pipeline:
         self.store.init_manifest(self.manifest_config())
         self.store.set_status(STATUS_RUNNING)
         self.emit(EV.RUN_STATUS, {"status": STATUS_RUNNING})
-        self.log(f"目标={self.cfg.target}{sn} 后端={self.cfg.backend} 并发={self.cfg.concurrency} "
+        self.log(f"目标={self.cfg.target}{sn} 模式={self.cfg.run_mode} 后端={self.cfg.backend} 并发={self.cfg.concurrency} "
                  f"每lens finder={self.cfg.finders_per_lens} dryRounds={self.cfg.dry_rounds} "
                  f"maxRounds={self.cfg.max_rounds} 裁决票={self.cfg.verify_votes} PoC={self.cfg.enable_poc} "
                  f"resume={self.cfg.resume} 威胁模型={self.cfg.threat_model}")
@@ -2107,7 +2210,14 @@ class Pipeline:
             self._reconcile_health_models()  # 续跑/重启:剔除旧 health 快照里已不在当前配置的模型
             if self.cfg.health.enabled and self.cfg.health.on_start and not self.stop_requested():
                 await self.health_check_all()
-            if not resumed:
+            if not resumed and self.cfg.run_mode == RUN_MODE_HISTORY_ONLY:
+                self.init_history_only_surface()
+            if not resumed and self.cfg.history_import_from:
+                self.import_history_patterns()
+
+            if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY:
+                stop_reason = await self.audit()
+            elif not resumed:
                 recon_task = asyncio.create_task(self.recon(try_restore=False))
                 await asyncio.sleep(0)
                 self._enqueue_history_commits()
@@ -2122,7 +2232,9 @@ class Pipeline:
                         history_sched.cancel()
                     await asyncio.gather(history_sched, return_exceptions=True)
                     raise
-            stop_reason = await self.audit()
+                stop_reason = await self.audit()
+            else:
+                stop_reason = await self.audit()
             if history_sched is not None:
                 await history_sched
                 if self._history_task is history_sched:
