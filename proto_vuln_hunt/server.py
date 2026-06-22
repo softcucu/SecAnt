@@ -168,6 +168,14 @@ class RunManager:
         rec["stop"].set()
         return True
 
+    def delete(self, run_id: str) -> bool:
+        """删除一个 run(不可逆):若在跑则先请求停止并取消任务,再整目录删除。"""
+        rec = self.active.pop(run_id, None)
+        if rec:
+            rec["stop"].set()
+            rec["task"].cancel()
+        return self.registry.delete(run_id)
+
     def set_risk_severity(self, run_id: str, rid: str, severity: str) -> bool:
         """人工调整某条风险点级别。run 在跑 → 走 pipeline(联动入队/出队);否则直接改文件。"""
         rec = self.active.get(run_id)
@@ -443,6 +451,11 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
     @app.post("/api/runs/{run_id}/resume")
     async def resume_run(run_id: str):
         return {"ok": manager.resume(run_id)}
+
+    @app.delete("/api/runs/{run_id}")
+    async def delete_run(run_id: str):
+        _store_or_404(run_id)
+        return {"ok": manager.delete(run_id)}
 
     # ── 结果读取(各读各的分文件) ──
     @app.get("/api/runs/{run_id}/findings")

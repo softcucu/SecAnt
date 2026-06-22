@@ -21,6 +21,7 @@ import json
 import os
 import random
 import hashlib
+import shutil
 import time
 from collections import deque
 from typing import Any, Dict, Iterator, List, Optional
@@ -107,6 +108,13 @@ class RunStore:
     def exists(self) -> bool:
         return (os.path.isfile(self.manifest_path) or os.path.isfile(self.state_path)
                 or os.path.isfile(self.checkpoint_path) or os.path.isfile(self.recon_path))
+
+    def delete(self) -> bool:
+        """整目录删除该 run(不可逆)。目录不存在视为已删除,返回 False。"""
+        if not os.path.isdir(self.dir):
+            return False
+        shutil.rmtree(self.dir, ignore_errors=True)
+        return not os.path.isdir(self.dir)
 
     # ── 清单 ──
     def load_manifest(self) -> Optional[Dict[str, Any]]:
@@ -451,6 +459,12 @@ class RunRegistry:
         if not os.path.isdir(d):
             return None
         return RunStore(d)
+
+    def delete(self, run_id: str) -> bool:
+        store = self.get(run_id)
+        if not store:
+            return False
+        return store.delete()
 
     def list_runs(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []

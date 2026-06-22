@@ -192,6 +192,8 @@ async function viewRuns() {
   const tb = el("tbody");
   for (const r of runs) {
     const s = r.summary || {};
+    const delBtn = el("button", { class: "btn danger ghost", style: "margin-left:10px;padding:2px 8px;font-size:12px",
+      onclick: () => deleteRun(r) }, "删除");
     tb.append(el("tr", {},
       el("td", {}, stPill(r.running ? "running" : r.status)),
       el("td", { html: `<a href="#/run/${encodeURIComponent(r.id)}">${esc(r.target || r.id)}</a>` + (r.scope ? `<div class="muted" style="font-size:12px">${esc(r.scope)}</div>` : "")}),
@@ -200,10 +202,17 @@ async function viewRuns() {
       el("td", {}, String(s.confirmed ?? 0)),
       el("td", {}, String(s.rounds ?? 0)),
       el("td", {}, fmtTs(r.created_at)),
-      el("td", { html: `<a href="#/run/${encodeURIComponent(r.id)}">查看 →</a>` })));
+      el("td", { class: "nowrap" }, el("a", { href: `#/run/${encodeURIComponent(r.id)}` }, "查看 →"), delBtn)));
   }
   tbl.append(tb);
   app.append(el("div", { class: "panel" }, el("div", { class: "table-wrap" }, tbl)));
+
+  async function deleteRun(r) {
+    const label = r.target || r.id;
+    if (!confirm(`确认删除该审计任务?\n\n${label}\n(${r.id})\n\n此操作不可恢复,将删除该 run 的全部数据。` + (r.running ? "\n\n该任务正在运行,将先停止再删除。" : ""))) return;
+    try { await api("DELETE", `/api/runs/${encodeURIComponent(r.id)}`); flash("已删除"); viewRuns(); }
+    catch (e) { flash("删除失败: " + e.message); }
+  }
 }
 
 // ──────────────────────── view: new run ────────────────────────
@@ -388,11 +397,17 @@ function viewDashboard(runId) {
     el("div", { class: "row" },
       el("button", { class: "btn danger", onclick: stop }, "停止"),
       el("button", { class: "btn secondary", onclick: resume }, "续跑"),
+      el("button", { class: "btn danger ghost", onclick: del }, "删除"),
       el("a", { class: "btn secondary", href: "#/" }, "返回"))));
   app.append(header, tabsBar, tabBody);
 
   async function stop() { try { await api("POST", `/api/runs/${encodeURIComponent(runId)}/stop`); flash("已请求停止"); } catch (e) { flash(e.message); } }
   async function resume() { try { const r = await api("POST", `/api/runs/${encodeURIComponent(runId)}/resume`); flash(r.ok ? "已续跑" : "无法续跑(可能正在运行)"); if (r.ok) boot(); } catch (e) { flash(e.message); } }
+  async function del() {
+    if (!confirm(`确认删除该审计任务?\n\n${runId}\n\n此操作不可恢复,将删除该 run 的全部数据(若正在运行将先停止)。`)) return;
+    try { await api("DELETE", `/api/runs/${encodeURIComponent(runId)}`); if (window._es) { window._es.close(); window._es = null; } flash("已删除"); location.hash = "#/"; }
+    catch (e) { flash("删除失败: " + e.message); }
+  }
 
   function finiteNumber(v) {
     const n = Number(v);

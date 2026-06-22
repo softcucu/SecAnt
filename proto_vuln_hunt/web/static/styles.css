@@ -20,7 +20,10 @@ main{padding:20px clamp(12px,1.6vw,24px);max-width:none;margin:0;width:100%}
 .btn:hover{background:var(--accent2)}
 .btn.secondary{background:var(--panel2);border:1px solid var(--border);color:var(--text)}
 .btn.danger{background:var(--crit)}
+.btn.danger.ghost{background:transparent;border:1px solid var(--crit);color:var(--crit)}
+.btn.danger.ghost:hover{background:var(--crit);color:#fff}
 .btn:disabled{opacity:.5;cursor:not-allowed}
+.nowrap{white-space:nowrap}
 .link-btn{appearance:none;border:0;background:transparent;color:var(--accent);padding:0;cursor:pointer;font:inherit;text-align:left}
 .link-btn:hover{text-decoration:underline}
 .segmented{display:inline-flex;align-items:center;border:1px solid var(--border);border-radius:6px;overflow:hidden;background:var(--bg)}
