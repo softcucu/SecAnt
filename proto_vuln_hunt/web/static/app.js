@@ -263,6 +263,7 @@ function viewDashboard(runId) {
   // 大列表分页:每页只建一页 DOM,切页签与 SSE 重渲都只重建当页,与总量无关。
   const PAGE_SIZE = { findings: 40, candidates: 100, nonissues: 40, history: 50, risks: 50 };
   const pageState = { findings: 1, candidates: 1, nonissues: 1, history: 1, risks: 1 };
+  let findingAuditModelFilter = "all"; // 漏洞页按审计模型筛选
   let candStatusFilter = "all";   // 候选页按状态筛选:all/pending/confirmed/rejected/verify_failed
   let histStatusFilter = "all";   // 历史问题页按排查状态筛选
   let riskStatusFilter = "all";   // 风险页按排查状态筛选
@@ -526,9 +527,57 @@ function viewDashboard(runId) {
     return wrap;
   }
 
+  const MISSING_AUDIT_MODEL = "__missing_audit_model__";
+  function auditModelKey(f) {
+    const m = String((f && f.audit_model) || "").trim();
+    return m || MISSING_AUDIT_MODEL;
+  }
+  function auditModelLabel(key) {
+    return key === MISSING_AUDIT_MODEL ? "未记录" : key;
+  }
+  function findingAuditModelFilterBar(list) {
+    const counts = new Map();
+    for (const f of list) {
+      const k = auditModelKey(f);
+      counts.set(k, (counts.get(k) || 0) + 1);
+    }
+    const items = [...counts.entries()].sort((a, b) =>
+      String(auditModelLabel(a[0])).localeCompare(String(auditModelLabel(b[0])), undefined, { numeric: true }));
+    const bar = el("div", { class: "filter-bar row", style: "gap:6px;margin:0 0 8px;flex-wrap:wrap" });
+    const allBtn = el("button", { type: "button", class: "seg-btn" + (findingAuditModelFilter === "all" ? " active" : "") },
+      `全部 ${list.length}`);
+    allBtn.addEventListener("click", () => {
+      if (findingAuditModelFilter === "all") return;
+      findingAuditModelFilter = "all";
+      pageState.findings = 1;
+      renderTab();
+    });
+    bar.append(el("span", { class: "muted", style: "font-size:12px" }, "审计模型"), allBtn);
+    for (const [value, n] of items) {
+      const btn = el("button", { type: "button", class: "seg-btn" + (findingAuditModelFilter === value ? " active" : "") },
+        `${auditModelLabel(value)} ${n}`);
+      btn.addEventListener("click", () => {
+        if (findingAuditModelFilter === value) return;
+        findingAuditModelFilter = value;
+        pageState.findings = 1;
+        renderTab();
+      });
+      bar.append(btn);
+    }
+    return bar;
+  }
+
   function renderFindings() {
-    const list = [...S.findings.values()].sort((a, b) => SEVS.indexOf(a.corrected_severity) - SEVS.indexOf(b.corrected_severity));
-    if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无疑似漏洞(审计进行中会实时出现)。")); return; }
+    const all = [...S.findings.values()].sort((a, b) => SEVS.indexOf(a.corrected_severity) - SEVS.indexOf(b.corrected_severity));
+    if (!all.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无疑似漏洞(审计进行中会实时出现)。")); return; }
+    const focusId = pendingFocus?.type === "finding" ? pendingFocus.id : null;
+    if (focusId && findingAuditModelFilter !== "all") {
+      const target = all.find(f => String(f.id) === String(focusId));
+      if (target && auditModelKey(target) !== findingAuditModelFilter) findingAuditModelFilter = "all";
+    }
+    tabBody.append(findingAuditModelFilterBar(all));
+    const list = findingAuditModelFilter === "all" ? all : all.filter(f => auditModelKey(f) === findingAuditModelFilter);
+    if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "当前审计模型筛选下暂无疑似漏洞。")); return; }
     const focusIdx = pendingFocus?.type === "finding" ? list.findIndex(f => String(f.id) === String(pendingFocus.id)) : -1;
     const info = paginate("findings", list, focusIdx);
     const topPager = pagerBar("findings", info);
