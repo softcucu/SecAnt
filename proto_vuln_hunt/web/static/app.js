@@ -264,6 +264,7 @@ function viewDashboard(runId) {
   const PAGE_SIZE = { findings: 40, candidates: 100, nonissues: 40, history: 50, risks: 50 };
   const pageState = { findings: 1, candidates: 1, nonissues: 1, history: 1, risks: 1 };
   let findingAuditModelFilter = "all"; // 漏洞页按审计模型筛选
+  let findingFeedbackFilter = "all";   // 漏洞页按人工确认状态筛选
   let candStatusFilter = "all";   // 候选页按状态筛选:all/pending/confirmed/rejected/verify_failed
   let histStatusFilter = "all";   // 历史问题页按排查状态筛选
   let riskStatusFilter = "all";   // 风险页按排查状态筛选
@@ -502,6 +503,9 @@ function viewDashboard(runId) {
     renderHeader();
     renderTabs();
   }
+  function refreshFindingsTab() {
+    if (activeTab === "findings") renderTab();
+  }
 
   function renderFindingFeedback(f) {
     const select = el("select", { class: "feedback-select", title: "人工确认反馈" },
@@ -545,6 +549,7 @@ function viewDashboard(runId) {
         renderTabs();
         setState("已保存");
         flash("人工确认反馈已保存");
+        refreshFindingsTab();
       } catch (err) {
         f.manual_feedback = previousFeedback;
         S.findings.set(f.id, f);
@@ -553,6 +558,7 @@ function viewDashboard(runId) {
         renderTabs();
         setState("保存失败");
         flash("保存反馈失败: " + err.message);
+        refreshFindingsTab();
       } finally {
         saving = false;
         select.disabled = false;
@@ -603,18 +609,52 @@ function viewDashboard(runId) {
     }
     return bar;
   }
+  function findingFeedbackFilterBar(list) {
+    const counts = {};
+    for (const f of list) {
+      const s = findingFeedbackStatus(f);
+      counts[s] = (counts[s] || 0) + 1;
+    }
+    const bar = el("div", { class: "filter-bar row", style: "gap:6px;margin:0 0 8px;flex-wrap:wrap" });
+    const allBtn = el("button", { type: "button", class: "seg-btn" + (findingFeedbackFilter === "all" ? " active" : "") },
+      `全部 ${list.length}`);
+    allBtn.addEventListener("click", () => {
+      if (findingFeedbackFilter === "all") return;
+      findingFeedbackFilter = "all";
+      pageState.findings = 1;
+      renderTab();
+    });
+    bar.append(el("span", { class: "muted", style: "font-size:12px" }, "人工确认"), allBtn);
+    for (const [value, label] of FINDING_FEEDBACK_OPTIONS) {
+      const n = counts[value] || 0;
+      if (!n && findingFeedbackFilter !== value) continue;
+      const btn = el("button", { type: "button", class: "seg-btn" + (findingFeedbackFilter === value ? " active" : "") },
+        `${label} ${n}`);
+      btn.addEventListener("click", () => {
+        if (findingFeedbackFilter === value) return;
+        findingFeedbackFilter = value;
+        pageState.findings = 1;
+        renderTab();
+      });
+      bar.append(btn);
+    }
+    return bar;
+  }
 
   function renderFindings() {
     const all = [...S.findings.values()].sort((a, b) => SEVS.indexOf(a.corrected_severity) - SEVS.indexOf(b.corrected_severity));
     if (!all.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无疑似漏洞(审计进行中会实时出现)。")); return; }
     const focusId = pendingFocus?.type === "finding" ? pendingFocus.id : null;
-    if (focusId && findingAuditModelFilter !== "all") {
+    if (focusId && (findingAuditModelFilter !== "all" || findingFeedbackFilter !== "all")) {
       const target = all.find(f => String(f.id) === String(focusId));
-      if (target && auditModelKey(target) !== findingAuditModelFilter) findingAuditModelFilter = "all";
+      if (target && findingAuditModelFilter !== "all" && auditModelKey(target) !== findingAuditModelFilter) findingAuditModelFilter = "all";
+      if (target && findingFeedbackFilter !== "all" && findingFeedbackStatus(target) !== findingFeedbackFilter) findingFeedbackFilter = "all";
     }
     tabBody.append(findingAuditModelFilterBar(all));
-    const list = findingAuditModelFilter === "all" ? all : all.filter(f => auditModelKey(f) === findingAuditModelFilter);
-    if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "当前审计模型筛选下暂无疑似漏洞。")); return; }
+    const modelFiltered = findingAuditModelFilter === "all" ? all : all.filter(f => auditModelKey(f) === findingAuditModelFilter);
+    tabBody.append(findingFeedbackFilterBar(modelFiltered));
+    const list = findingFeedbackFilter === "all" ? modelFiltered : modelFiltered.filter(f => findingFeedbackStatus(f) === findingFeedbackFilter);
+    if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "当前筛选下暂无疑似漏洞。")); return; }
     const focusIdx = pendingFocus?.type === "finding" ? list.findIndex(f => String(f.id) === String(pendingFocus.id)) : -1;
     const info = paginate("findings", list, focusIdx);
     const topPager = pagerBar("findings", info);
