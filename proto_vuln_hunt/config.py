@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import yaml  # type: ignore
@@ -173,6 +175,7 @@ class Config:
     backends: Dict[str, BackendSpec] = field(default_factory=dict)
     models: Dict[str, List[str]] = field(default_factory=dict)
     model_concurrency: Dict[str, int] = field(default_factory=dict)
+    model_time_windows: Dict[str, List[str]] = field(default_factory=dict)
     concurrency: int = 4
     # backend=opencode 专用的运行产物回收开关。
     # opencode 把快照(snapshot/ 裸 git 仓,每步提交整棵工作树)等写在 ~/.local/share/opencode;
@@ -246,6 +249,9 @@ class Config:
         self.runs_dir = os.path.abspath(os.path.expanduser(self.runs_dir))
         self.models = normalize_models(self.models)
         self.model_concurrency = normalize_model_concurrency(self.model_concurrency)
+        (self.model_time_windows,
+         self._model_time_window_minutes,
+         self._model_time_window_errors) = normalize_model_time_windows_with_errors(self.model_time_windows)
         # methods_dir 展开为绝对路径(~ → $HOME)
         self._methods_abs = os.path.abspath(os.path.expanduser(self.methods_dir))
 
@@ -279,6 +285,47 @@ class Config:
 
     def model_concurrency_for(self, model: str) -> int:
         return max(1, int(self.model_concurrency.get(model) or self.model_concurrency.get("default") or self.concurrency))
+
+    def _time_window_minutes_for(self, model: str) -> Optional[List[Tuple[int, int]]]:
+        windows = getattr(self, "_model_time_window_minutes", {})
+        if model in windows:
+            return list(windows.get(model) or [])
+        if "default" in windows:
+            return list(windows.get("default") or [])
+        return None
+
+    def model_time_windows_for(self, model: str) -> List[str]:
+        if model in self.model_time_windows:
+            return list(self.model_time_windows.get(model) or [])
+        if "default" in self.model_time_windows:
+            return list(self.model_time_windows.get("default") or [])
+        return ["*"]
+
+    def model_available_at(self, model: str, when: Optional[float] = None) -> bool:
+        """按本机本地时间判断模型当前是否处于可用时间窗内。
+
+        未配置时间窗的模型默认全天可用。时间窗语义为 start <= 当前时间 < end;
+        跨零点窗口(如 22:00~02:00)按夜间跨日处理。
+        """
+        windows = self._time_window_minutes_for(model)
+        if windows is None:
+            return True
+        if not windows:
+            return False
+        lt = time.localtime(time.time() if when is None else when)
+        minute = lt.tm_hour * 60 + lt.tm_min
+        for start, end in windows:
+            if start == end:
+                return True
+            if start < end:
+                if start <= minute < end:
+                    return True
+            elif minute >= start or minute < end:
+                return True
+        return False
+
+    def available_models(self, models: List[str], when: Optional[float] = None) -> List[str]:
+        return [m for m in models if self.model_available_at(m, when)]
 
     def all_models(self) -> List[str]:
         """所有 role 里配置到的去重模型列表(保持首次出现顺序),用于启动前健康检查。"""
@@ -317,11 +364,22 @@ class Config:
         missing = self.missing_model_roles()
         if missing:
             problems.append("缺少模型配置: " + ", ".join(f"models.{r}" for r in missing))
+        window_errors = getattr(self, "_model_time_window_errors", [])
+        if window_errors:
+            problems.append("模型可用时间段配置错误: " + "; ".join(window_errors))
         return "; ".join(problems)
 
-    def model_slots_for(self, role: str) -> List[str]:
+    def configured_model_slots_for(self, role: str) -> List[str]:
         slots: List[str] = []
         for model in self.models_for(role):
+            slots.extend([model] * self.model_concurrency_for(model))
+        return slots
+
+    def model_slots_for(self, role: str, when: Optional[float] = None) -> List[str]:
+        slots: List[str] = []
+        for model in self.models_for(role):
+            if not self.model_available_at(model, when):
+                continue
             slots.extend([model] * self.model_concurrency_for(model))
         return slots
 
@@ -389,6 +447,123 @@ def normalize_model_concurrency(raw: Any) -> Dict[str, int]:
         except Exception:
             continue
     return out
+
+
+_WINDOW_SEP = re.compile(r"\s*(?:~|–|—|-|\bto\b)\s*", re.IGNORECASE)
+_ALWAYS_WINDOW_VALUES = {"*", "all", "any", "always", "anytime", "24h", "全天", "任意"}
+
+
+def _parse_clock_minute(raw: Any) -> Optional[int]:
+    s = str(raw or "").strip()
+    m = re.fullmatch(r"(\d{1,2})(?::(\d{1,2}))?", s)
+    if not m:
+        return None
+    hour = int(m.group(1))
+    minute = int(m.group(2) or 0)
+    if hour == 24 and minute == 0:
+        return 1440
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour * 60 + minute
+
+
+def _fmt_clock_minute(minute: int, *, end: bool = False) -> str:
+    if end and minute == 1440:
+        return "24:00"
+    minute = minute % 1440
+    return f"{minute // 60:02d}:{minute % 60:02d}"
+
+
+def _normalize_window_item(item: Any) -> Tuple[Optional[str], Optional[Tuple[int, int]], Optional[str]]:
+    if isinstance(item, dict):
+        start_raw = item.get("start", item.get("from"))
+        end_raw = item.get("end", item.get("to"))
+        label = f"{start_raw}~{end_raw}"
+    else:
+        label = str(item or "").strip()
+        if label.lower() in _ALWAYS_WINDOW_VALUES:
+            return "*", (0, 0), None
+        parts = _WINDOW_SEP.split(label, maxsplit=1)
+        if len(parts) != 2:
+            return None, None, f"{label or '<empty>'} 应形如 00:00~06:00"
+        start_raw, end_raw = parts[0], parts[1]
+
+    start = _parse_clock_minute(start_raw)
+    end = _parse_clock_minute(end_raw)
+    if start is None or end is None:
+        return None, None, f"{label} 包含非法时间"
+    start = start % 1440
+    norm = f"{_fmt_clock_minute(start)}~{_fmt_clock_minute(end, end=True)}"
+    return norm, (start, end), None
+
+
+def _iter_window_items(value: Any) -> List[Any]:
+    if isinstance(value, str):
+        return [x.strip() for x in value.split(",") if x.strip()]
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, dict):
+        if "start" in value or "from" in value or "end" in value or "to" in value:
+            return [value]
+        return []
+    if value is None:
+        return []
+    return [value]
+
+
+def normalize_model_time_windows_with_errors(raw: Any) -> Tuple[Dict[str, List[str]], Dict[str, List[Tuple[int, int]]], List[str]]:
+    """标准化模型可用时间窗。
+
+    支持:
+      model_time_windows:
+        model-a: "00:00~06:00"
+        model-b: ["00:00~06:00", "22:00~24:00"]
+        model-c:
+          - start: "00:00"
+            end: "06:00"
+
+    未配置的模型默认全天可用;可用时间段为左闭右开,跨零点窗口可写 22:00~02:00。
+    """
+    if not raw:
+        return {}, {}, []
+    if isinstance(raw, str):
+        raw = {"default": raw}
+    if not isinstance(raw, dict):
+        return {}, {}, ["model_time_windows 应为 object,如 model: 00:00~06:00"]
+
+    normalized: Dict[str, List[str]] = {}
+    parsed: Dict[str, List[Tuple[int, int]]] = {}
+    errors: List[str] = []
+
+    for model, value in raw.items():
+        key = str(model or "").strip()
+        if not key:
+            errors.append("存在空模型名")
+            continue
+        items = _iter_window_items(value)
+        if not items:
+            normalized[key] = []
+            parsed[key] = []
+            errors.append(f"{key} 未配置任何时间段")
+            continue
+        norm_items: List[str] = []
+        parsed_items: List[Tuple[int, int]] = []
+        for item in items:
+            norm, win, err = _normalize_window_item(item)
+            if err:
+                errors.append(f"{key}: {err}")
+                continue
+            if norm is not None and win is not None:
+                norm_items.append(norm)
+                parsed_items.append(win)
+        normalized[key] = norm_items
+        parsed[key] = parsed_items
+    return normalized, parsed, errors
+
+
+def normalize_model_time_windows(raw: Any) -> Dict[str, List[str]]:
+    normalized, _parsed, _errors = normalize_model_time_windows_with_errors(raw)
+    return normalized
 
 def _load_file(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:

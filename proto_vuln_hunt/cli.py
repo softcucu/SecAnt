@@ -87,6 +87,7 @@ def cmd_run(args) -> int:
         print(json.dumps({
             "target": cfg.target, "scope": cfg.scope, "out_dir": cfg.out_dir, "backend": cfg.backend,
             "models": cfg.models, "model_concurrency": cfg.model_concurrency,
+            "model_time_windows": cfg.model_time_windows,
             "concurrency": cfg.concurrency, "lenses": cfg.lenses,
             "threat_model": cfg.threat_model, "finders_per_lens": cfg.finders_per_lens,
             "max_rounds": cfg.max_rounds, "dry_rounds": cfg.dry_rounds, "verify_votes": cfg.verify_votes,

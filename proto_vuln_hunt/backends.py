@@ -1104,9 +1104,12 @@ class AgentRunner:
 
     def role_capacity_limit(self, role: str) -> int:
         """该 role 理论上可同时启动的模型槽数,用于上层避免同一调度 tick 过量派发。"""
+        configured = self.cfg.configured_model_slots_for(role)
+        if not configured:
+            return self.cfg.concurrency
         slots = self.cfg.model_slots_for(role)
         if not slots:
-            return self.cfg.concurrency
+            return 0
         return max(1, min(self.cfg.concurrency, len(slots)))
 
     async def _wait_capacity_tick(self, should_stop: Optional[Callable[[], bool]]) -> bool:
@@ -1494,6 +1497,13 @@ class AgentRunner:
             return None
         hc = self.cfg.health
         rec = self._health_rec(model)
+        if not self.cfg.model_available_at(model):
+            rec["status"] = "unavailable"
+            rec["reason"] = reason
+            rec["last_check_ts"] = time.time()
+            rec["error"] = "当前不在模型可用时间段"
+            self._emit_health(rec)
+            return rec
         rec["status"] = "checking"
         rec["reason"] = reason
         self._emit_health(rec)
@@ -1552,6 +1562,8 @@ class AgentRunner:
         无论探针结果如何都不阻断真正的调用——只更新状态,失败仍交由 run() 的重试兜底。"""
         hc = self.cfg.health
         if not model or not hc.enabled or not hc.gate or hc.ttl_s <= 0:
+            return
+        if not self.cfg.model_available_at(model):
             return
         rec = self._health_rec(model)
         now = time.time()
@@ -1636,8 +1648,8 @@ class AgentRunner:
             self._emit_agent(rec)
 
         emit_agent("queued", prompt_chars=len(prompt or ""), schema=bool(schema))
-        if not self.cfg.model_slots_for(role):
-            msg = f"角色 {role} 未配置可用模型"
+        if not self.cfg.configured_model_slots_for(role):
+            msg = f"角色 {role} 未配置模型"
             self.log(f"⚠ {tag} CLI 任务无法启动: {msg}")
             emit_agent(
                 "failed",

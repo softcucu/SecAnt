@@ -22,7 +22,7 @@ from . import schemas as S
 from .backends import AgentRunner
 from .common import (class_code, finalize_findings, finding_key, item_key,
                      most_severe, pad3, slim_finding)
-from .config import Config, normalize_models
+from .config import Config, normalize_model_time_windows_with_errors, normalize_models
 from .prompts import VERIFY_LENSES, PromptBuilder
 from .store import RunStore, STATUS_DONE, STATUS_ERROR, STATUS_INCOMPLETE, STATUS_RUNNING, STATUS_STOPPED
 
@@ -190,14 +190,21 @@ class Pipeline:
                 pass
 
     async def health_check_all(self) -> Dict[str, Any]:
-        """运行前(或按需)对所有配置的模型各发一个 1+1 探针,实时反映健康度。"""
-        models = self.cfg.all_models()
-        if not models:
+        """运行前(或按需)对当前时间窗内可用的模型各发一个 1+1 探针,实时反映健康度。"""
+        all_models = self.cfg.all_models()
+        if not all_models:
             self.log("⚠ 未配置任何模型,跳过健康检查")
             self.emit(EV.HEALTH_DONE, {"total": 0, "ok": 0, "unhealthy": []})
             return {"total": 0, "ok": 0, "unhealthy": []}
+        models = self.cfg.available_models(all_models)
+        skipped = [m for m in all_models if m not in models]
+        if not models:
+            self.log("🩺 模型健康检查:当前无模型处于可用时间段,跳过探针")
+            self.emit(EV.HEALTH_DONE, {"total": 0, "ok": 0, "unhealthy": [], "skipped_unavailable": skipped})
+            return {"total": 0, "ok": 0, "unhealthy": [], "skipped_unavailable": skipped}
         self.emit(EV.HEALTH_START, {"models": models})
-        self.log(f"🩺 模型健康检查:对 {len(models)} 个模型各发一个探针({', '.join(models)})…")
+        suffix = f";跳过当前不可用 {', '.join(skipped)}" if skipped else ""
+        self.log(f"🩺 模型健康检查:对 {len(models)} 个当前可用模型各发一个探针({', '.join(models)}){suffix}…")
         recs = await asyncio.gather(*[self.runner.probe_model(m, reason="startup") for m in models],
                                     return_exceptions=True)
         ok = sum(1 for r in recs if isinstance(r, dict) and r.get("status") == "ok")
@@ -207,8 +214,8 @@ class Pipeline:
                      f"(仍会尝试运行,失败将自动重试)")
         else:
             self.log(f"🩺 健康检查完成:{ok}/{len(models)} 全部正常")
-        self.emit(EV.HEALTH_DONE, {"total": len(models), "ok": ok, "unhealthy": bad})
-        return {"total": len(models), "ok": ok, "unhealthy": bad}
+        self.emit(EV.HEALTH_DONE, {"total": len(models), "ok": ok, "unhealthy": bad, "skipped_unavailable": skipped})
+        return {"total": len(models), "ok": ok, "unhealthy": bad, "skipped_unavailable": skipped}
 
     def _stop_ev(self) -> asyncio.Event:
         if self._stop is None:
@@ -481,10 +488,12 @@ class Pipeline:
         role = self._work_role(item)
         if role is None:
             return True
-        if not self.cfg.model_slots_for(role):
+        if not self.cfg.configured_model_slots_for(role):
             return True
         limit_fn = getattr(self.runner, "role_capacity_limit", None)
         role_limit = int(limit_fn(role)) if callable(limit_fn) else self.cfg.concurrency
+        if role_limit <= 0:
+            return False
         if self._active_roles.get(role, 0) >= max(1, role_limit):
             return False
         has_capacity = getattr(self.runner, "role_has_capacity", None)
@@ -573,12 +582,19 @@ class Pipeline:
         """运行中动态调整模型与并发(供 Web 接口调用)。可含:
           · models:{role: [model, ...]} —— 增/减某角色的模型(空列表=清空该角色,会触发配置错误提示);
           · model_concurrency:{model: limit} —— 每模型并发上限;
+          · model_time_windows:{model: [window, ...]} —— 每模型可用时间段;
           · concurrency:int —— 全局并发。
         就地改写 self.cfg(scheduler/各 acquire 都实时读它)并重设已存在的信号量;
         新增模型的 per-model 信号量在首次派任务时按新配置惰性创建。返回当前生效快照(含配置校验)。
         """
         patch = patch or {}
         changed: List[str] = []
+
+        if "model_time_windows" in patch and isinstance(patch["model_time_windows"], dict):
+            (self.cfg.model_time_windows,
+             self.cfg._model_time_window_minutes,
+             self.cfg._model_time_window_errors) = normalize_model_time_windows_with_errors(patch["model_time_windows"])
+            changed.append("模型可用时间段")
 
         if "models" in patch and isinstance(patch["models"], dict):
             old_models = self.cfg.all_models()
@@ -598,7 +614,8 @@ class Pipeline:
             # 启动健康探针只覆盖了当时配置的模型;新增的模型在后台补探一次。
             if added and self.cfg.health.enabled:
                 for m in added:
-                    asyncio.ensure_future(self.runner.probe_model(m, reason="reconfigure"))
+                    if self.cfg.model_available_at(m):
+                        asyncio.ensure_future(self.runner.probe_model(m, reason="reconfigure"))
 
         conc = patch.get("concurrency")
         mconc = patch.get("model_concurrency") if "model_concurrency" in patch else None
@@ -614,6 +631,7 @@ class Pipeline:
             self.store.update_config({
                 "models": self.cfg.models,
                 "model_concurrency": self.cfg.model_concurrency,
+                "model_time_windows": self.cfg.model_time_windows,
                 "concurrency": self.cfg.concurrency,
             })
         except Exception:
@@ -630,10 +648,13 @@ class Pipeline:
     def config_snapshot(self) -> Dict[str, Any]:
         """当前生效的模型/并发配置快照(含逐模型实际并发上限与配置校验)。"""
         eff = {m: self.cfg.model_concurrency_for(m) for m in self.cfg.all_models()}
+        avail = {m: self.cfg.model_available_at(m) for m in self.cfg.all_models()}
         return {
             "models": self.cfg.models,
             "model_concurrency": self.cfg.model_concurrency,
+            "model_time_windows": self.cfg.model_time_windows,
             "effective_model_concurrency": eff,
+            "model_availability": avail,
             "concurrency": self.cfg.concurrency,
             "model_config_error": self.cfg.model_config_error(),
         }
@@ -644,6 +665,7 @@ class Pipeline:
         return {
             "target": cfg.target, "scope": cfg.scope, "backend": cfg.backend,
             "models": cfg.models, "model_concurrency": cfg.model_concurrency,
+            "model_time_windows": cfg.model_time_windows,
             "concurrency": cfg.concurrency, "threat_model": cfg.threat_model,
             "lenses": cfg.lenses, "finders_per_lens": cfg.finders_per_lens,
             "max_rounds": cfg.max_rounds, "dry_rounds": cfg.dry_rounds,

@@ -28,6 +28,7 @@ class ResumeConfigTest(unittest.TestCase):
             backend="claude",
             models=_models(base_model),
             model_concurrency={base_model: 2},
+            model_time_windows={base_model: "00:00~06:00"},
             concurrency=concurrency,
         )
         registry = RunRegistry(base.runs_dir).ensure()
@@ -40,6 +41,7 @@ class ResumeConfigTest(unittest.TestCase):
             "target": tmp, "backend": "codex",
             "models": _models("old-stale-model"),
             "model_concurrency": {"old-stale-model": 9},
+            "model_time_windows": {"old-stale-model": "22:00~23:00"},
             "concurrency": 1,
             "max_rounds": 3,
         })
@@ -60,6 +62,7 @@ class ResumeConfigTest(unittest.TestCase):
             self.assertEqual(cfg.backend, "claude")
             self.assertEqual(cfg.models["audit"], ["new-startup-model"])
             self.assertEqual(cfg.model_concurrency, {"new-startup-model": 2})
+            self.assertEqual(cfg.model_time_windows, {"new-startup-model": ["00:00~06:00"]})
             self.assertEqual(cfg.concurrency, 7)
             # 非模型字段 → 仍沿用 run 的旧快照
             self.assertEqual(cfg.max_rounds, 3)
@@ -79,6 +82,7 @@ class ResumeConfigTest(unittest.TestCase):
             self.assertEqual(cfg["backend"], "claude")
             self.assertEqual(cfg["models"]["audit"], ["new-startup-model"])
             self.assertEqual(cfg["model_concurrency"], {"new-startup-model": 2})
+            self.assertEqual(cfg["model_time_windows"], {"new-startup-model": ["00:00~06:00"]})
             self.assertEqual(cfg["concurrency"], 7)
             self.assertEqual(cfg["max_rounds"], 3)
 

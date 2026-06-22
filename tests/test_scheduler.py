@@ -2,10 +2,12 @@ import os
 import sys
 import tempfile
 import asyncio
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from proto_vuln_hunt.backends import AgentRunner
 from proto_vuln_hunt.config import Config, HistorySpec, RecheckSpec
 from proto_vuln_hunt.pipeline import Pipeline
 from proto_vuln_hunt.store import RunStore
@@ -39,7 +41,46 @@ def _pipe(tmp, **overrides):
     return Pipeline(cfg, store=store)
 
 
+def _future_hour_window():
+    now = time.localtime()
+    start = (now.tm_hour + 1) % 24
+    end = (start + 1) % 24
+    return f"{start:02d}:00~{end:02d}:00"
+
+
 class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
+    async def test_health_check_skips_time_window_unavailable_models(self):
+        class DummyRunner:
+            async def probe_model(self, model, *, reason="startup"):
+                seen.append(model)
+                return {"model": model, "status": "ok"}
+
+        seen = []
+        models = {
+            "recon": ["ready-model"],
+            "history": ["ready-model"],
+            "recheck": ["ready-model"],
+            "decompose": ["ready-model"],
+            "audit": ["closed-model", "ready-model"],
+            "verify": ["ready-model"],
+            "report": ["ready-model"],
+            "poc": ["ready-model"],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            p = _pipe(
+                tmp,
+                models=models,
+                model_concurrency={"default": 1},
+                model_time_windows={"closed-model": _future_hour_window()},
+            )
+            p.runner = DummyRunner()
+
+            result = await p.health_check_all()
+
+            self.assertEqual(seen, ["ready-model"])
+            self.assertEqual(result["ok"], 1)
+            self.assertIn("closed-model", result["skipped_unavailable"])
+
     async def test_history_commit_starts_while_recon_is_running(self):
         class DummyRunner:
             def __init__(self):
@@ -279,6 +320,59 @@ class TestSchedulerPriority(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             p = _pipe(tmp)
             p.runner = CapacityRunner()
+            p._enqueue_work({"kind": "_finder", "audit_id": "a", "item": {}, "lens_key": "memory",
+                             "idx": 0, "priority": "high"})
+            p._enqueue_work({"kind": "_history_commit", "commit": {"hash": "abc", "subject": "s"},
+                             "priority": "medium"})
+
+            work = p._pop_next_work()
+
+            self.assertEqual(work["kind"], "_history_commit")
+
+    def test_time_window_unavailable_model_does_not_dispatch_role(self):
+        models = {
+            "recon": ["ready-model"],
+            "history": ["ready-model"],
+            "recheck": ["ready-model"],
+            "decompose": ["ready-model"],
+            "audit": ["closed-model"],
+            "verify": ["ready-model"],
+            "report": ["ready-model"],
+            "poc": ["ready-model"],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            p = _pipe(
+                tmp,
+                concurrency=2,
+                models=models,
+                model_concurrency={"default": 1},
+                model_time_windows={"closed-model": _future_hour_window()},
+            )
+            p.runner = AgentRunner(p.cfg, logger=lambda *_a, **_k: None)
+
+            self.assertEqual(p.runner.role_capacity_limit("audit"), 0)
+            self.assertFalse(p.runner.role_has_capacity("audit"))
+
+    def test_time_window_unavailable_front_work_does_not_block_ready_work(self):
+        models = {
+            "recon": ["ready-model"],
+            "history": ["ready-model"],
+            "recheck": ["ready-model"],
+            "decompose": ["ready-model"],
+            "audit": ["closed-model"],
+            "verify": ["ready-model"],
+            "report": ["ready-model"],
+            "poc": ["ready-model"],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            p = _pipe(
+                tmp,
+                concurrency=2,
+                models=models,
+                model_concurrency={"default": 1},
+                model_time_windows={"closed-model": _future_hour_window()},
+            )
+            p.runner = AgentRunner(p.cfg, logger=lambda *_a, **_k: None)
             p._enqueue_work({"kind": "_finder", "audit_id": "a", "item": {}, "lens_key": "memory",
                              "idx": 0, "priority": "high"})
             p._enqueue_work({"kind": "_history_commit", "commit": {"hash": "abc", "subject": "s"},

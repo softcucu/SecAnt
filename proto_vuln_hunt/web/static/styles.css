@@ -85,7 +85,7 @@ tr:hover td{background:var(--panel2)}
 .st-error{background:var(--crit)} .st-queued{background:var(--info)} .st-interrupted{background:var(--warn)}
 .st-incomplete{background:var(--warn)}
 .health-ok{background:var(--ok)} .health-down{background:var(--crit)} .health-degraded{background:var(--warn)}
-.health-checking{background:var(--run)} .health-unknown{background:var(--info)}
+.health-checking{background:var(--run)} .health-unavailable{background:var(--info)} .health-unknown{background:var(--info)}
 .agent-running{background:var(--run)} .agent-queued{background:var(--info)} .agent-retrying{background:var(--warn)}
 .agent-failed-attempt{background:var(--warn)} .agent-done{background:var(--ok)} .agent-failed{background:var(--crit)}
 .cand-pending{background:var(--run)} .cand-confirmed{background:var(--ok)} .cand-rejected{background:var(--info)}

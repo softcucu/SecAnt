@@ -58,6 +58,9 @@ function findingFeedbackStatus(f) { return (f && f.manual_feedback && f.manual_f
 function modelText(v) { return Array.isArray(v) ? v.join(", ") : (v || ""); }
 function splitModels(v) { return String(v || "").split(",").map(s => s.trim()).filter(Boolean); }
 function kvText(obj) { return Object.entries(obj || {}).map(([k, v]) => `${k}=${v}`).join(", "); }
+function modelWindowsText(obj) {
+  return Object.entries(obj || {}).map(([k, v]) => `${k}=${Array.isArray(v) ? v.join("|") : v}`).join("\n");
+}
 function shortJson(v, max = 420) {
   let s;
   try { s = typeof v === "string" ? v : JSON.stringify(v, null, 2); }
@@ -74,6 +77,19 @@ function parseKvInts(v) {
     const k = part.slice(0, i).trim();
     const n = parseInt(part.slice(i + 1).trim(), 10);
     if (k && Number.isFinite(n) && n > 0) out[k] = n;
+  }
+  return out;
+}
+function parseModelWindows(v) {
+  const out = {};
+  for (const rawLine of String(v || "").split(/\n+/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const i = line.indexOf("=");
+    if (i < 1) continue;
+    const model = line.slice(0, i).trim();
+    const windows = line.slice(i + 1).split("|").map(s => s.trim()).filter(Boolean);
+    if (model && windows.length) out[model] = windows.length === 1 ? windows[0] : windows;
   }
   return out;
 }
@@ -197,6 +213,7 @@ async function viewNew() {
   const d = meta.defaults;
   const f = (label, node) => el("label", { class: "field" }, el("span", {}, label), node);
   const inp = (id, val, type = "text") => el("input", { id, type, value: val == null ? "" : val });
+  const area = (id, val, rows = 3) => el("textarea", { id, rows }, val == null ? "" : val);
   const num = (id, val) => inp(id, val, "number");
 
   const backendSel = el("select", { id: "backend" }, ...meta.backends.map(b => el("option", { value: b, selected: b === d.backend ? "" : null }, b)));
@@ -226,7 +243,8 @@ async function viewNew() {
     el("div", { class: "panel", style: "padding:10px" },
       el("div", { class: "muted", style: "margin-bottom:6px" }, "每角色模型(运行中的角色必须填写)"),
       modelRows,
-      f("模型并发 model=limit", inp("model_concurrency", kvText(d.model_concurrency), "text"))),
+      f("模型并发 model=limit", inp("model_concurrency", kvText(d.model_concurrency), "text")),
+      f("模型可用时间段 model=00:00~06:00", area("model_time_windows", modelWindowsText(d.model_time_windows), 4))),
   );
 
   const submit = el("button", { class: "btn" }, "🚀 启动审计");
@@ -247,6 +265,7 @@ async function viewNew() {
       dry_rounds: +document.getElementById("dry_rounds").value, verify_votes: +document.getElementById("verify_votes").value,
       enable_poc: document.getElementById("enable_poc").checked, decompose: document.getElementById("decompose").checked,
       models, model_concurrency: parseKvInts(document.getElementById("model_concurrency").value),
+      model_time_windows: parseModelWindows(document.getElementById("model_time_windows").value),
     };
     submit.disabled = true;
     try { const r = await api("POST", "/api/runs", payload); location.hash = "#/run/" + encodeURIComponent(r.run_id); }
@@ -1112,7 +1131,7 @@ function viewDashboard(runId) {
     if (bottomPager) tabBody.append(bottomPager);
   }
 
-  const HEALTH_TXT = { ok: "✅ 正常", down: "⛔ 不可达", degraded: "⚠️ 异常", checking: "⏳ 检查中", unknown: "· 未检查" };
+  const HEALTH_TXT = { ok: "✅ 正常", down: "⛔ 不可达", degraded: "⚠️ 异常", checking: "⏳ 检查中", unavailable: "时间窗外", unknown: "· 未检查" };
   function healthPill(s) { return el("span", { class: "pill health-" + (s || "unknown") }, HEALTH_TXT[s] || s || "未检查"); }
   function isCallErrorText(s) { return /CLI 未产出|后端输出无可解析 JSON|结构化 JSON|parsefail|stdout 已存/.test(String(s || "")); }
   function runningModelCounts() {
@@ -1136,11 +1155,17 @@ function viewDashboard(runId) {
     }));
     const concInput = el("input", { type: "number", min: "1", value: cfg.concurrency ?? 4 });
     const mcInput = el("input", { type: "text", value: kvText(cfg.model_concurrency) });
+    const mtwInput = el("textarea", { rows: "4" }, modelWindowsText(cfg.model_time_windows));
     const btn = el("button", { class: "btn" }, "应用配置");
     btn.addEventListener("click", async () => {
       const models = {};
       for (const role of roles) { const v = splitModels(inputs[role].value); if (v.length) models[role] = v; }
-      const payload = { models, concurrency: +concInput.value, model_concurrency: parseKvInts(mcInput.value) };
+      const payload = {
+        models,
+        concurrency: +concInput.value,
+        model_concurrency: parseKvInts(mcInput.value),
+        model_time_windows: parseModelWindows(mtwInput.value),
+      };
       btn.disabled = true;
       try {
         const r = await api("POST", `/api/runs/${encodeURIComponent(runId)}/config`, payload);
@@ -1153,9 +1178,10 @@ function viewDashboard(runId) {
         el("span", { class: "muted", style: "font-size:12px" },
           running ? "改动即时生效:增/减模型、调整并发" : "run 未在运行 · 改动将在续跑时生效")),
       el("div", { class: "muted", style: "margin-bottom:6px;font-size:12px" },
-        "每个角色填写一个或多个模型(逗号分隔);留空=该角色不派任务。每模型并发用 model=limit,逗号分隔。"),
+        "每个角色填写一个或多个模型(逗号分隔);留空=该角色不派任务。每模型并发用 model=limit;可用时间段每行 model=00:00~06:00,多段用 |。"),
       modelGrid,
       el("div", { class: "grid", style: "margin-top:8px" }, f("全局并发", concInput), f("每模型并发 model=limit", mcInput)),
+      f("模型可用时间段 model=00:00~06:00", mtwInput),
       el("div", { style: "margin-top:10px" }, btn));
     tabBody.append(panel);
   }
@@ -1171,7 +1197,7 @@ function viewDashboard(runId) {
       el("p", { class: "muted", style: "margin:0" },
         "运行开始前会对每个配置的模型发一个短探针;调用某模型前若健康状态陈旧/异常会自动补检。首 token 与输出速度实时更新。")));
     if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无模型健康数据(开始运行后会自动检测)。")); return; }
-    const order = { checking: 0, down: 1, degraded: 2, unknown: 3, ok: 4 };
+    const order = { checking: 0, down: 1, degraded: 2, unavailable: 3, unknown: 4, ok: 5 };
     list.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9) || String(a.model).localeCompare(String(b.model)));
     const tbl = el("table", {}, el("thead", {}, el("tr", {},
       el("th", {}, "状态"), el("th", {}, "模型"), el("th", {}, "运行中"), el("th", {}, "首 token"), el("th", {}, "平均输出速度"), el("th", {}, "探针(正常/总)"),
@@ -1946,7 +1972,8 @@ function viewDashboard(runId) {
       case "config_updated":
         if (S.manifest) {
           S.manifest.config = Object.assign({}, S.manifest.config, {
-            models: d.models, model_concurrency: d.model_concurrency, concurrency: d.concurrency,
+            models: d.models, model_concurrency: d.model_concurrency,
+            model_time_windows: d.model_time_windows, concurrency: d.concurrency,
           });
         }
         flash("⚙ 配置已更新:全局并发 " + (d.concurrency ?? "?") + (d.model_config_error ? "(模型配置不完整)" : ""));

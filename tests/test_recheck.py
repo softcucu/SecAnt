@@ -3,6 +3,7 @@
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -294,6 +295,43 @@ class TestConfig(unittest.TestCase):
         cfg.history.enabled = False
         cfg.recheck.enabled = False
         self.assertEqual(cfg.model_config_error(), "")
+
+    def test_model_time_windows_default_to_all_day(self):
+        ts = time.mktime((2026, 1, 2, 12, 0, 0, 0, 0, -1))
+        cfg = Config(models={"audit": ["m"]}, model_concurrency={"default": 1})
+
+        self.assertTrue(cfg.model_available_at("m", ts))
+        self.assertEqual(cfg.model_slots_for("audit", ts), ["m"])
+
+    def test_model_time_windows_filter_slots(self):
+        at_0100 = time.mktime((2026, 1, 2, 1, 0, 0, 0, 0, -1))
+        at_0700 = time.mktime((2026, 1, 2, 7, 0, 0, 0, 0, -1))
+        cfg = Config(
+            models={"audit": ["night", "always"]},
+            model_concurrency={"default": 1},
+            model_time_windows={"night": "00:00~06:00"},
+        )
+
+        self.assertTrue(cfg.model_available_at("night", at_0100))
+        self.assertFalse(cfg.model_available_at("night", at_0700))
+        self.assertTrue(cfg.model_available_at("always", at_0700))
+        self.assertEqual(cfg.model_slots_for("audit", at_0100), ["night", "always"])
+        self.assertEqual(cfg.model_slots_for("audit", at_0700), ["always"])
+
+    def test_model_time_windows_support_cross_midnight(self):
+        at_2300 = time.mktime((2026, 1, 2, 23, 0, 0, 0, 0, -1))
+        at_0100 = time.mktime((2026, 1, 3, 1, 0, 0, 0, 0, -1))
+        at_1200 = time.mktime((2026, 1, 3, 12, 0, 0, 0, 0, -1))
+        cfg = Config(models={"audit": ["m"]}, model_time_windows={"m": "22:00~02:00"})
+
+        self.assertTrue(cfg.model_available_at("m", at_2300))
+        self.assertTrue(cfg.model_available_at("m", at_0100))
+        self.assertFalse(cfg.model_available_at("m", at_1200))
+
+    def test_invalid_model_time_windows_report_config_error(self):
+        cfg = Config(models={"audit": ["m"]}, model_time_windows={"m": "bad-window"})
+
+        self.assertIn("模型可用时间段配置错误", cfg.model_config_error())
 
 
 if __name__ == "__main__":

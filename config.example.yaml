@@ -35,6 +35,17 @@ model_concurrency:
   claude-sonnet-4-6: 2
   claude-opus-4-8: 1
 
+# ── 模型可用时间段 ──
+# 未配置的模型默认全天可用。时间按运行机器的本地时间判断,格式为 HH:MM~HH:MM,左闭右开:
+# 00:00~06:00 表示 00:00 起可用,到 06:00 前可用。跨零点可写 22:00~02:00。
+# 多个时间段可写数组;也可配置 default 给未单独列出的模型套默认时间段。
+model_time_windows:
+  # default: "*"                # 可选:未单独列出的模型全天可用(默认即如此;YAML 里 * 需要加引号)
+  # claude-opus-4-8: "00:00~06:00"
+  # claude-sonnet-4-6:
+  #   - "00:00~06:00"
+  #   - "22:00~24:00"
+
 # ── opencode 运行产物自动回收(仅 backend=opencode 生效) ──
 # opencode 会把会话(storage)、快照(snapshot,每步把整棵工作树提交进一个裸 git 仓)、sqlite 库
 # 都写在 $XDG_DATA_HOME/opencode(默认 ~/.local/share/opencode)。本工具一次跑会派成千上万个 agent,

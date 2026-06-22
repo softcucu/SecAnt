@@ -102,6 +102,12 @@ model_concurrency:                    # 单个模型自己的并发上限;未列
   claude-sonnet-4-6: 2
   claude-opus-4-8: 1
 
+model_time_windows:                   # 单个模型的可用时间段;未列出默认全天可用
+  claude-opus-4-8: "00:00~06:00"      # 本地时间,左闭右开;跨零点可写 22:00~02:00
+  claude-sonnet-4-6:
+    - "00:00~06:00"
+    - "22:00~24:00"
+
 params:
   finders_per_lens: 2
   dry_rounds: 2
@@ -132,6 +138,7 @@ backends:                             # (可选)自定义任意 CLI 的调用方
 字符串里也可以用逗号分隔多个模型,例如 `--model gpt-5-codex,o3` 会把同一组模型展开到当前会运行的所有 role,
 或写 `audit: "anthropic/a,openai/b"`。同一 role 下的 agent 调用会按
 `model_concurrency` 加权轮换模型,并由每个模型自己的 semaphore 强制限流。
+`model_time_windows` 可限制某个模型只在指定本地时间段内参与调度;未配置的模型默认全天可用。
 
 **自定义后端**:`command` 是 token 列表,运行时把 `{model}` 替换为当前角色模型、`{prompt}` 替换为提示词
 (仅 `prompt_mode: arg` 时需要)、`{prompt_file}` 替换为提示词临时文件路径(仅 `prompt_mode: file` 时需要);

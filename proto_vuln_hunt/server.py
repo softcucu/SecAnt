@@ -28,12 +28,12 @@ _RUN_FIELDS = {
     "target", "scope", "backend", "concurrency", "threat_model", "lenses",
     "finders_per_lens", "max_rounds", "dry_rounds", "verify_votes",
     "enable_poc", "decompose", "unit_line_budget", "max_files_per_unit", "max_subtasks_per_region",
-    "methods_dir", "models", "model_concurrency", "resume", "fresh",
+    "methods_dir", "models", "model_concurrency", "model_time_windows", "resume", "fresh",
 }
 
 # 续跑历史任务时,这些"后端/模型/并发"字段改用本次启动的基础配置(self.base,随服务重启读取最新
 # 配置文件刷新),而不沿用 run 首次创建时落盘的旧快照——避免改了配置文件重启后续跑仍用老模型/老并发。
-_RESUME_FROM_BASE_FIELDS = {"backend", "models", "model_concurrency", "concurrency"}
+_RESUME_FROM_BASE_FIELDS = {"backend", "models", "model_concurrency", "model_time_windows", "concurrency"}
 
 _FINDING_FEEDBACK_STATUSES = {"unreviewed", "confirmed", "false_positive", "needs_review"}
 
@@ -60,6 +60,8 @@ def build_run_config(base: Config, payload: Dict[str, Any]) -> Config:
         overrides.pop("models")
     if "model_concurrency" in overrides and not isinstance(overrides["model_concurrency"], dict):
         overrides.pop("model_concurrency")
+    if "model_time_windows" in overrides and not isinstance(overrides["model_time_windows"], dict):
+        overrides.pop("model_time_windows")
     overrides.setdefault("resume", False)   # 新建 run 默认从头(run 目录本来就是空的)
     return dataclasses.replace(base, **overrides)
 
@@ -184,6 +186,8 @@ class RunManager:
             clean["models"] = patch["models"]
         if isinstance(patch.get("model_concurrency"), dict):
             clean["model_concurrency"] = patch["model_concurrency"]
+        if isinstance(patch.get("model_time_windows"), dict):
+            clean["model_time_windows"] = patch["model_time_windows"]
         if patch.get("concurrency") is not None:
             try:
                 clean["concurrency"] = max(1, int(patch["concurrency"]))
@@ -369,6 +373,7 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
             "defaults": {
                 "backend": cfg.backend, "concurrency": cfg.concurrency, "models": cfg.models,
                 "model_concurrency": cfg.model_concurrency,
+                "model_time_windows": cfg.model_time_windows,
                 "threat_model": cfg.threat_model, "lenses": cfg.lenses,
                 "finders_per_lens": cfg.finders_per_lens, "max_rounds": cfg.max_rounds,
                 "dry_rounds": cfg.dry_rounds, "verify_votes": cfg.verify_votes,
@@ -504,7 +509,7 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
             body.pop("lenses", None)
         snapshot = manager.reconfigure(run_id, body or {})
         if snapshot is None:
-            raise HTTPException(400, "无可应用的配置(仅支持 models / model_concurrency / concurrency)")
+            raise HTTPException(400, "无可应用的配置(仅支持 models / model_concurrency / model_time_windows / concurrency)")
         return {"ok": True, **snapshot}
 
     # ── 模型健康 ──
