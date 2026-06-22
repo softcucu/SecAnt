@@ -9,6 +9,11 @@ const FINDING_FEEDBACK_OPTIONS = [
   ["false_positive", "误报"],
   ["needs_review", "待复核"],
 ];
+const FINDING_SOURCE_OPTIONS = [
+  ["history", "历史问题排查"],
+  ["risk", "潜在风险点审计"],
+  ["coverage", "攻击面覆盖审计"],
+];
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 function el(tag, attrs = {}, ...kids) {
   const e = document.createElement(tag);
@@ -264,6 +269,7 @@ function viewDashboard(runId) {
   const PAGE_SIZE = { findings: 40, candidates: 100, nonissues: 40, history: 50, risks: 50 };
   const pageState = { findings: 1, candidates: 1, nonissues: 1, history: 1, risks: 1 };
   let findingAuditModelFilter = "all"; // 漏洞页按审计模型筛选
+  let findingSourceFilter = "all";      // 漏洞页按来源筛选
   let findingFeedbackFilter = "all";   // 漏洞页按人工确认状态筛选
   let candStatusFilter = "all";   // 候选页按状态筛选:all/pending/confirmed/rejected/verify_failed
   let histStatusFilter = "all";   // 历史问题页按排查状态筛选
@@ -612,7 +618,28 @@ function viewDashboard(runId) {
     }
     return counts;
   }
-  function findingFilterPanel(all, modelFiltered, filtered) {
+  function findingSourceRecord(f) {
+    const k = candKeyOf(f);
+    let c = S.candidateMap.get(k);
+    if (!c && f && f.id) c = candidateList().find(x => String(x.id) === String(f.id));
+    return c || f || {};
+  }
+  function findingSourceKey(f) {
+    const c = findingSourceRecord(f);
+    const variant = String(c.variant_of || f?.variant_of || "").trim();
+    if (c.risk_id || c.risk_area || c.good_validation_ref || variant.startsWith("风险点")) return "risk";
+    if (variant) return "history";
+    return "coverage";
+  }
+  function findingSourceCounts(list) {
+    const counts = {};
+    for (const f of list) {
+      const s = findingSourceKey(f);
+      counts[s] = (counts[s] || 0) + 1;
+    }
+    return counts;
+  }
+  function findingFilterPanel(all, modelFiltered, sourceFiltered, filtered) {
     const modelSelect = el("select", { title: "按审计模型筛选漏洞" },
       el("option", { value: "all", selected: findingAuditModelFilter === "all" ? "" : null }, `全部模型 (${all.length})`),
       ...findingAuditModelItems(all).map(([value, n]) =>
@@ -624,10 +651,23 @@ function viewDashboard(runId) {
       renderTab();
     });
 
-    const feedbackCounts = findingFeedbackCounts(modelFiltered);
+    const sourceCounts = findingSourceCounts(modelFiltered);
+    const sourceSelect = el("select", { title: "按来源筛选漏洞" },
+      el("option", { value: "all", selected: findingSourceFilter === "all" ? "" : null },
+        `全部来源 (${modelFiltered.length})`),
+      ...FINDING_SOURCE_OPTIONS.map(([value, label]) =>
+        el("option", { value, selected: findingSourceFilter === value ? "" : null },
+          `${label} (${sourceCounts[value] || 0})`)));
+    sourceSelect.addEventListener("change", () => {
+      findingSourceFilter = sourceSelect.value || "all";
+      pageState.findings = 1;
+      renderTab();
+    });
+
+    const feedbackCounts = findingFeedbackCounts(sourceFiltered);
     const feedbackOptions = [
       el("option", { value: "all", selected: findingFeedbackFilter === "all" ? "" : null },
-        `全部结果 (${modelFiltered.length})`),
+        `全部结果 (${sourceFiltered.length})`),
       ...FINDING_FEEDBACK_OPTIONS.map(([value, label]) => {
         const n = feedbackCounts[value] || 0;
         return el("option", { value, selected: findingFeedbackFilter === value ? "" : null },
@@ -644,11 +684,12 @@ function viewDashboard(runId) {
     const clearBtn = el("button", {
       type: "button",
       class: "btn secondary finding-filter-clear",
-      disabled: findingAuditModelFilter === "all" && findingFeedbackFilter === "all" ? "" : null,
+      disabled: findingAuditModelFilter === "all" && findingSourceFilter === "all" && findingFeedbackFilter === "all" ? "" : null,
     }, "清除筛选");
     clearBtn.addEventListener("click", () => {
-      if (findingAuditModelFilter === "all" && findingFeedbackFilter === "all") return;
+      if (findingAuditModelFilter === "all" && findingSourceFilter === "all" && findingFeedbackFilter === "all") return;
       findingAuditModelFilter = "all";
+      findingSourceFilter = "all";
       findingFeedbackFilter = "all";
       pageState.findings = 1;
       renderTab();
@@ -658,22 +699,26 @@ function viewDashboard(runId) {
       el("div", { class: "row finding-filter-row" },
         el("strong", {}, "漏洞筛选"),
         el("label", { class: "filter-field" }, el("span", {}, "审计模型"), modelSelect),
+        el("label", { class: "filter-field" }, el("span", {}, "来源"), sourceSelect),
         el("label", { class: "filter-field" }, el("span", {}, "人工确认结果"), feedbackSelect),
         clearBtn,
         el("span", { class: "muted filter-summary" }, `显示 ${filtered.length} / ${all.length}`)));
   }
 
   function renderFindings() {
+    if (!candidatesLoaded) fetchCandidates();
     const all = [...S.findings.values()].sort((a, b) => SEVS.indexOf(a.corrected_severity) - SEVS.indexOf(b.corrected_severity));
     const focusId = pendingFocus?.type === "finding" ? pendingFocus.id : null;
-    if (all.length && focusId && (findingAuditModelFilter !== "all" || findingFeedbackFilter !== "all")) {
+    if (all.length && focusId && (findingAuditModelFilter !== "all" || findingSourceFilter !== "all" || findingFeedbackFilter !== "all")) {
       const target = all.find(f => String(f.id) === String(focusId));
       if (target && findingAuditModelFilter !== "all" && auditModelKey(target) !== findingAuditModelFilter) findingAuditModelFilter = "all";
+      if (target && findingSourceFilter !== "all" && findingSourceKey(target) !== findingSourceFilter) findingSourceFilter = "all";
       if (target && findingFeedbackFilter !== "all" && findingFeedbackStatus(target) !== findingFeedbackFilter) findingFeedbackFilter = "all";
     }
     const modelFiltered = findingAuditModelFilter === "all" ? all : all.filter(f => auditModelKey(f) === findingAuditModelFilter);
-    const list = findingFeedbackFilter === "all" ? modelFiltered : modelFiltered.filter(f => findingFeedbackStatus(f) === findingFeedbackFilter);
-    tabBody.append(findingFilterPanel(all, modelFiltered, list));
+    const sourceFiltered = findingSourceFilter === "all" ? modelFiltered : modelFiltered.filter(f => findingSourceKey(f) === findingSourceFilter);
+    const list = findingFeedbackFilter === "all" ? sourceFiltered : sourceFiltered.filter(f => findingFeedbackStatus(f) === findingFeedbackFilter);
+    tabBody.append(findingFilterPanel(all, modelFiltered, sourceFiltered, list));
     if (!all.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无疑似漏洞(审计进行中会实时出现)。")); return; }
     if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "当前筛选下暂无疑似漏洞。")); return; }
     const focusIdx = pendingFocus?.type === "finding" ? list.findIndex(f => String(f.id) === String(pendingFocus.id)) : -1;
@@ -1951,7 +1996,7 @@ function viewDashboard(runId) {
       applyCandidateRows(r.candidates || [], r.nonissues || []);
       renderHeader();
       renderTabs();
-      if (["candidates", "nonissues", "coverage", "history", "risks"].includes(activeTab)) renderTab();
+      if (["findings", "candidates", "nonissues", "coverage", "history", "risks"].includes(activeTab)) renderTab();
     })().catch(e => {
       flash("加载候选失败: " + e.message);
     }).finally(() => { candidatesLoading = null; });
