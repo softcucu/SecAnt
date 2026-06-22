@@ -278,6 +278,52 @@ POC_SCHEMA = {
     },
 }
 
+# 仅历史模式:确认漏洞的结构化报告字段。LLM 只填字段,程序用统一模板渲染成 Markdown。
+HISTORY_REPORT_SCHEMA = {
+    "type": "object",
+    "required": ["summary", "description", "vuln_code", "data_flow", "impact",
+                 "fix_suggestion", "history"],
+    "properties": {
+        "summary": {"type": "string", "description": "一句话概述:这是什么漏洞、在哪、为什么是它(攻击者能做什么)"},
+        "description": {"type": "string", "description": "漏洞分析说明:破坏了什么不变量、攻击者控制什么、缺陷如何形成"},
+        "vuln_code": {"type": "string", "description": "本处漏洞的关键真实代码片段(用 Read 取原文,不要转述;只贴够看清 bug 的几行)"},
+        "vuln_code_loc": {"type": "string", "description": "上面代码片段的位置,如 path:line-line"},
+        "data_flow": {"type": "string", "description": "数据流:不可信来源(path:line)→ sink(path:line),中途有无校验、为何不足"},
+        "call_chain": {"type": "array", "items": {"type": "string"}, "description": "从真实入口到 sink 的可达性调用链,每项 path:line + 一句话"},
+        "impact": {"type": "string", "description": "影响与可利用性(结合威胁模型)"},
+        "mitigations": {"type": "string", "description": "已检查的缓解:canary/ASLR/FORTIFY/sanitizer/类型上界等是否存在、可否绕过"},
+        "poc_result": {"type": "string", "description": "PoC / 验证结果说明;无动态 PoC 则给静态触发构造说明"},
+        "fix_suggestion": {"type": "string", "description": "修复建议:具体怎么改,最好与历史修复后的正确写法对齐"},
+        "confidence_basis": {"type": "string", "description": "置信度依据(一句话)"},
+        "history": {
+            "type": "object",
+            "description": "与历史已修问题的对比(本漏洞是其同类变体)",
+            "required": ["root_cause", "why_recurred"],
+            "properties": {
+                "source": {"type": "string", "description": "历史问题出处:修复提交 hash / 文件 等"},
+                "root_cause": {"type": "string", "description": "历史问题的根因 / 缺陷类型(抽象描述)"},
+                "before_code": {"type": "string", "description": "历史修复前(有问题)的关键代码;用 git show 取原文,只贴几行"},
+                "after_code": {"type": "string", "description": "历史修复后(正确)的关键代码;用 git show 取原文,只贴几行"},
+                "fix_note": {"type": "string", "description": "当时是怎么修的(一句话)"},
+                "why_recurred": {"type": "string", "description": "为什么此处重蹈覆辙:漏了同款修复 / 历史修复没覆盖到本调用点"},
+                "comparison": {
+                    "type": "array",
+                    "description": "历史 vs 本处的逐维度对比(渲染成对比表)",
+                    "items": {
+                        "type": "object",
+                        "required": ["dimension", "history", "current"],
+                        "properties": {
+                            "dimension": {"type": "string", "description": "对比维度,如 根因 / 危险写法 / 是否做了同款校验 / 触发条件 / 位置"},
+                            "history": {"type": "string", "description": "历史问题在该维度的情况"},
+                            "current": {"type": "string", "description": "本处漏洞在该维度的情况"},
+                        },
+                    },
+                },
+            },
+        },
+    },
+}
+
 # 单条 git 提交的「是否安全修复 + 问题模式」判定(每条提交一个 agent)
 HISTORY_COMMIT_SCHEMA = {
     "type": "object",

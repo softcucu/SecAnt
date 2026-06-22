@@ -112,6 +112,7 @@ class PromptBuilder:
         self.target = cfg.target
         self.scope_note = f"(仅审子路径:{cfg.scope})" if cfg.scope else ""
         self.threat = cfg.threat_model
+        self.run_mode = getattr(cfg, "run_mode", "full")
         self.methods_ok = cfg.methods_ok()
         self.methods_dir = cfg.methods_abs
 
@@ -539,20 +540,28 @@ class PromptBuilder:
         )
 
     # ── 报告正文(返回纯 Markdown 正文,frontmatter 由 Python 拼接) ──
-    def report_body(self, rec: Dict[str, Any], poc: Any) -> str:
-        votes_brief = json.dumps(
+    @staticmethod
+    def _votes_brief(rec: Dict[str, Any]) -> str:
+        return json.dumps(
             [{"phase": v.get("phase"), "decision": v.get("decision"), "is_real": v.get("is_real"),
               "evidence_refs": v.get("evidence_refs"), "source_chain": v.get("source_chain"),
               "sink_ref": v.get("sink_ref"), "clearing_checks": v.get("clearing_checks"),
               "reachability": v.get("reachability"), "controllability": v.get("controllability"),
               "reasoning": v.get("reasoning"), "non_issue_reason": v.get("non_issue_reason")}
              for v in (rec.get("votes") or [])], ensure_ascii=False)
-        poc_brief = json.dumps({
+
+    @staticmethod
+    def _poc_brief(poc: Any) -> str:
+        return json.dumps({
             "compiled": poc.get("compiled"), "triggered": poc.get("triggered"),
             "approach": poc.get("approach"), "build_cmd": poc.get("build_cmd"),
             "exploitability": poc.get("exploitability"), "notes": poc.get("notes"),
             "harness_code": poc.get("harness_code"),
         }, ensure_ascii=False) if poc else "(未做动态 PoC,给出静态触发构造说明)"
+
+    def report_body(self, rec: Dict[str, Any], poc: Any) -> str:
+        votes_brief = self._votes_brief(rec)
+        poc_brief = self._poc_brief(poc)
         # 按发现来源附加两类对照小节:历史问题排查命中 → 类似哪个历史问题;
         # 潜在风险点排查命中 → 哪一处其他代码把校验做对了(正面对照)。
         extras = ""
@@ -584,6 +593,33 @@ class PromptBuilder:
             f"{extras}"
             f"对抗性验证结论(供你参考,提炼进报告):{votes_brief}\n"
             "**只输出报告正文 Markdown 本身**(从 ## ① 漏洞描述 之类开始),不要任何额外说明、不要代码块包裹整篇。"
+        )
+
+    # ── 仅历史模式:返回结构化字段(由程序套用统一模板渲染成 MD)──
+    def report_history(self, rec: Dict[str, Any], poc: Any, schema) -> str:
+        votes_brief = self._votes_brief(rec)
+        poc_brief = self._poc_brief(poc)
+        variant_of = (rec.get("variant_of") or "").strip()
+        return (
+            f"为下面这**一条**已确认漏洞填写一份结构化报告,**只输出符合给定 schema 的 JSON 对象**"
+            f"(不要写 Markdown、不要任何额外说明)。我会用统一模板把这些字段渲染成报告。\n"
+            f"{OUTPUT_LANGUAGE_ZH}\n"
+            f"目标仓:{self.target}{self.scope_note};漏洞位置 {rec.get('file')}:{rec.get('line') or '?'} 函数 {rec.get('function')}。"
+            f"威胁模型:{self.threat}。\n"
+            f"**这是「历史漏洞同类变体排查」命中的结果**:本漏洞是某历史已修问题的同类变体,历史来源:{variant_of}。\n\n"
+            "填写要点:\n"
+            "- summary / description / impact / fix_suggestion:基本的漏洞分析说明,简洁准确,不堆砌套话。\n"
+            "- vuln_code:用 Read 取本处**真实代码原文**(只贴够看清 bug 的几行),并在 vuln_code_loc 填位置;不要转述。\n"
+            "- data_flow / call_chain:给出来源→sink 的传播路径与可达性调用链(path:line)。\n"
+            "- history:这是报告的重点对比块——用 `git show`/Read 取历史问题的**真实代码**:"
+            "before_code(修复前有问题的写法)、after_code(修复后正确的写法),各只贴几行;"
+            "root_cause(根因/缺陷类型)、fix_note(当时怎么修)、why_recurred(为什么此处重蹈覆辙)、source(出处);"
+            "comparison 给出逐维度对比行(根因 / 危险写法 / 是否做了同款校验 / 触发条件 / 位置)。"
+            "若历史代码取不到,如实在对应字段说明,并据 variant_of 概述。\n"
+            f"- poc_result:{poc_brief}。\n"
+            f"- confidence_basis:置信度={rec.get('confidence')},一句话说明依据。\n\n"
+            f"对抗性验证结论(供你提炼字段内容,不要整段照抄):{votes_brief}\n"
+            "**只输出 JSON 对象本身。**"
         )
 
     # ── 汇总(INDEX.md 正文) ──

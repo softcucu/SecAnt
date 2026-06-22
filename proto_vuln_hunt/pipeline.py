@@ -19,6 +19,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from . import events as EV
+from . import exporters as export
 from . import schemas as S
 from .backends import AgentRunner
 from .common import (class_code, finalize_findings, finding_key, item_key,
@@ -1394,11 +1395,21 @@ class Pipeline:
                 if poc:
                     self.emit(EV.POC_DONE, {"id": fid, "compiled": poc.get("compiled"), "triggered": poc.get("triggered")})
 
-            body = await self.runner.run(self.pb.report_body(rec, poc),
-                                         role="report", label=f"report:{fid}", schema=None, fallback=None)
-            rec["report_body"] = body or ""
+            # 仅历史模式且命中历史变体:report 只产出结构化 JSON,由程序套统一模板渲染成 MD。
+            if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY and (rec.get("variant_of") or "").strip():
+                struct = await self.runner.run(
+                    self.pb.report_history(rec, poc, S.HISTORY_REPORT_SCHEMA),
+                    role="report", label=f"report:{fid}", schema=S.HISTORY_REPORT_SCHEMA, fallback=None)
+                rec["report_struct"] = struct if isinstance(struct, dict) else None
+                rec["report_body"] = (export.render_history_report_body(struct, rec)
+                                      if isinstance(struct, dict) else "")
+                rec["report_failed"] = not isinstance(struct, dict)
+            else:
+                body = await self.runner.run(self.pb.report_body(rec, poc),
+                                             role="report", label=f"report:{fid}", schema=None, fallback=None)
+                rec["report_body"] = body or ""
+                rec["report_failed"] = not body
             rec["poc"] = poc
-            rec["report_failed"] = not body
             rec["output_ts"] = time.time()
             self.confirmed.append(rec)
             self.store.save_finding(rec)            # 流式:确认即写 findings/<id>.json

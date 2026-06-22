@@ -219,6 +219,64 @@ def _render_verify_votes_md(votes: List[Dict[str, Any]]) -> str:
     return "".join(rows)
 
 
+def _code_block(code: Optional[str], lang: str = "c") -> str:
+    """把代码原文包成 ```lang 代码块;已自带围栏的原样返回;空则给占位。"""
+    s = (code or "").strip()
+    if not s:
+        return "_(未取到代码)_"
+    if s.startswith("```"):
+        return s
+    return f"```{lang}\n{s}\n```"
+
+
+def render_history_report_body(struct: Dict[str, Any], finding: Dict[str, Any]) -> str:
+    """仅历史模式:把 report 结构化字段套用统一模板渲染成报告正文 Markdown。"""
+    s = struct or {}
+    loc = (s.get("vuln_code_loc") or "").strip() or \
+        f"{finding.get('file') or ''}:{finding.get('line') or '?'}"
+    chain = s.get("call_chain") or []
+    parts: List[str] = []
+
+    parts.append(f"## 一、漏洞概述\n\n{s.get('summary') or finding.get('title') or '(无)'}\n")
+
+    parts.append("## 二、漏洞分析\n")
+    parts.append(f"**漏洞描述**\n\n{s.get('description') or '(无)'}\n")
+    parts.append(f"**关键代码** `{loc}`\n\n{_code_block(s.get('vuln_code'))}\n")
+    parts.append(f"**数据流**\n\n{s.get('data_flow') or '(无)'}\n")
+    if chain:
+        parts.append("**可达性调用链**\n\n" + _as_md(chain) + "\n")
+    parts.append(f"**影响与可利用性**\n\n{s.get('impact') or finding.get('exploitability') or '(无)'}\n")
+    if (s.get("mitigations") or "").strip():
+        parts.append(f"**已检查的缓解措施**\n\n{s.get('mitigations')}\n")
+
+    parts.append(f"## 三、PoC / 验证结果\n\n{s.get('poc_result') or '(无)'}\n")
+    parts.append(f"## 四、修复建议\n\n{s.get('fix_suggestion') or '(无)'}\n")
+
+    h = s.get("history") or {}
+    hp: List[str] = ["## 五、与历史问题的对比\n"]
+    if (h.get("source") or "").strip():
+        hp.append(f"- **历史出处**:{h.get('source')}")
+    hp.append(f"- **历史根因**:{h.get('root_cause') or finding.get('variant_of') or '(无)'}")
+    hp.append("")
+    hp.append("**历史修复前(有问题)**\n\n" + _code_block(h.get("before_code")) + "\n")
+    hp.append("**历史修复后(正确)**\n\n" + _code_block(h.get("after_code")) + "\n")
+    if (h.get("fix_note") or "").strip():
+        hp.append(f"**当时的修复**:{h.get('fix_note')}\n")
+    hp.append(f"**为何此处重蹈覆辙**:{h.get('why_recurred') or '(无)'}\n")
+    comp = h.get("comparison") or []
+    if comp:
+        hp.append("| 维度 | 历史问题 | 本处漏洞 |")
+        hp.append("|---|---|---|")
+        for row in comp:
+            hp.append(f"| {_nl(row.get('dimension'))} | {_nl(row.get('history'))} | {_nl(row.get('current'))} |")
+    parts.append("\n".join(hp) + "\n")
+
+    if (s.get("confidence_basis") or "").strip():
+        parts.append(f"> 置信度:{finding.get('confidence') or '?'} —— {s.get('confidence_basis')}\n")
+
+    return "\n".join(parts)
+
+
 def render_finding_md(finding: Dict[str, Any]) -> str:
     fm = {
         "id": finding.get("id"), "title": finding.get("title"), "bug_class": finding.get("bug_class"),
@@ -228,7 +286,11 @@ def render_finding_md(finding: Dict[str, Any]) -> str:
         "variant_of": finding.get("variant_of") or "",
     }
     fm_lines = "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False) if isinstance(v, str) else v}" for k, v in fm.items())
-    body = (finding.get("report_body") or "").strip()
+    # 仅历史模式:有结构化报告字段时,始终用统一模板现渲染(模板可演进、可重导出)。
+    if isinstance(finding.get("report_struct"), dict):
+        body = render_history_report_body(finding["report_struct"], finding).strip()
+    else:
+        body = (finding.get("report_body") or "").strip()
     if not body:
         poc = finding.get("poc")
         body = (f"## ① 漏洞描述\n{finding.get('description') or finding.get('title')}\n\n"
