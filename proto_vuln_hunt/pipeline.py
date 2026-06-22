@@ -534,7 +534,11 @@ class Pipeline:
         return self._RISK_SEV_ORDER.get(sev or "info", 0) >= self._RISK_SEV_ORDER.get(th, 2)
 
     def _enqueue_risk(self, note: Dict[str, Any]) -> None:
-        """把一条风险点放进优先排查队列(置 recheck_status=queued)。调用方负责落盘。"""
+        """把一条风险点放进优先排查队列(置 recheck_status=queued)。调用方负责落盘。
+        仅历史模式不放回风险线索:这里是把风险点重新投入排查队列的唯一闸口,
+        命中该模式时直接不入队(只走 recheck→verify→report→可选 poc,不再触发 audit 扩面)。"""
+        if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY:
+            return
         note["recheck_status"] = "queued"
         self.pq.append({"kind": "risk", "id": note["id"], "area": note.get("area"),
                         "note": note.get("note"), "file": note.get("file"),
@@ -557,8 +561,10 @@ class Pipeline:
                 "lens": lens, "round": rnd, "recheck_status": "none"}
         self.risk_notes.append(note)
         self.risk_by_id[note["id"]] = note
-        # 达阈值且非复查自身产出的风险点 → 自动进专用优先排查队列(防自激:复查产出的不再回灌)
-        enq = self.cfg.recheck.enabled and not from_recheck and self._risk_sev_ok(note["severity_hint"])
+        # 达阈值且非复查自身产出的风险点 → 自动进专用优先排查队列(防自激:复查产出的不再回灌)。
+        # 仅历史模式:不放回任何风险线索,只记录登记供报告引用,绝不回灌触发 audit 扩面。
+        enq = (self.cfg.recheck.enabled and not from_recheck and self._risk_sev_ok(note["severity_hint"])
+               and self.cfg.run_mode != RUN_MODE_HISTORY_ONLY)
         if enq:
             note["recheck_status"] = "queued"
         self.store.save_risk(note)            # 写一次即落盘:risks/<id>.json
@@ -2055,7 +2061,10 @@ class Pipeline:
         else:
             self._final_failed_sweep_done = True
         if not self.queue and not self.pq and not self._audit_passes and not self._recheck_inflight:
-            self.log(f"轮 {self.round}: 工作队列已空且无新攻击面回灌")
+            if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY:
+                self.log("历史问题排查完成:工作队列已排空,审计结束")
+            else:
+                self.log(f"轮 {self.round}: 工作队列已空且无新攻击面回灌")
 
         incomplete = self._incomplete_counts()
         if self.stop_requested():
@@ -2162,7 +2171,10 @@ class Pipeline:
             self._save_candidate_state(payload)
             self.emit(EV.CANDIDATE_FOUND, payload)
             self._enqueue_finding(f)
-        for s in new_surfaces:
+        # 仅历史模式:不把复查/挖掘提炼出的新攻击面放回主队列。surface 会被 _start_audit_pass
+        # 展开成 finder(audit 角色),正是“触发 audit 等流程”的来源;该模式只做 recheck→verify→report。
+        history_only = self.cfg.run_mode == RUN_MODE_HISTORY_ONLY
+        for s in (() if history_only else new_surfaces):
             sk = (s.get("name") or "").strip().lower()
             if not sk or sk in self.seen_surface:
                 continue
@@ -2380,7 +2392,11 @@ class Pipeline:
         incomplete_counts = self._incomplete_counts()
         has_incomplete = self._has_incomplete_counts(incomplete_counts)
         status = STATUS_STOPPED if self.stop_requested() else (STATUS_INCOMPLETE if has_incomplete else STATUS_DONE)
-        converged = status == STATUS_DONE and self.round < self.cfg.max_rounds
+        # 仅历史模式无轮次概念:历史变体排查完即收敛,不参照 maxRounds。
+        if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY:
+            converged = status == STATUS_DONE
+        else:
+            converged = status == STATUS_DONE and self.round < self.cfg.max_rounds
 
         summary = {
             **self._summary_snapshot(self.round),
@@ -2421,10 +2437,16 @@ class Pipeline:
         self.store.init_manifest(self.manifest_config())
         self.store.set_status(STATUS_RUNNING)
         self.emit(EV.RUN_STATUS, {"status": STATUS_RUNNING})
-        self.log(f"目标={self.cfg.target}{sn} 模式={self.cfg.run_mode} 后端={self.cfg.backend} 并发={self.cfg.concurrency} "
-                 f"每lens finder={self.cfg.finders_per_lens} dryRounds={self.cfg.dry_rounds} "
-                 f"maxRounds={self.cfg.max_rounds} 验证=witness/blocker(5-agent) PoC={self.cfg.enable_poc} "
-                 f"resume={self.cfg.resume} 威胁模型={self.cfg.threat_model}")
+        if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY:
+            # 仅历史模式没有"轮"的概念:不做 finder 扩面/多轮重审,历史变体排查完即停。
+            self.log(f"目标={self.cfg.target}{sn} 模式={self.cfg.run_mode} 后端={self.cfg.backend} 并发={self.cfg.concurrency} "
+                     f"流程=recheck→verify→report{'→poc' if self.cfg.enable_poc else ''}(无轮次,审计完即停) "
+                     f"验证=witness/blocker(5-agent) resume={self.cfg.resume} 威胁模型={self.cfg.threat_model}")
+        else:
+            self.log(f"目标={self.cfg.target}{sn} 模式={self.cfg.run_mode} 后端={self.cfg.backend} 并发={self.cfg.concurrency} "
+                     f"每lens finder={self.cfg.finders_per_lens} dryRounds={self.cfg.dry_rounds} "
+                     f"maxRounds={self.cfg.max_rounds} 验证=witness/blocker(5-agent) PoC={self.cfg.enable_poc} "
+                     f"resume={self.cfg.resume} 威胁模型={self.cfg.threat_model}")
         self.log(f"启用 lens: {', '.join(self.cfg.lenses)} | run 目录: {self.store.dir} | "
                  f"方法库: {self.cfg.methods_abs} ({'就绪' if self.cfg.methods_ok() else '不可用→内联兜底'})")
         history_sched: Optional[asyncio.Task] = None

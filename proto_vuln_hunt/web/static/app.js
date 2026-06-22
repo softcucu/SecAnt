@@ -192,7 +192,7 @@ async function viewRuns() {
   const tb = el("tbody");
   for (const r of runs) {
     const s = r.summary || {};
-    const delBtn = el("button", { class: "btn danger ghost", style: "margin-left:10px;padding:2px 8px;font-size:12px",
+    const delBtn = el("button", { class: "btn danger ghost", style: "padding:2px 8px;font-size:12px",
       onclick: () => deleteRun(r) }, "删除");
     tb.append(el("tr", {},
       el("td", {}, stPill(r.running ? "running" : r.status)),
@@ -202,7 +202,8 @@ async function viewRuns() {
       el("td", {}, String(s.confirmed ?? 0)),
       el("td", {}, String(s.rounds ?? 0)),
       el("td", {}, fmtTs(r.created_at)),
-      el("td", { class: "nowrap" }, el("a", { href: `#/run/${encodeURIComponent(r.id)}` }, "查看 →"), delBtn)));
+      el("td", {}, el("div", { class: "run-actions" },
+        el("a", { href: `#/run/${encodeURIComponent(r.id)}` }, "查看 →"), delBtn))));
   }
   tbl.append(tb);
   app.append(el("div", { class: "panel" }, el("div", { class: "table-wrap" }, tbl)));

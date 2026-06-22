@@ -23,7 +23,6 @@ main{padding:20px clamp(12px,1.6vw,24px);max-width:none;margin:0;width:100%}
 .btn.danger.ghost{background:transparent;border:1px solid var(--crit);color:var(--crit)}
 .btn.danger.ghost:hover{background:var(--crit);color:#fff}
 .btn:disabled{opacity:.5;cursor:not-allowed}
-.nowrap{white-space:nowrap}
 .link-btn{appearance:none;border:0;background:transparent;color:var(--accent);padding:0;cursor:pointer;font:inherit;text-align:left}
 .link-btn:hover{text-decoration:underline}
 .segmented{display:inline-flex;align-items:center;border:1px solid var(--border);border-radius:6px;overflow:hidden;background:var(--bg)}
@@ -49,8 +48,9 @@ tr:hover td{background:var(--panel2)}
 .run-table th:nth-child(3),.run-table td:nth-child(3){width:86px}
 .run-table th:nth-child(4),.run-table td:nth-child(4){width:120px}
 .run-table th:nth-child(5),.run-table td:nth-child(5),.run-table th:nth-child(6),.run-table td:nth-child(6){width:72px}
-.run-table th:nth-child(7),.run-table td:nth-child(7){width:190px}
-.run-table th:nth-child(8),.run-table td:nth-child(8){width:78px}
+.run-table th:nth-child(7),.run-table td:nth-child(7){width:158px}
+.run-table th:nth-child(8),.run-table td:nth-child(8){width:120px}
+.run-actions{display:flex;align-items:center;gap:10px;white-space:nowrap}
 .risk-table{min-width:1280px}
 .risk-table th:nth-child(1),.risk-table td:nth-child(1){width:100px}
 .risk-table th:nth-child(2),.risk-table td:nth-child(2){width:16%}
