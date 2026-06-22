@@ -1335,7 +1335,7 @@ function viewDashboard(runId) {
         el("span", { class: "muted", style: "font-size:12px" },
           running ? "改动即时生效:增/减模型、调整并发" : "run 未在运行 · 改动将在续跑时生效")),
       el("div", { class: "muted", style: "margin-bottom:6px;font-size:12px" },
-        "每个角色填写一个或多个模型(逗号分隔);留空=该角色不派任务。每模型并发用 model=limit;可用时间段每行 model=00:00~06:00,多段用 |。"),
+        "每个角色填写一个或多个模型(逗号分隔);留空=该角色不派任务。每模型并发用 model=limit(未配置默认为 1);可用时间段每行 model=00:00~06:00,多段用 |。"),
       modelGrid,
       el("div", { class: "grid", style: "margin-top:8px" }, f("全局并发", concInput), f("每模型并发 model=limit", mcInput)),
       f("模型可用时间段 model=00:00~06:00", mtwInput),

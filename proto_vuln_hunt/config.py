@@ -291,7 +291,8 @@ class Config:
         return list(self.models.get(role) or [])
 
     def model_concurrency_for(self, model: str) -> int:
-        return max(1, int(self.model_concurrency.get(model) or self.model_concurrency.get("default") or self.concurrency))
+        # 模型未显式配置并发时默认为 1;配置了(模型自身或 default 键)则按配置生效
+        return max(1, int(self.model_concurrency.get(model) or self.model_concurrency.get("default") or 1))
 
     def _time_window_minutes_for(self, model: str) -> Optional[List[Tuple[int, int]]]:
         windows = getattr(self, "_model_time_window_minutes", {})
