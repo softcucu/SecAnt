@@ -595,67 +595,72 @@ function viewDashboard(runId) {
   function auditModelLabel(key) {
     return key === MISSING_AUDIT_MODEL ? "未记录" : key;
   }
-  function findingAuditModelFilterBar(list) {
+  function findingAuditModelItems(list) {
     const counts = new Map();
     for (const f of list) {
       const k = auditModelKey(f);
       counts.set(k, (counts.get(k) || 0) + 1);
     }
-    const items = [...counts.entries()].sort((a, b) =>
+    return [...counts.entries()].sort((a, b) =>
       String(auditModelLabel(a[0])).localeCompare(String(auditModelLabel(b[0])), undefined, { numeric: true }));
-    const bar = el("div", { class: "filter-bar row", style: "gap:6px;margin:0 0 8px;flex-wrap:wrap" });
-    const allBtn = el("button", { type: "button", class: "seg-btn" + (findingAuditModelFilter === "all" ? " active" : "") },
-      `全部 ${list.length}`);
-    allBtn.addEventListener("click", () => {
-      if (findingAuditModelFilter === "all") return;
-      findingAuditModelFilter = "all";
-      pageState.findings = 1;
-      renderTab();
-    });
-    bar.append(el("span", { class: "muted", style: "font-size:12px" }, "审计模型"), allBtn);
-    for (const [value, n] of items) {
-      const btn = el("button", { type: "button", class: "seg-btn" + (findingAuditModelFilter === value ? " active" : "") },
-        `${auditModelLabel(value)} ${n}`);
-      btn.addEventListener("click", () => {
-        if (findingAuditModelFilter === value) return;
-        findingAuditModelFilter = value;
-        pageState.findings = 1;
-        renderTab();
-      });
-      bar.append(btn);
-    }
-    return bar;
   }
-  function findingFeedbackFilterBar(list) {
+  function findingFeedbackCounts(list) {
     const counts = {};
     for (const f of list) {
       const s = findingFeedbackStatus(f);
       counts[s] = (counts[s] || 0) + 1;
     }
-    const bar = el("div", { class: "filter-bar row", style: "gap:6px;margin:0 0 8px;flex-wrap:wrap" });
-    const allBtn = el("button", { type: "button", class: "seg-btn" + (findingFeedbackFilter === "all" ? " active" : "") },
-      `全部 ${list.length}`);
-    allBtn.addEventListener("click", () => {
-      if (findingFeedbackFilter === "all") return;
+    return counts;
+  }
+  function findingFilterPanel(all, modelFiltered, filtered) {
+    const modelSelect = el("select", { title: "按审计模型筛选漏洞" },
+      el("option", { value: "all", selected: findingAuditModelFilter === "all" ? "" : null }, `全部模型 (${all.length})`),
+      ...findingAuditModelItems(all).map(([value, n]) =>
+        el("option", { value, selected: findingAuditModelFilter === value ? "" : null },
+          `${auditModelLabel(value)} (${n})`)));
+    modelSelect.addEventListener("change", () => {
+      findingAuditModelFilter = modelSelect.value || "all";
+      pageState.findings = 1;
+      renderTab();
+    });
+
+    const feedbackCounts = findingFeedbackCounts(modelFiltered);
+    const feedbackOptions = [
+      el("option", { value: "all", selected: findingFeedbackFilter === "all" ? "" : null },
+        `全部结果 (${modelFiltered.length})`),
+      ...FINDING_FEEDBACK_OPTIONS.map(([value, label]) => {
+        const n = feedbackCounts[value] || 0;
+        return el("option", { value, selected: findingFeedbackFilter === value ? "" : null },
+          `${label} (${n})`);
+      }),
+    ];
+    const feedbackSelect = el("select", { title: "按人工确认结果筛选漏洞" }, ...feedbackOptions);
+    feedbackSelect.addEventListener("change", () => {
+      findingFeedbackFilter = feedbackSelect.value || "all";
+      pageState.findings = 1;
+      renderTab();
+    });
+
+    const clearBtn = el("button", {
+      type: "button",
+      class: "btn secondary finding-filter-clear",
+      disabled: findingAuditModelFilter === "all" && findingFeedbackFilter === "all" ? "" : null,
+    }, "清除筛选");
+    clearBtn.addEventListener("click", () => {
+      if (findingAuditModelFilter === "all" && findingFeedbackFilter === "all") return;
+      findingAuditModelFilter = "all";
       findingFeedbackFilter = "all";
       pageState.findings = 1;
       renderTab();
     });
-    bar.append(el("span", { class: "muted", style: "font-size:12px" }, "人工确认"), allBtn);
-    for (const [value, label] of FINDING_FEEDBACK_OPTIONS) {
-      const n = counts[value] || 0;
-      if (!n && findingFeedbackFilter !== value) continue;
-      const btn = el("button", { type: "button", class: "seg-btn" + (findingFeedbackFilter === value ? " active" : "") },
-        `${label} ${n}`);
-      btn.addEventListener("click", () => {
-        if (findingFeedbackFilter === value) return;
-        findingFeedbackFilter = value;
-        pageState.findings = 1;
-        renderTab();
-      });
-      bar.append(btn);
-    }
-    return bar;
+
+    return el("div", { class: "panel finding-filter-panel" },
+      el("div", { class: "row finding-filter-row" },
+        el("strong", {}, "漏洞筛选"),
+        el("label", { class: "filter-field" }, el("span", {}, "审计模型"), modelSelect),
+        el("label", { class: "filter-field" }, el("span", {}, "人工确认结果"), feedbackSelect),
+        clearBtn,
+        el("span", { class: "muted filter-summary" }, `显示 ${filtered.length} / ${all.length}`)));
   }
 
   function renderFindings() {
@@ -667,10 +672,9 @@ function viewDashboard(runId) {
       if (target && findingAuditModelFilter !== "all" && auditModelKey(target) !== findingAuditModelFilter) findingAuditModelFilter = "all";
       if (target && findingFeedbackFilter !== "all" && findingFeedbackStatus(target) !== findingFeedbackFilter) findingFeedbackFilter = "all";
     }
-    tabBody.append(findingAuditModelFilterBar(all));
     const modelFiltered = findingAuditModelFilter === "all" ? all : all.filter(f => auditModelKey(f) === findingAuditModelFilter);
-    tabBody.append(findingFeedbackFilterBar(modelFiltered));
     const list = findingFeedbackFilter === "all" ? modelFiltered : modelFiltered.filter(f => findingFeedbackStatus(f) === findingFeedbackFilter);
+    tabBody.append(findingFilterPanel(all, modelFiltered, list));
     if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "当前筛选下暂无疑似漏洞。")); return; }
     const focusIdx = pendingFocus?.type === "finding" ? list.findIndex(f => String(f.id) === String(pendingFocus.id)) : -1;
     const info = paginate("findings", list, focusIdx);

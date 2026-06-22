@@ -72,6 +72,12 @@ tr:hover td{background:var(--panel2)}
 .feedback-save:hover{background:var(--bg)}
 .feedback-save:disabled{opacity:.55;cursor:wait}
 .feedback-state{display:inline-block;min-width:42px;font-size:12px;white-space:nowrap}
+.finding-filter-panel{padding:12px 14px}
+.finding-filter-row{gap:10px}
+.filter-field{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:12px}
+.filter-field select{min-width:150px;max-width:min(300px,70vw);padding:5px 28px 5px 8px;font-size:12px}
+.finding-filter-clear{padding:5px 10px;font-size:12px;line-height:1.25}
+.filter-summary{margin-left:auto;font-size:12px;white-space:nowrap}
 .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;color:#fff}
 .sev-critical{background:var(--crit)} .sev-high{background:var(--high)} .sev-medium{background:var(--med)}
 .sev-low{background:var(--low)} .sev-info{background:var(--info)} .sev-none{background:var(--info)}
