@@ -470,6 +470,9 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
         if not rec:
             raise HTTPException(404, "finding not found")
         _apply_finding_output_times(store, [rec])
+        # 仅历史模式:正文以 report_struct 结构化存储,这里现渲染成 report_body 供 web 展示。
+        if not (rec.get("report_body") or "").strip() and isinstance(rec.get("report_struct"), dict):
+            rec["report_body"] = exporters.render_history_report_body(rec["report_struct"], rec)
         return rec
 
     @app.post("/api/runs/{run_id}/findings/{fid}/feedback")

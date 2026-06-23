@@ -241,7 +241,9 @@ def render_history_report_body(struct: Dict[str, Any], finding: Dict[str, Any]) 
 
     parts.append("## 二、漏洞分析\n")
     parts.append(f"**漏洞描述**\n\n{s.get('description') or '(无)'}\n")
-    parts.append(f"**关键代码** `{loc}`\n\n{_code_block(s.get('vuln_code'))}\n")
+    parts.append(f"**漏洞代码(完整上下文)** `{loc}`\n\n{_code_block(s.get('vuln_code'))}\n")
+    if (s.get("judgement") or "").strip():
+        parts.append(f"**漏洞判定原因**\n\n{s.get('judgement')}\n")
     parts.append(f"**数据流**\n\n{s.get('data_flow') or '(无)'}\n")
     if chain:
         parts.append("**可达性调用链**\n\n" + _as_md(chain) + "\n")
@@ -258,8 +260,10 @@ def render_history_report_body(struct: Dict[str, Any], finding: Dict[str, Any]) 
         hp.append(f"- **历史出处**:{h.get('source')}")
     hp.append(f"- **历史根因**:{h.get('root_cause') or finding.get('variant_of') or '(无)'}")
     hp.append("")
-    hp.append("**历史修复前(有问题)**\n\n" + _code_block(h.get("before_code")) + "\n")
-    hp.append("**历史修复后(正确)**\n\n" + _code_block(h.get("after_code")) + "\n")
+    if (h.get("root_cause_analysis") or "").strip():
+        hp.append(f"**历史问题根因分析**\n\n{h.get('root_cause_analysis')}\n")
+    hp.append("**历史修复前(有问题,完整上下文)**\n\n" + _code_block(h.get("before_code")) + "\n")
+    hp.append("**历史修复后(正确,完整上下文)**\n\n" + _code_block(h.get("after_code")) + "\n")
     if (h.get("fix_note") or "").strip():
         hp.append(f"**当时的修复**:{h.get('fix_note')}\n")
     hp.append(f"**为何此处重蹈覆辙**:{h.get('why_recurred') or '(无)'}\n")

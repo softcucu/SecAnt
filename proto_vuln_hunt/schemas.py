@@ -281,12 +281,13 @@ POC_SCHEMA = {
 # 仅历史模式:确认漏洞的结构化报告字段。LLM 只填字段,程序用统一模板渲染成 Markdown。
 HISTORY_REPORT_SCHEMA = {
     "type": "object",
-    "required": ["summary", "description", "vuln_code", "data_flow", "impact",
+    "required": ["summary", "description", "judgement", "vuln_code", "data_flow", "impact",
                  "fix_suggestion", "history"],
     "properties": {
         "summary": {"type": "string", "description": "一句话概述:这是什么漏洞、在哪、为什么是它(攻击者能做什么)"},
         "description": {"type": "string", "description": "漏洞分析说明:破坏了什么不变量、攻击者控制什么、缺陷如何形成"},
-        "vuln_code": {"type": "string", "description": "本处漏洞的关键真实代码片段(用 Read 取原文,不要转述;只贴够看清 bug 的几行)"},
+        "judgement": {"type": "string", "description": "漏洞判定原因:为什么确信这是真实漏洞——把判断依据与推理过程逐条讲清(危险写法具体在哪一行、缺了哪一步校验/为何现有校验不足、不可信输入如何到达此处且可被攻击者控制、可达性/触发条件如何成立),让读者据此即可独立复核此结论"},
+        "vuln_code": {"type": "string", "description": "本处漏洞的真实代码——用 Read 取**完整上下文原文**:至少覆盖整个所在函数,并带上理解此漏洞所必需的相邻定义/调用方/结构体/宏(保证读者**不看原始仓库**也能完整读懂并复核此漏洞);贴原文不要转述,可用注释标出关键漏洞行"},
         "vuln_code_loc": {"type": "string", "description": "上面代码片段的位置,如 path:line-line"},
         "data_flow": {"type": "string", "description": "数据流:不可信来源(path:line)→ sink(path:line),中途有无校验、为何不足"},
         "call_chain": {"type": "array", "items": {"type": "string"}, "description": "从真实入口到 sink 的可达性调用链,每项 path:line + 一句话"},
@@ -298,12 +299,13 @@ HISTORY_REPORT_SCHEMA = {
         "history": {
             "type": "object",
             "description": "与历史已修问题的对比(本漏洞是其同类变体)",
-            "required": ["root_cause", "why_recurred"],
+            "required": ["root_cause", "root_cause_analysis", "before_code", "after_code", "why_recurred"],
             "properties": {
                 "source": {"type": "string", "description": "历史问题出处:修复提交 hash / 文件 等"},
-                "root_cause": {"type": "string", "description": "历史问题的根因 / 缺陷类型(抽象描述)"},
-                "before_code": {"type": "string", "description": "历史修复前(有问题)的关键代码;用 git show 取原文,只贴几行"},
-                "after_code": {"type": "string", "description": "历史修复后(正确)的关键代码;用 git show 取原文,只贴几行"},
+                "root_cause": {"type": "string", "description": "历史问题的根因 / 缺陷类型(一句话抽象概括,作为标题用)"},
+                "root_cause_analysis": {"type": "string", "description": "历史问题根因分析:展开讲清楚——历史代码当时为什么会出错(破坏了什么不变量、错误假设是什么)、攻击者当时如何利用、这一类缺陷的本质模式是什么;让读者理解根因而非只看结论"},
+                "before_code": {"type": "string", "description": "历史修复前(有问题)的关键代码——用 git show 取**完整上下文原文**(至少覆盖整个改动函数),保证不看原始提交也能看懂当时的缺陷;不要只贴一两行"},
+                "after_code": {"type": "string", "description": "历史修复后(正确)的关键代码——用 git show 取**完整上下文原文**(与 before_code 对应的同一函数修复后版本),便于和修复前逐行对照;不要只贴一两行"},
                 "fix_note": {"type": "string", "description": "当时是怎么修的(一句话)"},
                 "why_recurred": {"type": "string", "description": "为什么此处重蹈覆辙:漏了同款修复 / 历史修复没覆盖到本调用点"},
                 "comparison": {
