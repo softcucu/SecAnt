@@ -20,9 +20,10 @@ ROUND_START = "round_start"        # {round}
 ROUND_DONE = "round_done"          # {round, new_findings, new_surfaces, queue_len, dry_streak, risks}
 CANDIDATE_FOUND = "candidate_found"    # {key, title, bug_class, file, line, lens, severity, function, description, source_to_sink, ...}
 FINDING_CONFIRMED = "finding_confirmed"  # {finding ...}
+FINDING_ADDED = "finding_added"      # {finding ...; not necessarily proven_real, see finding_status/tags}
 FINDING_REJECTED = "finding_rejected"    # {candidate fields..., votes, rejection_reason}
 CANDIDATE_FAILED = "candidate_failed"    # {key, title, reason, attempts}
-CANDIDATE_DECIDED = "candidate_decided"  # {candidate fields..., status=suppressed_unproven|promoted_to_risk|needs_manual_review, votes}
+CANDIDATE_DECIDED = "candidate_decided"  # {candidate fields..., status=suppressed_unproven|needs_manual_review, votes}
 SURFACE_ADDED = "surface_added"    # {name, why, files, lens_hint, round, from}
 RISK_ADDED = "risk_added"          # {area, note, file, severity_hint, lens, round}
 RECHECK_ENQUEUED = "recheck_enqueued"  # {kind: variant|risk, id?, pattern?, area?, severity_hint?, lens_hint?}

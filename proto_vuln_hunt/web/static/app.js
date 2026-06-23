@@ -3,6 +3,8 @@
 const app = document.getElementById("app");
 const SEVS = ["critical", "high", "medium", "low", "info"];
 const RELATED_CANDIDATE_RENDER_LIMIT = 80;
+const QUALITY_FINDING_STATUS = "unproven_quality_issue";
+const QUALITY_FINDING_TAG = "编码质量问题";
 const FINDING_FEEDBACK_OPTIONS = [
   ["unreviewed", "未确认"],
   ["confirmed", "确认漏洞"],
@@ -55,6 +57,13 @@ function fmtTok(n) {
 }
 function cssKey(s) { return String(s || "unknown").replace(/[^a-z0-9-]+/gi, "-").toLowerCase(); }
 function findingFeedbackStatus(f) { return (f && f.manual_feedback && f.manual_feedback.status) || "unreviewed"; }
+function issueTags(f) { return Array.isArray(f?.tags) ? f.tags.filter(Boolean).map(String) : []; }
+function isQualityFinding(f) { return f?.finding_status === QUALITY_FINDING_STATUS || issueTags(f).includes(QUALITY_FINDING_TAG); }
+function tagPills(f) {
+  const tags = issueTags(f);
+  if (!tags.length) return null;
+  return el("span", { class: "tag-list" }, ...tags.map(t => el("span", { class: "tag" }, t)));
+}
 function modelText(v) { return Array.isArray(v) ? v.join(", ") : (v || ""); }
 function splitModels(v) { return String(v || "").split(",").map(s => s.trim()).filter(Boolean); }
 function kvText(obj) { return Object.entries(obj || {}).map(([k, v]) => `${k}=${v}`).join(", "); }
@@ -478,6 +487,7 @@ function viewDashboard(runId) {
   function renderHeader() {
     const bySev = {}; for (const f of S.findings.values()) bySev[f.corrected_severity] = (bySev[f.corrected_severity] || 0) + 1;
     const suspectedCount = S.findings.size;
+    const qualityCount = [...S.findings.values()].filter(isQualityFinding).length;
     const manualConfirmed = [...S.findings.values()].filter(f => findingFeedbackStatus(f) === "confirmed").length;
     header.innerHTML = "";
     const cfg = runConfig();
@@ -497,7 +507,8 @@ function viewDashboard(runId) {
         el("div", { class: "stat" }, el("div", { class: "n" }, String(hs.hits)), el("div", { class: "l" }, "命中模式")),
         el("div", { class: "stat" }, el("div", { class: "n" }, String(hs.failed)), el("div", { class: "l" }, "失败/未覆盖")),
         el("div", { class: "stat" }, el("div", { class: "n" }, String(S.candidates)), el("div", { class: "l" }, "候选")),
-        el("div", { class: "stat" }, el("div", { class: "n" }, String(S.findings.size)), el("div", { class: "l" }, "确认漏洞")),
+        el("div", { class: "stat" }, el("div", { class: "n" }, String(S.findings.size)), el("div", { class: "l" }, "漏洞条目")),
+        el("div", { class: "stat" }, el("div", { class: "n" }, String(qualityCount)), el("div", { class: "l" }, "质量问题")),
         el("div", { class: "stat" }, el("div", { class: "n" }, String(agentCount)), el("div", { class: "l" }, "agent 调用")),
         el("div", { class: "stat" }, el("div", { class: "n" }, fmtTok(S.usage.total_tokens)), el("div", { class: "l" }, "总 token"))));
       return;
@@ -508,8 +519,9 @@ function viewDashboard(runId) {
         el("span", { class: "muted" }, `模式 ${cfg.run_mode === "history_only" ? "仅历史" : "完整"} · 后端 ${esc(cfg.backend || "?")} · 威胁 ${esc(cfg.threat_model || "?")}`)),
       el("div", { class: "muted" }, `轮 ${S.round}/${cfg.max_rounds ?? "?"} · dry ${S.dry} · 用时 ${elapsed}s`)));
     const stats = el("div", { class: "stats" },
-      el("div", { class: "stat" }, el("div", { class: "n" }, String(suspectedCount)), el("div", { class: "l" }, "疑似漏洞")),
+      el("div", { class: "stat" }, el("div", { class: "n" }, String(suspectedCount)), el("div", { class: "l" }, "漏洞条目")),
       el("div", { class: "stat" }, el("div", { class: "n" }, String(manualConfirmed)), el("div", { class: "l" }, "确认漏洞")),
+      el("div", { class: "stat" }, el("div", { class: "n" }, String(qualityCount)), el("div", { class: "l" }, "质量问题")),
       el("div", { class: "stat" }, el("div", { class: "n" }, fmtPct(manualConfirmed, suspectedCount)), el("div", { class: "l" }, "准确率")),
       ...SEVS.map(s => el("div", { class: "stat" }, el("div", { class: "n", style: "color:var(--" + (s === "critical" ? "crit" : s === "high" ? "high" : s === "medium" ? "med" : s === "low" ? "low" : "info") + ")" }, String(bySev[s] || 0)), el("div", { class: "l" }, s))),
       el("div", { class: "stat" }, el("div", { class: "n" }, String(S.candidates)), el("div", { class: "l" }, "候选")),
@@ -642,6 +654,7 @@ function viewDashboard(runId) {
   function jumpToCandidate(c) {
     if (!c) return;
     if (c.status === "confirmed" && c.id) return jumpToFinding(c.id);
+    if (c.status === "suppressed_unproven" && c.id) return jumpToFinding(c.id);
     if (c.status === "rejected") return jumpToNonIssue(c.key || candKeyOf(c));
     showTab("candidates", { type: "candidate", key: c.key || candKeyOf(c) });
   }
@@ -869,6 +882,7 @@ function viewDashboard(runId) {
       const head = el("div", { class: "head" }, sevPill(f.corrected_severity),
         el("span", { class: "title" }, f.title || f.id),
         el("span", { class: "muted" }, f.bug_class || ""),
+        tagPills(f),
         el("span", { class: "loc" }, `${f.file || ""}:${f.line || 0}`),
         el("span", { class: "muted output-time" }, `输出 ${fmtTs(outputTs)}`),
         renderFindingFeedback(f),
@@ -895,6 +909,8 @@ function viewDashboard(runId) {
             const attrBits = [];
             if (full.output_ts) attrBits.push("<strong>输出时间:</strong> " + esc(fmtTs(full.output_ts)));
             if (full.audit_model) attrBits.push("<strong>审计模型:</strong> " + esc(full.audit_model));
+            if ((full.tags || []).length) attrBits.push("<strong>标签:</strong> " + esc((full.tags || []).join("、")));
+            if (full.finding_status) attrBits.push("<strong>条目状态:</strong> " + esc(full.finding_status));
             if (voteTxt) attrBits.push("<strong>验证裁决:</strong> " + esc(voteTxt));
             else if ((full.verify_models || []).length) attrBits.push("<strong>验证模型:</strong> " + esc(full.verify_models.join("、")));
             if (attrBits.length) body.prepend(el("p", { class: "model-attr", html: "🧠 " + attrBits.join("　|　") }));
@@ -916,7 +932,7 @@ function viewDashboard(runId) {
 
   const CAND_STATUS_TXT = {
     pending: "验证中", confirmed: "已确认", rejected: "已否决", verify_failed: "验证失败",
-    suppressed_unproven: "证据不足压制", promoted_to_risk: "转风险", needs_manual_review: "待人工复核"
+    suppressed_unproven: "编码质量问题", needs_manual_review: "待人工复核"
   };
   function candPill(s) { return el("span", { class: "pill cand-" + cssKey(s) }, CAND_STATUS_TXT[s] || s || "?"); }
   function candKeyOf(d) {
@@ -925,7 +941,7 @@ function viewDashboard(runId) {
   const CAND_FIELDS = ["title", "bug_class", "file", "line", "lens", "severity", "function", "description",
     "source_to_sink", "variant_of", "confidence", "audit_model", "good_validation_ref", "risk_id", "risk_area",
     "epistemic_verdict", "operational_decision", "decision_reason", "residual_uncertainty", "recommended_next_action",
-    "risk_note"];
+    "risk_note", "id", "corrected_severity", "tags", "finding_status"];
   function mergeCandidateFields(c, d) {
     for (const k of CAND_FIELDS) {
       if (d[k] !== undefined && d[k] !== null && d[k] !== "") c[k] = d[k];
@@ -975,8 +991,9 @@ function viewDashboard(runId) {
   }
   function candidateActionLabel(c) {
     if (c.status === "confirmed" && c.id) return "查看漏洞";
+    if (c.status === "suppressed_unproven" && c.id) return "查看漏洞条目";
     if (c.status === "rejected") return "查看非问题";
-    if (["suppressed_unproven", "promoted_to_risk", "needs_manual_review", "verify_failed"].includes(c.status)) return "查看候选";
+    if (["suppressed_unproven", "needs_manual_review", "verify_failed"].includes(c.status)) return "查看候选";
     return "定位候选";
   }
   function candidateSummaryLine(c) {
@@ -1063,7 +1080,7 @@ function viewDashboard(runId) {
     return statusChips(current, items, onPick);
   }
   const CAND_FILTERS = [["all", "全部"], ["pending", "验证中"], ["needs_manual_review", "待人工复核"],
-    ["promoted_to_risk", "转风险"], ["suppressed_unproven", "证据不足压制"], ["confirmed", "已确认"],
+    ["suppressed_unproven", "编码质量问题"], ["confirmed", "已确认"],
     ["rejected", "已否决"], ["verify_failed", "验证失败"]];
   function candStatusFilterBar(counts) {
     const bar = el("div", { class: "filter-bar row", style: "gap:6px;margin-top:8px;flex-wrap:wrap" });
@@ -1088,7 +1105,7 @@ function viewDashboard(runId) {
     }
     const all = [...S.candidateMap.values()];
     const counts = { all: all.length, pending: 0, confirmed: 0, rejected: 0, verify_failed: 0,
-      suppressed_unproven: 0, promoted_to_risk: 0, needs_manual_review: 0 };
+      suppressed_unproven: 0, needs_manual_review: 0 };
     for (const c of all) if (counts[c.status] !== undefined) counts[c.status]++;
     // 若跳转目标被当前筛选隐藏,自动切回「全部」以保证能定位到。
     const focusKey = pendingFocus?.type === "candidate" ? pendingFocus.key : null;
@@ -1099,14 +1116,14 @@ function viewDashboard(runId) {
     tabBody.append(el("div", { class: "panel" },
       el("div", { class: "row", style: "justify-content:space-between" },
         el("strong", {}, "漏洞候选点"),
-        el("span", { class: "muted" }, `共 ${counts.all} · 验证中 ${counts.pending} · 待复核 ${counts.needs_manual_review} · 转风险 ${counts.promoted_to_risk} · 已确认 ${counts.confirmed} · 已否决 ${counts.rejected}`)),
+        el("span", { class: "muted" }, `共 ${counts.all} · 验证中 ${counts.pending} · 待复核 ${counts.needs_manual_review} · 编码质量 ${counts.suppressed_unproven} · 已确认 ${counts.confirmed} · 已否决 ${counts.rejected}`)),
       el("p", { class: "muted", style: "margin:6px 0 0;font-size:12px" },
         "候选点 = 审计/复查 agent 报出、进入 witness/blocker 对抗验证流水线中的疑点;验证后会升级为漏洞、非问题、风险种子或人工复核项。"),
       candStatusFilterBar(counts)));
     if (!all.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无候选点(审计开始后会实时出现)。")); return; }
     const list = candStatusFilter === "all" ? all : all.filter(c => c.status === candStatusFilter);
     if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "当前筛选下暂无候选点。")); return; }
-    const rank = { pending: 0, needs_manual_review: 1, promoted_to_risk: 2, suppressed_unproven: 3, verify_failed: 4, confirmed: 5, rejected: 6 };
+    const rank = { pending: 0, needs_manual_review: 1, suppressed_unproven: 2, verify_failed: 3, confirmed: 4, rejected: 5 };
     list.sort((a, b) =>
       (rank[a.status] ?? 9) - (rank[b.status] ?? 9) ||
       (SEVS.indexOf(a.severity) - SEVS.indexOf(b.severity)) ||
@@ -1125,6 +1142,7 @@ function viewDashboard(runId) {
         details.append(
           detailLine("终局决策", c.operational_decision || c.status),
           detailLine("证据结论", c.epistemic_verdict),
+          detailLine("标签", issueTags(c).join("、")),
           detailLine("决策理由", c.decision_reason || c.rejection_reason || c.reason, true),
           detailLine("剩余不确定性", c.residual_uncertainty, true),
           detailLine("建议动作", c.recommended_next_action, true),
@@ -1138,6 +1156,8 @@ function viewDashboard(runId) {
         ? linkButton(String(c.id), () => jumpToCandidate(c), "查看漏洞")
         : c.status === "rejected"
           ? linkButton("非问题", () => jumpToCandidate(c), "查看非问题")
+        : c.status === "suppressed_unproven" && c.id
+          ? linkButton(String(c.id), () => jumpToCandidate(c), "查看漏洞页质量问题条目")
         : el("span", { class: "muted" }, "—");
       tb.append(el("tr", { class: "cand-row cand-" + cssKey(c.status), "data-cand-key": c.key || candKeyOf(c) },
         el("td", {}, candPill(c.status)),
@@ -2179,6 +2199,18 @@ function viewDashboard(runId) {
         S.candidateTotal = Math.max(S.candidateTotal || 0, S.candidateMap.size, S.candidates || 0);
         renderHeader(); renderTabs(); if (activeTab === "findings" || activeTab === "candidates" || activeTab === "nonissues") renderTab(); break;
       }
+      case "finding_added": {
+        if (!d.output_ts && ev.ts) d.output_ts = ev.ts / 1000;
+        if (d.id) S.findings.set(d.id, d);
+        const ca = upsertCandidate(d);
+        ca.id = d.id || ca.id;
+        ca.status = d.operational_decision || ca.status;
+        ca.finding_status = d.finding_status || ca.finding_status;
+        ca.tags = d.tags || ca.tags || [];
+        ca.corrected_severity = d.corrected_severity || ca.corrected_severity;
+        flash("漏洞条目 " + (d.id || "?") + (isQualityFinding(d) ? " [" + QUALITY_FINDING_TAG + "]" : ""));
+        renderHeader(); renderTabs(); if (activeTab === "findings" || activeTab === "candidates") renderTab(); break;
+      }
       case "finding_rejected": {
         const existed = S.nonIssueMap.has(candKeyOf(d));
         upsertNonIssue(d);
@@ -2343,7 +2375,7 @@ function viewDashboard(runId) {
     // 首屏由 snapshot 提供完整关键数据;SSE 只接 snapshot 之后的新事件。
     const es = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events?last_id=${encodeURIComponent(lastSeq)}`);
     window._es = es;
-    const TYPES = ["run_status", "metrics", "usage", "agent_update", "candidate_found", "finding_confirmed", "finding_rejected", "candidate_failed", "candidate_decided", "risk_added", "recheck_enqueued", "recheck_done", "risk_severity_changed", "surface_added", "coverage_update", "round_start", "round_done", "recon_done", "history_added", "run_done", "log", "decompose_done", "poc_done", "error", "model_health", "health_check_start", "health_check_done", "config_updated"];
+    const TYPES = ["run_status", "metrics", "usage", "agent_update", "candidate_found", "finding_confirmed", "finding_added", "finding_rejected", "candidate_failed", "candidate_decided", "risk_added", "recheck_enqueued", "recheck_done", "risk_severity_changed", "surface_added", "coverage_update", "round_start", "round_done", "recon_done", "history_added", "run_done", "log", "decompose_done", "poc_done", "error", "model_health", "health_check_start", "health_check_done", "config_updated"];
     for (const t of TYPES) es.addEventListener(t, (e) => { try { applyEvent(JSON.parse(e.data)); } catch (_) {} });
     es.onerror = () => { /* EventSource 自动重连 */ };
   }

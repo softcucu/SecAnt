@@ -461,8 +461,7 @@ class PromptBuilder:
             "决策口径:\n"
             "- confirmed: witness 被基本验证,且没有 verified global blocker;\n"
             "- rejected: blocker 被验证为 global/decisive,或坏条件在合法输入/状态/代码约束下不可满足;\n"
-            "- suppressed_unproven: witness 不完整,blocker 也不决定性,低/中风险且不值得作为风险种子继续追;\n"
-            "- promoted_to_risk: witness 不完整,但存在可复用风险模式、调用方约束分散、边界不清或值得变体排查的危险原语;\n"
+            "- suppressed_unproven: witness 不完整,blocker 也不决定性,证据不足以确认或否决;系统会作为编码质量问题保留到漏洞页;\n"
             "- needs_manual_review: high/critical 潜在影响且证据冲突,补查后仍无法闭合。\n"
             "同时输出 epistemic_verdict(proven_real/proven_false/unresolved)。不要用 unknown 作为 operational_decision。"
             + must_struct(schema)

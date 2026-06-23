@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 from proto_vuln_hunt import events as EV
-from proto_vuln_hunt.common import finding_key
+from proto_vuln_hunt.common import QUALITY_FINDING_STATUS, QUALITY_FINDING_TAG, finding_key
 from proto_vuln_hunt.config import Config
 from proto_vuln_hunt.pipeline import Pipeline
 from proto_vuln_hunt.store import RunStore
@@ -175,8 +175,6 @@ def _final(decision="confirmed", sev="high", **over):
             "recommended_next_action": "后续变体排查",
             "reasoning": "不确认也不强否决",
         }
-        if decision == "promoted_to_risk":
-            v["risk_note"] = "共享 helper 依赖调用方校验,值得变体排查"
         if decision == "needs_manual_review":
             v["final_reason"] = "高危潜在影响但正反证据冲突"
     v.update(over)
@@ -258,8 +256,8 @@ class TestAdversarialVerify(_PipelineTestBase):
         self.assertEqual(len(cands), 1)
         self.assertEqual(cands[0]["status"], "rejected")
 
-    async def test_suppressed_unproven_is_terminal_candidate(self):
-        """witness 不完整 + blocker 不决定性 + 终局压制 → 不回队、不确认。"""
+    async def test_suppressed_unproven_records_quality_finding(self):
+        """witness 不完整 + blocker 不决定性 + 终局压制 → 漏洞页质量问题条目。"""
         p = self.make_pipeline(verify_votes=3)
         p.runner.verify_responses = [
             _witness(False),
@@ -271,32 +269,24 @@ class TestAdversarialVerify(_PipelineTestBase):
         f = _finding()
         await p.process_finding(f)
 
-        self.assertEqual(p.confirmed, [])
+        self.assertEqual(len(p.confirmed), 1)
         self.assertIn(finding_key(f), p.processed_keys)
         self.assertEqual(p.pending_findings, {})
         self.assertEqual(f["verify_status"], "suppressed_unproven")
+        self.assertEqual(p.risk_notes, [])
         self.assertNotIn(EV.CANDIDATE_FAILED, self._event_types(p))
+        self.assertIn(EV.FINDING_ADDED, self._event_types(p))
         self.assertIn(EV.CANDIDATE_DECIDED, self._event_types(p))
-        self.assertEqual(p.store.load_candidates()[0]["status"], "suppressed_unproven")
-
-    async def test_promoted_to_risk_records_risk(self):
-        """终局 promoted_to_risk → 候选终态 + 风险登记。"""
-        p = self.make_pipeline(verify_votes=3)
-        p.runner.verify_responses = [
-            _witness(False),
-            _blocker(False),
-            _witness_review("inconclusive"),
-            _blocker_review("unknown_scope"),
-            _final("promoted_to_risk"),
-        ]
-        f = _finding()
-        await p.process_finding(f)
-
-        self.assertEqual(p.confirmed, [])
-        self.assertIn(finding_key(f), p.processed_keys)
-        self.assertEqual(p.store.load_candidates()[0]["status"], "promoted_to_risk")
-        self.assertEqual(len(p.risk_notes), 1)
-        self.assertIn("共享 helper", p.risk_notes[0]["note"])
+        finding = p.store.load_findings()[0]
+        self.assertEqual(finding["id"], "QUAL-001")
+        self.assertEqual(finding["finding_status"], QUALITY_FINDING_STATUS)
+        self.assertIn(QUALITY_FINDING_TAG, finding["tags"])
+        self.assertEqual(finding["corrected_severity"], "info")
+        self.assertIn("编码质量问题", finding["report_body"])
+        cand = p.store.load_candidates()[0]
+        self.assertEqual(cand["status"], "suppressed_unproven")
+        self.assertEqual(cand["id"], "QUAL-001")
+        self.assertIn(QUALITY_FINDING_TAG, cand["tags"])
 
     async def test_high_conflict_needs_manual_review_is_terminal(self):
         """高危冲突无法闭合 → needs_manual_review 终态,不确认不否决。"""

@@ -5,6 +5,8 @@ import re
 from typing import Any, Dict, List, Optional
 
 SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+QUALITY_FINDING_STATUS = "unproven_quality_issue"
+QUALITY_FINDING_TAG = "编码质量问题"
 
 LEDGER_STATUS = {
     "decomposed": "🧩 已拆解为子任务", "completed-clean": "✅ 已完成(未发现)",
@@ -82,7 +84,27 @@ def slim_finding(c: Dict[str, Any]) -> Dict[str, Any]:
         "audit_model": c.get("audit_model") or "", "verify_models": c.get("verify_models") or [],
         "output_ts": c.get("output_ts") or c.get("confirmed_at") or c.get("created_at") or 0,
         "manual_feedback": c.get("manual_feedback") or {},
+        "tags": c.get("tags") if isinstance(c.get("tags"), list) else [],
+        "finding_status": c.get("finding_status") or "",
+        "verification_status": c.get("verification_status") or "",
+        "original_severity": c.get("original_severity") or "",
+        "epistemic_verdict": c.get("epistemic_verdict") or "",
+        "operational_decision": c.get("operational_decision") or "",
+        "decision_reason": c.get("decision_reason") or "",
+        "residual_uncertainty": c.get("residual_uncertainty") or "",
+        "recommended_next_action": c.get("recommended_next_action") or "",
     }
+
+
+def finding_tags(c: Dict[str, Any]) -> List[str]:
+    tags = c.get("tags")
+    if not isinstance(tags, list):
+        return []
+    return [str(t) for t in tags if str(t).strip()]
+
+
+def is_quality_issue_finding(c: Dict[str, Any]) -> bool:
+    return c.get("finding_status") == QUALITY_FINDING_STATUS or QUALITY_FINDING_TAG in finding_tags(c)
 
 
 def finalize_findings(confirmed: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -92,7 +114,11 @@ def finalize_findings(confirmed: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         sev = c.get("corrected_severity") or c.get("severity")
         lk = f"{(c.get('file') or '').strip()}::{c.get('line') or 0}::{(c.get('bug_class') or '').strip().lower()}"
         ex = loc_seen.get(lk)
-        if not ex or SEV_RANK.get(sev, 9) < SEV_RANK.get(ex.get("corrected_severity") or ex.get("severity"), 9):
+        cur_rank = (1 if is_quality_issue_finding(c) else 0, SEV_RANK.get(sev, 9))
+        ex_sev = (ex.get("corrected_severity") or ex.get("severity")) if ex else None
+        ex_rank = (1 if ex and is_quality_issue_finding(ex) else 0, SEV_RANK.get(ex_sev, 9))
+        if not ex or cur_rank < ex_rank:
             loc_seen[lk] = c
     return sorted(loc_seen.values(),
-                  key=lambda c: SEV_RANK.get(c.get("corrected_severity") or c.get("severity"), 9))
+                  key=lambda c: (1 if is_quality_issue_finding(c) else 0,
+                                 SEV_RANK.get(c.get("corrected_severity") or c.get("severity"), 9)))

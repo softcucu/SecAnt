@@ -206,6 +206,30 @@ class SnapshotMigrationTests(unittest.TestCase):
             self.assertEqual(cands[0]["vote_false"], 2)
             self.assertEqual(store.load_candidates()[0]["status"], "rejected")
 
+    def test_finding_added_event_keeps_suppressed_candidate_status(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = RunStore(td).ensure()
+            store.append_event({"seq": 1, "ts": 0, "type": EV.CANDIDATE_FOUND, "data": {
+                "key": "a.c::10::memory", "title": "t", "bug_class": "memory",
+                "file": "a.c", "line": 10, "severity": "high",
+            }})
+            store.append_event({"seq": 2, "ts": 0, "type": EV.FINDING_ADDED, "data": {
+                "id": "QUAL-001", "title": "t", "bug_class": "memory",
+                "file": "a.c", "line": 10, "corrected_severity": "info",
+                "finding_status": "unproven_quality_issue", "tags": ["编码质量问题"],
+            }})
+            store.append_event({"seq": 3, "ts": 0, "type": EV.CANDIDATE_DECIDED, "data": {
+                "key": "a.c::10::memory", "title": "t", "bug_class": "memory",
+                "file": "a.c", "line": 10, "status": "suppressed_unproven",
+                "id": "QUAL-001", "finding_status": "unproven_quality_issue", "tags": ["编码质量问题"],
+            }})
+
+            cands = _candidate_snapshot_from_events(store)
+            self.assertEqual(len(cands), 1)
+            self.assertEqual(cands[0]["status"], "suppressed_unproven")
+            self.assertEqual(cands[0]["id"], "QUAL-001")
+            self.assertIn("编码质量问题", cands[0]["tags"])
+
 
 if __name__ == "__main__":
     unittest.main()

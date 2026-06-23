@@ -97,15 +97,14 @@ global_decisive | partial | invalid | unknown_scope
 
 ```text
 epistemic_verdict: proven_real | proven_false | unresolved
-operational_decision: confirmed | rejected | suppressed_unproven | promoted_to_risk | needs_manual_review
+operational_decision: confirmed | rejected | suppressed_unproven | needs_manual_review
 ```
 
 ## 3. 工程决策
 
 - `confirmed`: witness 被基本验证，且没有 verified global blocker。进入漏洞报告 / PoC 流程。
 - `rejected`: blocker 被验证为 global / decisive，或坏条件在合法输入、状态、代码约束下不可满足。进入非问题。
-- `suppressed_unproven`: witness 不完整，blocker 也不决定性，且风险价值不足。不输出漏洞。
-- `promoted_to_risk`: witness 不完整，但存在可复用风险模式、调用方约束分散、边界不清或值得变体排查的危险原语。登记为 risk note。
+- `suppressed_unproven`: witness 不完整，blocker 也不决定性，证据不足以确认或否决。作为漏洞页条目保留，但打 `编码质量问题` 标签，Web 展示为编码质量问题。
 - `needs_manual_review`: high/critical 潜在影响且正反证据冲突，终局补查仍无法闭合。作为人工复核候选保留。
 
 验证失败只用于终局裁判无结构化输出、工程决策无效、CLI/解析持续失败等流水线异常；证据未闭合不再简单落到 `verify_failed`。
@@ -142,4 +141,4 @@ Web、候选 JSON、finding JSON 和 Markdown 导出都会展示 witness、block
 | `proto_vuln_hunt/pipeline.py` | 编排五阶段验证、终态保存、risk/manual/suppressed 流转 |
 | `proto_vuln_hunt/exporters.py` | Markdown 导出验证记录 |
 | `proto_vuln_hunt/web/static/app.js` | Web 展示新状态与验证详情 |
-| `proto_vuln_hunt/tests/test_pipeline_verify.py` | 单元测试覆盖确认、否决、压制、转风险、人工复核与失败重试 |
+| `proto_vuln_hunt/tests/test_pipeline_verify.py` | 单元测试覆盖确认、否决、编码质量问题、人工复核与失败重试 |

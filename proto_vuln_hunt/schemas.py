@@ -248,11 +248,10 @@ FINAL_ADJUDICATION_SCHEMA = {
     "required": ["epistemic_verdict", "operational_decision", "reasoning"],
     "properties": {
         "epistemic_verdict": {"type": "string", "enum": ["proven_real", "proven_false", "unresolved"], "description": "证据层结论"},
-        "operational_decision": {"type": "string", "enum": ["confirmed", "rejected", "suppressed_unproven", "promoted_to_risk", "needs_manual_review"], "description": "流水线工程决策"},
+        "operational_decision": {"type": "string", "enum": ["confirmed", "rejected", "suppressed_unproven", "needs_manual_review"], "description": "流水线工程决策"},
         "deciding_facts_checked": {"type": "array", "items": {"type": "string"}, "description": "第 5 agent 定向补查的 1-2 个关键事实,path:line + 说明优先"},
         "final_reason": {"type": "string", "description": "最终工程决策理由"},
         "rejection_reason": {"type": "string", "description": "operational_decision=rejected 时的非问题原因"},
-        "risk_note": {"type": "string", "description": "operational_decision=promoted_to_risk 时写入风险登记的说明"},
         "residual_uncertainty": {"type": "string"},
         "why_not_confirmed": {"type": "string"},
         "why_not_rejected": {"type": "string"},

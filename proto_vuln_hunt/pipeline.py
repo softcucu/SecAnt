@@ -22,8 +22,9 @@ from . import events as EV
 from . import exporters as export
 from . import schemas as S
 from .backends import AgentRunner
-from .common import (class_code, finalize_findings, finding_key, item_key,
-                     most_severe, pad3, slim_finding)
+from .common import (QUALITY_FINDING_STATUS, QUALITY_FINDING_TAG, class_code,
+                     finalize_findings, finding_key, is_quality_issue_finding,
+                     item_key, most_severe, pad3, slim_finding)
 from .config import RUN_MODE_HISTORY_ONLY, Config, normalize_model_time_windows_with_errors, normalize_models
 from .prompts import PromptBuilder
 from .store import RunStore, STATUS_DONE, STATUS_ERROR, STATUS_INCOMPLETE, STATUS_RUNNING, STATUS_STOPPED
@@ -31,7 +32,7 @@ from .store import RunStore, STATUS_DONE, STATUS_ERROR, STATUS_INCOMPLETE, STATU
 _CODE_REF_RE = re.compile(r"\S+:\d+")
 _SOURCE_EXTS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inc", ".ipp", ".s", ".S"}
 _COUNT_SKIP_DIRS = {".git", ".proto-vuln-hunt", "pvh-runs"}
-_FINAL_DECISIONS = {"confirmed", "rejected", "suppressed_unproven", "promoted_to_risk", "needs_manual_review"}
+_FINAL_DECISIONS = {"confirmed", "rejected", "suppressed_unproven", "needs_manual_review"}
 
 
 def _noop_emit(etype: str, data: Optional[Dict[str, Any]] = None, persist: bool = True) -> None:
@@ -287,8 +288,12 @@ class Pipeline:
         for c in self.confirmed:
             sev = c.get("corrected_severity") or c.get("severity")
             by_sev[sev] = by_sev.get(sev, 0) + 1
+        quality_issues = sum(1 for c in self.confirmed if is_quality_issue_finding(c))
+        confirmed_real = max(0, len(self.confirmed) - quality_issues)
         return {
-            "rounds": rnd, "confirmed": len(self.confirmed), "candidates": len(self.dedup_keys),
+            "rounds": rnd, "confirmed": confirmed_real, "finding_entries": len(self.confirmed),
+            "candidates": len(self.dedup_keys),
+            "quality_issues": quality_issues,
             "by_severity": by_sev, "risks": len(self.risk_notes), "surfaces": len(self.surface_log),
             "agents_spawned": self.runner.agent_count, "elapsed_s": round(time.time() - self._started, 1),
             "token_usage": dict(self.runner.usage_totals),
@@ -960,8 +965,6 @@ class Pipeline:
             "vote_false": 0,
             "vote_real": 0,
         }
-        if final.get("risk_note"):
-            payload["risk_note"] = final.get("risk_note")
         return payload
 
     def _slim_verify_votes(self, votes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1013,7 +1016,6 @@ class Pipeline:
             "why_not_confirmed": v.get("why_not_confirmed") or "",
             "why_not_rejected": v.get("why_not_rejected") or "",
             "recommended_next_action": v.get("recommended_next_action") or "",
-            "risk_note": v.get("risk_note") or "",
         } for v in votes]
 
     @staticmethod
@@ -1027,6 +1029,73 @@ class Pipeline:
         s = cls._text(v)
         return [s] if s else []
 
+    def _quality_finding_report_body(self, f: Dict[str, Any], final: Dict[str, Any],
+                                     decision: str) -> str:
+        facts = self._text_list(final.get("deciding_facts_checked"))
+        reason = (final.get("final_reason") or final.get("reasoning")
+                  or "对抗验证后未能闭合漏洞证据").strip()
+        uncertainty = (final.get("residual_uncertainty") or "缺少足够证据证明该候选是真实可利用漏洞").strip()
+        next_action = (final.get("recommended_next_action") or "按编码质量问题处理,后续结合人工代码审查补证").strip()
+        decision_text = "证据不足压制" if decision == "suppressed_unproven" else decision
+        lines = [
+            "## ① 漏洞描述",
+            f.get("description") or f.get("title") or "(无)",
+            "",
+            "## ② 对抗验证结论",
+            "该候选经过 witness/blocker 对抗验证后未达到确认漏洞的证据门槛,也未被全局 blocker 彻底证伪。"
+            f"终局工程决策为「{decision_text}」,因此保留到漏洞页,但标记为「{QUALITY_FINDING_TAG}」。",
+            "",
+            "## ③ 判定原因",
+            reason,
+            "",
+            "## ④ 剩余不确定性",
+            uncertainty,
+            "",
+            "## ⑤ 建议处理",
+            next_action,
+        ]
+        if facts:
+            lines.extend(["", "## ⑥ 已检查事实", *[f"- {x}" for x in facts]])
+        return "\n".join(lines).strip() + "\n"
+
+    def _record_quality_finding(self, f: Dict[str, Any], votes: List[Dict[str, Any]],
+                                final: Dict[str, Any], decision: str) -> Dict[str, Any]:
+        self.seq += 1
+        fid = f"QUAL-{pad3(self.seq)}"
+        verify_models = sorted({v.get("model") for v in votes if v.get("model")})
+        decision_reason = (final.get("final_reason") or final.get("reasoning")
+                           or final.get("residual_uncertainty") or "").strip()
+        raw_tags = f.get("tags")
+        tags = list(raw_tags) if isinstance(raw_tags, list) else ([str(raw_tags)] if raw_tags else [])
+        if QUALITY_FINDING_TAG not in tags:
+            tags.append(QUALITY_FINDING_TAG)
+        rec = {
+            **f,
+            "id": fid,
+            "corrected_severity": "info",
+            "original_severity": f.get("severity") or "",
+            "confidence": f.get("confidence") or "low",
+            "votes": votes,
+            "verify_models": verify_models,
+            "tags": tags,
+            "finding_status": QUALITY_FINDING_STATUS,
+            "verification_status": decision,
+            "epistemic_verdict": final.get("epistemic_verdict") or "unresolved",
+            "operational_decision": decision,
+            "decision_reason": decision_reason,
+            "residual_uncertainty": final.get("residual_uncertainty") or "",
+            "recommended_next_action": final.get("recommended_next_action") or "",
+            "report_body": self._quality_finding_report_body(f, final, decision),
+            "report_failed": False,
+            "poc": None,
+            "output_ts": time.time(),
+        }
+        self.confirmed.append(rec)
+        self.store.save_finding(rec)
+        self.emit(EV.FINDING_ADDED, slim_finding(rec))
+        self.log(f"候选 {fid} 已作为{QUALITY_FINDING_TAG}记录到漏洞页({decision}): {rec.get('title')}")
+        return rec
+
     @classmethod
     def _has_code_ref(cls, v: Any) -> bool:
         return any(_CODE_REF_RE.search(x) for x in cls._text_list(v))
@@ -1038,7 +1107,7 @@ class Pipeline:
             return "confirm"
         if op == "rejected":
             return "reject"
-        if op in ("suppressed_unproven", "promoted_to_risk", "needs_manual_review"):
+        if op in ("suppressed_unproven", "needs_manual_review"):
             return "inconclusive"
         d = (v.get("decision") or "").strip().lower()
         if d in ("confirm", "reject", "inconclusive"):
@@ -1221,9 +1290,6 @@ class Pipeline:
         if decision == "rejected" and not cls._text(final.get("rejection_reason") or final.get("final_reason")
                                                     or final.get("reasoning")):
             missing.append("rejected 缺少 rejection_reason")
-        if decision == "promoted_to_risk" and not cls._text(final.get("risk_note") or final.get("recommended_next_action")
-                                                           or final.get("reasoning")):
-            missing.append("promoted_to_risk 缺少 risk_note/next_action")
         return missing
 
     @staticmethod
@@ -1386,24 +1452,20 @@ class Pipeline:
                 self.emit(EV.FINDING_REJECTED, payload)
                 return
 
-            if decision in ("suppressed_unproven", "promoted_to_risk", "needs_manual_review"):
+            if decision in ("suppressed_unproven", "needs_manual_review"):
                 self.processed_keys.add(k)
                 self.pending_findings.pop(k, None)
                 f["verify_status"] = decision
-                if decision == "promoted_to_risk":
-                    risk_note = (final_vote.get("risk_note") or final_vote.get("recommended_next_action")
-                                 or final_vote.get("final_reason") or final_vote.get("reasoning") or "").strip()
-                    if risk_note:
-                        before = len(self.risk_notes)
-                        self.record_risk({
-                            "area": f.get("risk_area") or f.get("title") or f.get("bug_class") or "验证后风险",
-                            "note": risk_note,
-                            "file": f.get("file") or "",
-                            "severity_hint": final_vote.get("corrected_severity") or f.get("severity") or "medium",
-                        }, f.get("lens") or "unknown", self.round)
-                        if len(self.risk_notes) > before:
-                            f["risk_id"] = self.risk_notes[-1].get("id")
+                quality_rec: Optional[Dict[str, Any]] = None
+                if decision == "suppressed_unproven":
+                    quality_rec = self._record_quality_finding(f, votes, final_vote, decision)
+                    f["quality_finding_id"] = quality_rec.get("id")
                 payload = self._candidate_decision_payload(f, decision, votes, final_vote)
+                if quality_rec:
+                    payload["id"] = quality_rec.get("id")
+                    payload["finding_status"] = quality_rec.get("finding_status")
+                    payload["tags"] = quality_rec.get("tags") or []
+                    payload["corrected_severity"] = quality_rec.get("corrected_severity")
                 self._save_candidate_state(payload)
                 self.emit(EV.CANDIDATE_DECIDED, payload)
                 self.log(f"候选 {k} 终局决策:{decision} {f.get('title')}")
@@ -1452,7 +1514,8 @@ class Pipeline:
                     "verify_models": verify_models}
             self._save_candidate_state(cand)
             self.emit(EV.FINDING_CONFIRMED, slim_finding(rec))
-            self.log(f"✔ 确认漏洞 {fid} [{corrected}] {rec.get('title')} (累计 {len(self.confirmed)})")
+            confirmed_real = sum(1 for c in self.confirmed if not is_quality_issue_finding(c))
+            self.log(f"✔ 确认漏洞 {fid} [{corrected}] {rec.get('title')} (累计 {confirmed_real})")
         except Exception as e:  # noqa: BLE001
             self.log(f"⚠ process_finding 异常,候选验证稍后重试: {str(e)[:140]}")
             try:
@@ -1698,7 +1761,9 @@ class Pipeline:
             self.history_done.update(ckpt.get("historyDone") or [])
             self._enqueue_failed_rechecks()
             self.build_hint = self.surface_data.get("build_hint") or ""
-            self.log(f"♻ 从断点恢复:已完成 {self.start_round} 轮,确认 {len(self.confirmed)} 条,待审队列 {len(self.queue)} 项,"
+            quality_issues = sum(1 for c in self.confirmed if is_quality_issue_finding(c))
+            confirmed_real = max(0, len(self.confirmed) - quality_issues)
+            self.log(f"♻ 从断点恢复:已完成 {self.start_round} 轮,确认 {confirmed_real} 条,质量问题 {quality_issues} 条,待审队列 {len(self.queue)} 项,"
                      f"在途候选 {len(self.pending_findings)} 条,已处理 {len(self.processed_keys)} 个,已完成攻击面 {len(self.completed_items)} 个")
             self.emit(EV.RECON_DONE, {"resumed": True, "regions": len(self.regions), "history": len(self.history),
                                       "purpose": self.surface_data.get("purpose"),
@@ -2108,7 +2173,9 @@ class Pipeline:
         await asyncio.gather(*self.in_flight, return_exceptions=True)
         self.checkpoint(self.round)
         self.emit_coverage()
-        self.log(f"流水线排空完成:确认 {len(self.confirmed)} 条漏洞,候选去重池 {len(self.dedup_keys)} 条,"
+        quality_issues = sum(1 for c in self.confirmed if is_quality_issue_finding(c))
+        confirmed_real = max(0, len(self.confirmed) - quality_issues)
+        self.log(f"流水线排空完成:确认 {confirmed_real} 条漏洞,质量问题 {quality_issues} 条,候选去重池 {len(self.dedup_keys)} 条,"
                  f"潜在风险 {len(self.risk_notes)} 条,动态攻击面 {len(self.surface_log)} 个。")
         return stop_reason
 
@@ -2402,6 +2469,8 @@ class Pipeline:
     # ──────────────────────── 阶段 ③ 汇总(结构化,无文件写盘) ────────────────────────
     def synthesis(self, stop_reason: str) -> Dict[str, Any]:
         final = finalize_findings(self.confirmed)
+        quality_issues = sum(1 for c in final if is_quality_issue_finding(c))
+        confirmed_real = max(0, len(final) - quality_issues)
         counts: Dict[str, int] = {}
         for c in final:
             counts[c.get("bug_class")] = counts.get(c.get("bug_class"), 0) + 1
@@ -2418,7 +2487,8 @@ class Pipeline:
         summary = {
             **self._summary_snapshot(self.round),
             "converged": converged, "stop_reason": stop_reason, "by_class": counts, "top_severity": top_sev,
-            "confirmed": len(final), "status": status, **incomplete_counts,
+            "confirmed": confirmed_real, "finding_entries": len(final),
+            "quality_issues": quality_issues, "status": status, **incomplete_counts,
         }
         # 收尾:刷机制态 + 攻击面/覆盖快照(漏洞/风险已各自即时落盘),并写最终汇总+状态
         self.store.save_checkpoint(self.build_checkpoint(self.round))
@@ -2440,10 +2510,13 @@ class Pipeline:
             "failed_rechecks": incomplete_counts["failed_rechecks"],
             "agents_spawned": self.runner.agent_count,
             "token_usage": dict(self.runner.usage_totals),
-            "confirmed": len(final), "by_class": counts, "status": status,
+            "confirmed": confirmed_real, "finding_entries": len(final),
+            "quality_issues": quality_issues, "by_class": counts, "status": status,
             "top_findings": [{"id": c.get("id"), "severity": c.get("corrected_severity") or c.get("severity"),
                               "bug_class": c.get("bug_class"), "title": c.get("title"),
-                              "file": c.get("file"), "line": c.get("line", 0)} for c in final[:12]],
+                              "file": c.get("file"), "line": c.get("line", 0),
+                              "tags": c.get("tags") or [],
+                              "finding_status": c.get("finding_status") or ""} for c in final[:12]],
         }
         self.emit(EV.RUN_DONE, summary)
         return result

@@ -245,7 +245,7 @@ def _merge_candidate(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]
         "id", "corrected_severity", "reason", "attempts", "final_sweep", "votes",
         "verify_models", "vote_total", "vote_false", "vote_real", "rejection_reason",
         "epistemic_verdict", "operational_decision", "decision_reason", "residual_uncertainty",
-        "recommended_next_action", "risk_note",
+        "recommended_next_action", "risk_note", "tags", "finding_status",
     ]
     for k in fields:
         v = src.get(k)
@@ -281,12 +281,12 @@ def _response_findings(store: RunStore) -> List[Dict[str, Any]]:
 
 def _candidate_snapshot_from_events(store: RunStore) -> List[Dict[str, Any]]:
     """旧 run 兼容:只重放候选相关事件,迁移成 candidates/*.json 后续直接读结构化态。"""
-    rank = {"pending": 0, "needs_manual_review": 1, "verify_failed": 2, "promoted_to_risk": 3,
-            "suppressed_unproven": 4, "confirmed": 5, "rejected": 6}
+    rank = {"pending": 0, "needs_manual_review": 1, "verify_failed": 2,
+            "suppressed_unproven": 3, "confirmed": 4, "rejected": 5}
     candidates: Dict[str, Dict[str, Any]] = {}
     for ev in store.iter_events(0):
         et = ev.get("type")
-        if et not in (EV.CANDIDATE_FOUND, EV.FINDING_CONFIRMED, EV.FINDING_REJECTED,
+        if et not in (EV.CANDIDATE_FOUND, EV.FINDING_CONFIRMED, EV.FINDING_ADDED, EV.FINDING_REJECTED,
                       EV.CANDIDATE_FAILED, EV.CANDIDATE_DECIDED):
             continue
         d = ev.get("data") or {}
@@ -301,6 +301,8 @@ def _candidate_snapshot_from_events(store: RunStore) -> List[Dict[str, Any]]:
             c["status"] = "confirmed"
             c["id"] = d.get("id") or c.get("id")
             c["severity"] = d.get("corrected_severity") or c.get("severity")
+        elif et == EV.FINDING_ADDED:
+            c["id"] = d.get("id") or c.get("id")
         elif et == EV.FINDING_REJECTED:
             c["status"] = "rejected"
         elif et == EV.CANDIDATE_FAILED:

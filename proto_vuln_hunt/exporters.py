@@ -9,7 +9,7 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 
-from .common import LEDGER_STATUS, SEV_RANK, finalize_findings, sev_to_level
+from .common import LEDGER_STATUS, SEV_RANK, finalize_findings, finding_tags, is_quality_issue_finding, sev_to_level
 
 
 def _scope_note(meta: Dict[str, Any]) -> str:
@@ -288,6 +288,9 @@ def render_finding_md(finding: Dict[str, Any]) -> str:
         "file": finding.get("file"), "line": finding.get("line") or 0,
         "function": finding.get("function"), "confidence": finding.get("confidence"),
         "variant_of": finding.get("variant_of") or "",
+        "tags": finding_tags(finding),
+        "finding_status": finding.get("finding_status") or "",
+        "verification_status": finding.get("verification_status") or "",
     }
     fm_lines = "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False) if isinstance(v, str) else v}" for k, v in fm.items())
     # 仅历史模式:有结构化报告字段时,始终用统一模板现渲染(模板可演进、可重导出)。
@@ -323,6 +326,7 @@ def _index_status_line(summary: Dict[str, Any]) -> str:
 def render_index_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
     sn = _scope_note(meta)
     final = finalize_findings(state.get("confirmed") or [])
+    quality_count = sum(1 for c in final if is_quality_issue_finding(c))
     counts: Dict[str, int] = {}
     for c in final:
         counts[c.get("bug_class")] = counts.get(c.get("bug_class"), 0) + 1
@@ -334,20 +338,21 @@ def render_index_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
         f"# 漏洞挖掘汇总 — {meta.get('target')}{sn}", "",
         f"- 威胁模型: {meta.get('threat_model')}　|　后端: {meta.get('backend')}　|　"
         f"方法库: {'已用(' + str(meta.get('methods_dir')) + ')' if meta.get('methods_ok') else '内联兜底'}",
-        f"- 确认漏洞: {len(final)} 条;最高危等级: {top_sev};审计轮数: {summary.get('rounds', state.get('round', 0))};"
+        f"- 漏洞条目: {len(final)} 条;其中编码质量问题: {quality_count} 条;最高危等级: {top_sev};审计轮数: {summary.get('rounds', state.get('round', 0))};"
         f"候选去重池: {summary.get('candidates', '?')}",
         f"- 收敛: {'是' if summary.get('converged') else '否 —— ' + str(summary.get('stop_reason', ''))}",
         _index_status_line(summary),
         f"- 按 bug_class 计数: {json.dumps(counts, ensure_ascii=False)}", "",
         "## 漏洞索引(severity 从高到低)", "",
-        "| ID | 严重度 | 类型 | 标题 | 位置 | 报告 |", "|---|---|---|---|---|---|",
+        "| ID | 严重度 | 类型 | 标签 | 标题 | 位置 | 报告 |", "|---|---|---|---|---|---|---|",
     ]
     for c in final:
         sev = c.get("corrected_severity") or c.get("severity")
-        lines.append(f"| {c.get('id')} | {sev} | {c.get('bug_class')} | {c.get('title')} | "
+        tags = "、".join(finding_tags(c)) or "—"
+        lines.append(f"| {c.get('id')} | {sev} | {c.get('bug_class')} | {tags} | {c.get('title')} | "
                      f"{c.get('file')}:{c.get('line') or 0} | [findings/{c.get('id')}.md](findings/{c.get('id')}.md) |")
     if not final:
-        lines.append("| — | — | — | (本次未确认漏洞) | — | — |")
+        lines.append("| — | — | — | — | (本次未确认漏洞) | — | — |")
     # 攻击面地图 + 历史模式提要
     lines += ["", "## 攻击面地图(精炼)", ""]
     for r in regions:

@@ -233,6 +233,7 @@ input[type=text],input[type=number],select,textarea{width:100%;background:var(--
 .subtask .smeta{color:var(--muted);font-size:12px;font-family:ui-monospace,Menlo,monospace}
 .pri-high{border-left-color:var(--high)} .pri-medium{border-left-color:var(--med)} .pri-low{border-left-color:var(--low)}
 .tag{display:inline-block;padding:1px 7px;border-radius:5px;font-size:11px;background:var(--panel2);border:1px solid var(--border);color:var(--muted)}
+.tag-list{display:inline-flex;gap:4px;align-items:center;flex-wrap:wrap}
 .section-title{margin:18px 0 8px;font-size:15px}
 .flash{position:fixed;right:16px;bottom:16px;background:var(--panel2);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:6px;padding:10px 14px;box-shadow:0 4px 14px rgba(0,0,0,.4);animation:fade 4s forwards}
 @keyframes fade{0%{opacity:0;transform:translateY(8px)}10%{opacity:1;transform:none}80%{opacity:1}100%{opacity:0}}
