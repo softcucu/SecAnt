@@ -296,6 +296,28 @@ class TestConfig(unittest.TestCase):
         cfg.recheck.enabled = False
         self.assertEqual(cfg.model_config_error(), "")
 
+    def test_active_models_only_include_required_roles(self):
+        cfg = Config(
+            models={
+                "recon": ["recon-m"],
+                "history": ["unused-history-m"],
+                "recheck": ["unused-recheck-m"],
+                "decompose": ["unused-decompose-m"],
+                "audit": ["audit-m"],
+                "verify": ["verify-m"],
+                "report": ["report-m"],
+                "poc": ["unused-poc-m"],
+            },
+            decompose=False,
+            enable_poc=False,
+        )
+        cfg.history.enabled = False
+        cfg.recheck.enabled = False
+
+        self.assertEqual(cfg.active_models(), ["recon-m", "audit-m", "verify-m", "report-m"])
+        self.assertIn("unused-history-m", cfg.all_models())
+        self.assertIn("unused-poc-m", cfg.all_models())
+
     def test_model_time_windows_default_to_all_day(self):
         ts = time.mktime((2026, 1, 2, 12, 0, 0, 0, 0, -1))
         cfg = Config(models={"audit": ["m"]}, model_concurrency={"default": 1})

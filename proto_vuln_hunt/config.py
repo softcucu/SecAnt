@@ -102,11 +102,11 @@ class BackendSpec:
 class HealthCheckSpec:
     """模型健康检查:用一个短探针任务确认每个配置的模型可达且能正常回答。
 
-    · on_start:运行开始前先把**所有配置的模型**各探一遍,实时反映到 Web。
+    · on_start:运行开始前先把**当前任务会使用的模型**各探一遍,实时反映到 Web。
     · gate:真正用某模型派任务前,若其健康状态未知/陈旧/异常,则先补一次探针(按 ttl 去重,避免每次都探)。
     """
     enabled: bool = True
-    on_start: bool = True          # 运行开始前先把所有模型探一遍
+    on_start: bool = True          # 运行开始前先探当前任务会使用的模型
     gate: bool = True              # 调用某模型前,若其健康状态陈旧/未知则先探一次
     ttl_s: int = 300               # gate 复检的新鲜度窗口(秒);<=0 表示只在 on_start 探一次
     timeout_ms: int = 120000       # 单次健康探针的墙钟超时(独立于审计任务的大超时)
@@ -336,12 +336,25 @@ class Config:
         return [m for m in models if self.model_available_at(m, when)]
 
     def all_models(self) -> List[str]:
-        """所有 role 里配置到的去重模型列表(保持首次出现顺序),用于启动前健康检查。"""
+        """所有 role 里配置到的去重模型列表(保持首次出现顺序),用于配置诊断/展示。"""
         seen: List[str] = []
         for role, vals in self.models.items():
             if role == "default":
                 continue
             for m in vals:
+                if m and m not in seen:
+                    seen.append(m)
+        return seen
+
+    def active_models(self) -> List[str]:
+        """本次 run 实际会派任务的 role 中配置到的去重模型列表。
+
+        Web 新建任务会把部分隐藏/未参与当前模式的 role 模型一并带上;健康检查只应覆盖
+        当前 run 会使用的模型,否则会探测配置文件里存在但本次不会派任务的模型。
+        """
+        seen: List[str] = []
+        for role in self.required_model_roles():
+            for m in self.models_for(role):
                 if m and m not in seen:
                     seen.append(m)
         return seen

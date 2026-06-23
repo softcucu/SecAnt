@@ -173,7 +173,7 @@ class Pipeline:
 
     def record_agent(self, rec: Dict[str, Any]) -> None:
         """agent 子进程状态与 stdout/stderr chunk:经 SSE 推给 Web「Agent」页。
-        status=="output" 是逐字符输出流(高频大体积),只实时推、不落盘也不进内存 backlog,
+        status=="output" 是逐字符输出流(高频大体积),只实时推、不落盘也不进事件 backlog,
         避免 events.jsonl/内存随 agent 数量无上限膨胀;其它状态事件照常持久化。"""
         is_output = rec.get("status") == "output"
         self.emit(EV.AGENT_UPDATE, rec, persist=not is_output)
@@ -183,7 +183,7 @@ class Pipeline:
     def _reconcile_health_models(self) -> None:
         """把已落盘的 health 快照对齐到当前配置的模型集合:保留仍在用模型的既有健康记录,
         剔除已从配置移除的旧模型——避免续跑/重启后「模型」页残留上次配置里的模型。"""
-        cur = set(self.cfg.all_models())
+        cur = set(self.cfg.active_models())
         prior = (self.store.load_health() or {}).get("models", [])
         self.health_state = {r["model"]: r for r in prior if r.get("model") in cur}
         if len(self.health_state) != len([r for r in prior if r.get("model")]):
@@ -194,9 +194,9 @@ class Pipeline:
 
     async def health_check_all(self) -> Dict[str, Any]:
         """运行前(或按需)对当前时间窗内可用的模型各发一个 1+1 探针,实时反映健康度。"""
-        all_models = self.cfg.all_models()
+        all_models = self.cfg.active_models()
         if not all_models:
-            self.log("⚠ 未配置任何模型,跳过健康检查")
+            self.log("⚠ 当前 run 没有需要健康检查的模型,跳过健康检查")
             self.emit(EV.HEALTH_DONE, {"total": 0, "ok": 0, "unhealthy": []})
             return {"total": 0, "ok": 0, "unhealthy": []}
         models = self.cfg.available_models(all_models)
@@ -457,8 +457,10 @@ class Pipeline:
 
     def _work_priority(self, item: Dict[str, Any]) -> int:
         kind = item.get("kind")
-        if kind == "_recheck":
+        if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY and kind == "_finding":
             return 0
+        if kind == "_recheck":
+            return 5 if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY else 0
         if kind == "_finding":
             return 5
         if kind in ("_finder", "_history_commit"):
@@ -524,6 +526,15 @@ class Pipeline:
         if fk in self.processed_keys:
             return
         self._enqueue_work({"kind": "_finding", "finding_key": fk, "finding": finding})
+
+    def _pop_dispatchable_queued_kind(self, kind: str) -> Optional[Dict[str, Any]]:
+        self._ensure_queue_order()
+        for idx, item in sorted(enumerate(self.queue), key=lambda x: self._work_sort_key(x[1])):
+            if item.get("kind") != kind:
+                continue
+            if self._can_dispatch_work(item):
+                return self.queue.pop(idx)
+        return None
 
     # 风险点 severity_hint 排序(用于判断是否够格自动入排查队列)
     _RISK_SEV_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
@@ -621,9 +632,9 @@ class Pipeline:
             changed.append("模型可用时间段")
 
         if "models" in patch and isinstance(patch["models"], dict):
-            old_models = self.cfg.all_models()
+            old_models = self.cfg.active_models()
             self.cfg.models = normalize_models(patch["models"])
-            new_models = self.cfg.all_models()
+            new_models = self.cfg.active_models()
             added = [m for m in new_models if m not in old_models]
             removed = [m for m in old_models if m not in new_models]
             if added or removed:
@@ -671,8 +682,9 @@ class Pipeline:
 
     def config_snapshot(self) -> Dict[str, Any]:
         """当前生效的模型/并发配置快照(含逐模型实际并发上限与配置校验)。"""
-        eff = {m: self.cfg.model_concurrency_for(m) for m in self.cfg.all_models()}
-        avail = {m: self.cfg.model_available_at(m) for m in self.cfg.all_models()}
+        active_models = self.cfg.active_models()
+        eff = {m: self.cfg.model_concurrency_for(m) for m in active_models}
+        avail = {m: self.cfg.model_available_at(m) for m in active_models}
         return {
             "models": self.cfg.models,
             "model_concurrency": self.cfg.model_concurrency,
@@ -1916,6 +1928,11 @@ class Pipeline:
 
     def _pop_next_work(self) -> Optional[Dict[str, Any]]:
         self._ensure_queue_order()
+        if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY:
+            work = self._pop_dispatchable_queued_kind("_finding")
+            if work is not None:
+                return work
+
         if self.cfg.recheck.enabled and self.pq and self._active_roles.get("recheck", 0) < self._recheck_concurrency_limit():
             probe = {"kind": "_recheck"}
             if self._can_dispatch_work(probe):

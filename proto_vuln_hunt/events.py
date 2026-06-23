@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional
 
 # ── 事件类型常量(与 pipeline.emit 一一对应) ──
@@ -39,6 +40,10 @@ RUN_DONE = "run_done"              # {summary}
 CONFIG_UPDATED = "config_updated"  # {models, model_concurrency, concurrency, model_config_error}(运行中动态调参)
 ERROR = "error"                    # {message}
 
+_AGENT_ACTIVE_STATUSES = {"queued", "running", "retrying", "failed_attempt"}
+_AGENT_STATE_LIMIT = 256
+_AGENT_OUTPUT_CHAR_LIMIT = 256 * 1024
+
 
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -56,20 +61,123 @@ class EventBus:
         self._seq = max(start_seq, self.events[-1]["seq"] if self.events else 0)
         self._subscribers: List[asyncio.Queue] = []
         self._sink = sink           # 持久化回调:store.append_event(event)
+        self._agent_states: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self.closed = False
 
     @property
     def last_seq(self) -> int:
         return self._seq
 
+    def _trim_agent_output(self, rec: Dict[str, Any]) -> None:
+        output = str(rec.get("output") or "")
+        if len(output) <= _AGENT_OUTPUT_CHAR_LIMIT:
+            return
+        drop = len(output) - _AGENT_OUTPUT_CHAR_LIMIT
+        rec["output"] = output[drop:]
+        rec["output_truncated"] = True
+        rec["output_truncated_chars"] = int(rec.get("output_truncated_chars") or 0) + drop
+
+        remaining = drop
+        chunks = rec.get("chunks") if isinstance(rec.get("chunks"), list) else []
+        kept: List[Dict[str, Any]] = []
+        for item in chunks:
+            if not isinstance(item, dict):
+                continue
+            chunk = str(item.get("chunk") or "")
+            if remaining >= len(chunk):
+                remaining -= len(chunk)
+                continue
+            if remaining > 0:
+                item = dict(item)
+                item["chunk"] = chunk[remaining:]
+                remaining = 0
+            kept.append(item)
+        rec["chunks"] = kept
+
+    def _prune_agent_states(self) -> None:
+        while len(self._agent_states) > _AGENT_STATE_LIMIT:
+            drop_key = None
+            for key, rec in self._agent_states.items():
+                if rec.get("status") not in _AGENT_ACTIVE_STATUSES:
+                    drop_key = key
+                    break
+            if drop_key is None:
+                drop_key = next(iter(self._agent_states), None)
+            if drop_key is None:
+                return
+            self._agent_states.pop(drop_key, None)
+
+    def _note_agent_update(self, rec: Dict[str, Any]) -> None:
+        aid = rec.get("id")
+        if aid in (None, ""):
+            return
+        key = str(aid)
+        now = time.time()
+        cur = self._agent_states.get(key)
+        if cur is None:
+            cur = {
+                "id": aid,
+                "status": "queued",
+                "output": "",
+                "chunks": [],
+                "stdout_chars": 0,
+                "stderr_chars": 0,
+                "created_ts": rec.get("ts") or now,
+            }
+        else:
+            self._agent_states.move_to_end(key)
+            if not isinstance(cur.get("chunks"), list):
+                cur["chunks"] = []
+
+        if rec.get("status") == "output":
+            chunk = str(rec.get("chunk") if rec.get("chunk") is not None else "")
+            stream = "stderr" if rec.get("stream") == "stderr" else "stdout"
+            cur["output"] = str(cur.get("output") or "") + chunk
+            if chunk:
+                chunks = cur["chunks"]
+                if chunks and isinstance(chunks[-1], dict) and chunks[-1].get("stream") == stream:
+                    chunks[-1]["chunk"] = str(chunks[-1].get("chunk") or "") + chunk
+                else:
+                    chunks.append({"stream": stream, "chunk": chunk})
+            if stream == "stderr":
+                cur["stderr_chars"] = int(cur.get("stderr_chars") or 0) + len(chunk)
+            else:
+                cur["stdout_chars"] = int(cur.get("stdout_chars") or 0) + len(chunk)
+            for k in ("role", "label", "backend", "cwd", "model", "attempt", "ts"):
+                if rec.get(k) is not None:
+                    cur[k] = rec[k]
+            cur["updated_ts"] = rec.get("ts") or now
+            if not cur.get("status") or cur.get("status") == "queued":
+                cur["status"] = "running"
+            self._trim_agent_output(cur)
+        else:
+            for k, v in rec.items():
+                if k != "chunk":
+                    cur[k] = v
+            cur["updated_ts"] = rec.get("ts") or now
+
+        self._agent_states[key] = cur
+        self._prune_agent_states()
+
+    def agent_snapshot(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for rec in self._agent_states.values():
+            item = dict(rec)
+            chunks = rec.get("chunks")
+            item["chunks"] = [dict(c) for c in chunks] if isinstance(chunks, list) else []
+            out.append(item)
+        return out
+
     def emit(self, etype: str, data: Optional[Dict[str, Any]] = None,
              persist: bool = True) -> Dict[str, Any]:
-        # persist=False:仅实时推给当前订阅者,不写 events.jsonl、不进内存 backlog。
+        # persist=False:仅实时推给当前订阅者,不写 events.jsonl、不进事件 backlog。
         # 用于 agent 子进程的逐字符 stdout/stderr 流(高频、大体积):避免 events.jsonl 与
         # EventBus.events 随 agent 数量无上限膨胀(几千 agent × opencode 冗长输出 → GB 级)。
-        # 代价:刷新/服务重启后看不到历史输出流;结构化事件(状态/metrics/findings)仍照常持久化。
+        # 运行中页面重进依靠有上限的 live agent 快照恢复;服务重启后不保留该输出流。
         self._seq += 1
         ev = {"seq": self._seq, "ts": now_ms(), "type": etype, "data": data or {}}
+        if etype == AGENT_UPDATE and isinstance(ev["data"], dict):
+            self._note_agent_update(ev["data"])
         if persist:
             self.events.append(ev)
             if self._sink:

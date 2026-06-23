@@ -1368,7 +1368,7 @@ function viewDashboard(runId) {
       el("button", { class: "btn secondary", onclick: recheckHealth }, "🩺 重新检查"));
     tabBody.append(el("div", { class: "panel" }, bar,
       el("p", { class: "muted", style: "margin:0" },
-        "运行开始前会对每个配置的模型发一个短探针;调用某模型前若健康状态陈旧/异常会自动补检。首 token 与输出速度实时更新。")));
+        "运行开始前会对当前任务会使用的模型发一个短探针;调用某模型前若健康状态陈旧/异常会自动补检。首 token 与输出速度实时更新。")));
     if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无模型健康数据(开始运行后会自动检测)。")); return; }
     const order = { checking: 0, down: 1, degraded: 2, unavailable: 3, unknown: 4, ok: 5 };
     list.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9) || String(a.model).localeCompare(String(b.model)));
@@ -2128,6 +2128,11 @@ function viewDashboard(runId) {
   }
 
   // ── SSE 驱动 ──
+  function invalidateAgentOutputCache(a) {
+    a._stdoutN = -1;
+    a._stdout = undefined;
+    a._oc = null;
+  }
   function applyAgentUpdate(d) {
     const id = String(d.id || "");
     if (!id) return;
@@ -2144,11 +2149,14 @@ function viewDashboard(runId) {
       a.attempt = d.attempt || a.attempt;
       a.updated_ts = d.ts || now;
       if (!a.status || a.status === "queued") a.status = "running";
+      invalidateAgentOutputCache(a);
     } else {
+      const replacesOutput = Array.isArray(d.chunks) || d.output != null;
       for (const [k, v] of Object.entries(d)) {
         if (k !== "chunk") a[k] = v;
       }
       a.updated_ts = d.ts || now;
+      if (replacesOutput) invalidateAgentOutputCache(a);
     }
     S.agentMap.set(id, a);
     S.agents = Math.max(S.agents || 0, S.agentMap.size);
@@ -2297,6 +2305,8 @@ function viewDashboard(runId) {
     S.riskTotal = Math.max(S.riskTotal || 0, S.risks.size);
     S.health.clear();
     for (const h of ((snap.health || {}).models || [])) if (h.model) S.health.set(h.model, h);
+    S.agentMap.clear();
+    for (const a of (snap.agents || [])) applyAgentUpdate(a);
     S.coverage = snap.coverage || null;
     S.recon = snap.recon || null;
     applyUsageRows(snap.usage || []);

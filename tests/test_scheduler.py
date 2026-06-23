@@ -81,6 +81,45 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["ok"], 1)
             self.assertIn("closed-model", result["skipped_unavailable"])
 
+    async def test_health_check_only_probes_active_run_models(self):
+        class DummyRunner:
+            async def probe_model(self, model, *, reason="startup"):
+                seen.append(model)
+                return {"model": model, "status": "ok"}
+
+        seen = []
+        with tempfile.TemporaryDirectory() as tmp:
+            p = _pipe(
+                tmp,
+                models={
+                    "recon": ["active-recon"],
+                    "history": ["unused-history"],
+                    "recheck": ["unused-recheck"],
+                    "decompose": ["unused-decompose"],
+                    "audit": ["active-audit"],
+                    "verify": ["active-verify"],
+                    "report": ["active-report"],
+                    "poc": ["unused-poc"],
+                },
+                decompose=False,
+                enable_poc=False,
+                history=HistorySpec(enabled=False),
+                recheck=RecheckSpec(enabled=False),
+                model_time_windows={
+                    "unused-history": _future_hour_window(),
+                    "unused-recheck": _future_hour_window(),
+                    "unused-decompose": _future_hour_window(),
+                    "unused-poc": _future_hour_window(),
+                },
+            )
+            p.runner = DummyRunner()
+
+            result = await p.health_check_all()
+
+            self.assertEqual(seen, ["active-recon", "active-audit", "active-verify", "active-report"])
+            self.assertEqual(result["total"], 4)
+            self.assertEqual(result["skipped_unavailable"], [])
+
     async def test_history_commit_starts_while_recon_is_running(self):
         class DummyRunner:
             def __init__(self):
@@ -295,6 +334,33 @@ class TestSchedulerPriority(unittest.TestCase):
 
             self.assertEqual(work["kind"], "_recheck")
             self.assertEqual(work["item"]["id"], "RISK-001")
+
+    def test_history_only_verify_work_is_selected_before_recheck(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = _pipe(
+                tmp,
+                run_mode="history_only",
+                history_import_from="imported",
+                concurrency=3,
+                recheck=RecheckSpec(enabled=True),
+                model_concurrency={"default": 3},
+            )
+            p.pq.append({"kind": "variant", "pattern": "missing check", "source": "abc", "lens_hint": "memory"})
+            p._enqueue_work({
+                "kind": "_finding",
+                "finding_key": "candidate-1",
+                "finding": {
+                    "title": "candidate",
+                    "bug_class": "memory",
+                    "file": "a.c",
+                    "line": 1,
+                },
+            })
+
+            work = p._pop_next_work()
+
+            self.assertEqual(work["kind"], "_finding")
+            self.assertEqual(work["finding"]["title"], "candidate")
 
     def test_history_and_audit_share_priority_class(self):
         with tempfile.TemporaryDirectory() as tmp:

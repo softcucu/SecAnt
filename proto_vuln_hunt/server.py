@@ -325,7 +325,8 @@ def _response_candidates(store: RunStore, manifest: Optional[Dict[str, Any]] = N
 
 def _dashboard_snapshot(store: RunStore, running: bool, last_seq: int,
                         manifest: Optional[Dict[str, Any]] = None,
-                        lite: bool = False) -> Dict[str, Any]:
+                        lite: bool = False,
+                        agents: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     manifest = manifest or store.load_manifest() or {}
     manifest["running"] = running
     last_seq = max(last_seq, store.last_event_seq())
@@ -357,6 +358,7 @@ def _dashboard_snapshot(store: RunStore, running: bool, last_seq: int,
         "recon": store.load_recon(),
         "health": health,
         "usage": [] if lite else store.load_usage(limit=_DASHBOARD_USAGE_LIMIT),
+        "agents": agents or [],
     }
 
 
@@ -442,7 +444,9 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
         running = manager.is_running(run_id)
         bus = manager.get_bus(run_id) if running else None
         last_seq = bus.last_seq if bus else 0
-        return _dashboard_snapshot(store, running, last_seq, manager.manifest_for_display(store), lite=lite)
+        agents = bus.agent_snapshot() if bus else []
+        return _dashboard_snapshot(store, running, last_seq, manager.manifest_for_display(store), lite=lite,
+                                   agents=agents)
 
     @app.post("/api/runs/{run_id}/stop")
     async def stop_run(run_id: str):
@@ -604,6 +608,12 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
             # 2) 若 run 仍在跑,接活动流(内存 backlog>sent 部分 + 实时)
             bus = manager.get_bus(run_id)
             if bus:
+                # 非持久化 agent stdout/stderr 不在 backlog 里。新连接先补一份当前
+                # live agent 快照,覆盖页面离开期间和 snapshot→SSE 连接空窗里的输出。
+                for agent in bus.agent_snapshot():
+                    if await request.is_disconnected():
+                        break
+                    yield _sse({"seq": sent, "ts": EV.now_ms(), "type": EV.AGENT_UPDATE, "data": agent})
                 async for ev in bus.stream(sent):
                     if await request.is_disconnected():
                         break

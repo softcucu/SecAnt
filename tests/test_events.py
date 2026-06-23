@@ -28,11 +28,27 @@ class EventBusPersistTests(unittest.TestCase):
     def test_output_chunk_not_persisted_and_not_in_backlog(self):
         bus, sunk = self._bus()
         bus.emit(EV.AGENT_UPDATE, {"status": "output", "chunk": "x" * 100000}, persist=False)
-        # 不落盘、不进内存 backlog
+        # 不落盘、不进事件 backlog
         self.assertEqual(sunk, [])
         self.assertEqual(bus.events, [])
         # 但 seq 仍递增(实时推送可用)
         self.assertEqual(bus.last_seq, 1)
+
+    def test_output_chunk_available_in_live_agent_snapshot(self):
+        bus, sunk = self._bus()
+        bus.emit(EV.AGENT_UPDATE, {"id": 1, "role": "audit", "label": "unit", "status": "running"})
+        bus.emit(EV.AGENT_UPDATE, {"id": 1, "status": "output", "stream": "stdout", "chunk": "hello"}, persist=False)
+        bus.emit(EV.AGENT_UPDATE, {"id": 1, "status": "output", "stream": "stderr", "chunk": "!"}, persist=False)
+
+        # 输出流不落盘、不进事件 backlog；运行中回看依赖有上限的 live agent 快照。
+        self.assertEqual(len(sunk), 1)
+        self.assertEqual(len(bus.events), 1)
+        snap = bus.agent_snapshot()
+        self.assertEqual(len(snap), 1)
+        self.assertEqual(snap[0]["status"], "running")
+        self.assertEqual("".join(c["chunk"] for c in snap[0]["chunks"]), "hello!")
+        self.assertEqual(snap[0]["stdout_chars"], 5)
+        self.assertEqual(snap[0]["stderr_chars"], 1)
 
     def test_start_seq_continues_monotonically_on_resume(self):
         # 续跑:bus 必须从磁盘已落盘的最大 seq 续接,否则重号会被 SSE 的 seq>sent 过滤掉。
@@ -87,6 +103,21 @@ class EventBusPersistTests(unittest.TestCase):
             self.assertEqual(snap["counts"]["candidates"], 3)
             self.assertEqual(snap["counts"]["risks"], 2)
             self.assertEqual(snap["counts"]["usage"], 100)
+            self.assertEqual(snap["agents"], [])
+
+    def test_dashboard_snapshot_includes_live_agents(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = RunStore(td).ensure()
+            store.init_manifest({"target": "."})
+            bus = EventBus(sink=store.append_event)
+            bus.emit(EV.AGENT_UPDATE, {"id": 7, "role": "audit", "status": "running"})
+            bus.emit(EV.AGENT_UPDATE, {"id": 7, "status": "output", "stream": "stdout", "chunk": "live"}, persist=False)
+
+            snap = _dashboard_snapshot(store, running=True, last_seq=bus.last_seq,
+                                       agents=bus.agent_snapshot(), lite=True)
+            self.assertEqual(len(snap["agents"]), 1)
+            self.assertEqual(snap["agents"][0]["id"], 7)
+            self.assertEqual(snap["agents"][0]["chunks"][0]["chunk"], "live")
 
     def test_start_seq_respects_higher_backlog_tail(self):
         # start_seq 与 backlog 尾部取较大者,二者都给时不回退。

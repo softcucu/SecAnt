@@ -130,6 +130,44 @@ class HealthPruneTest(unittest.TestCase):
             self.assertIn("kept-model", models)
             self.assertNotIn("removed-model", models)
 
+    def test_reconcile_drops_models_from_inactive_roles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(
+                target=tmp,
+                out_dir=os.path.join(tmp, "out"),
+                models={
+                    "recon": ["active-recon"],
+                    "history": ["inactive-history"],
+                    "recheck": ["inactive-recheck"],
+                    "decompose": ["inactive-decompose"],
+                    "audit": ["active-audit"],
+                    "verify": ["active-verify"],
+                    "report": ["active-report"],
+                    "poc": ["inactive-poc"],
+                },
+                decompose=False,
+                enable_poc=False,
+            )
+            cfg.history.enabled = False
+            cfg.recheck.enabled = False
+            store = RunStore(cfg.out_dir).ensure()
+            store.save_health({
+                "active-recon": {"model": "active-recon", "status": "ok"},
+                "active-audit": {"model": "active-audit", "status": "ok"},
+                "active-verify": {"model": "active-verify", "status": "ok"},
+                "active-report": {"model": "active-report", "status": "ok"},
+                "inactive-history": {"model": "inactive-history", "status": "ok"},
+                "inactive-recheck": {"model": "inactive-recheck", "status": "ok"},
+                "inactive-decompose": {"model": "inactive-decompose", "status": "ok"},
+                "inactive-poc": {"model": "inactive-poc", "status": "ok"},
+            })
+
+            pipe = Pipeline(cfg, store=store)
+            pipe._reconcile_health_models()
+
+            models = [r["model"] for r in store.load_health()["models"]]
+            self.assertEqual(models, ["active-recon", "active-audit", "active-verify", "active-report"])
+
 
 class UsageResumeTest(unittest.TestCase):
     def test_resume_restores_usage_totals_and_next_id(self):
