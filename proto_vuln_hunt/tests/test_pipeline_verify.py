@@ -289,7 +289,7 @@ class TestAdversarialVerify(_PipelineTestBase):
         self.assertIn(QUALITY_FINDING_TAG, cand["tags"])
 
     async def test_high_conflict_needs_manual_review_is_terminal(self):
-        """高危冲突无法闭合 → needs_manual_review 终态,不确认不否决。"""
+        """高危冲突无法闭合 → 漏洞页质量问题条目,候选保持 needs_manual_review。"""
         p = self.make_pipeline(verify_votes=3)
         p.runner.verify_responses = [
             _witness(),
@@ -301,9 +301,21 @@ class TestAdversarialVerify(_PipelineTestBase):
         f = _finding()
         await p.process_finding(f)
 
-        self.assertEqual(p.confirmed, [])
+        self.assertEqual(len(p.confirmed), 1)
         self.assertIn(finding_key(f), p.processed_keys)
-        self.assertEqual(p.store.load_candidates()[0]["status"], "needs_manual_review")
+        self.assertIn(EV.FINDING_ADDED, self._event_types(p))
+        self.assertIn(EV.CANDIDATE_DECIDED, self._event_types(p))
+        finding = p.store.load_findings()[0]
+        self.assertEqual(finding["id"], "QUAL-001")
+        self.assertEqual(finding["finding_status"], QUALITY_FINDING_STATUS)
+        self.assertEqual(finding["verification_status"], "needs_manual_review")
+        self.assertIn(QUALITY_FINDING_TAG, finding["tags"])
+        self.assertIn("编码质量问题", finding["report_body"])
+        self.assertIn("待人工复核", finding["report_body"])
+        cand = p.store.load_candidates()[0]
+        self.assertEqual(cand["status"], "needs_manual_review")
+        self.assertEqual(cand["id"], "QUAL-001")
+        self.assertIn(QUALITY_FINDING_TAG, cand["tags"])
 
     async def test_final_adjudicator_parse_failure_retries_then_verify_failed(self):
         """终局裁判无结构化输出,耗尽 retry.max_attempts 后 → verify_failed。"""

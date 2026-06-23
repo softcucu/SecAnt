@@ -1036,9 +1036,12 @@ class Pipeline:
                   or "对抗验证后未能闭合漏洞证据").strip()
         uncertainty = (final.get("residual_uncertainty") or "缺少足够证据证明该候选是真实可利用漏洞").strip()
         next_action = (final.get("recommended_next_action") or "按编码质量问题处理,后续结合人工代码审查补证").strip()
-        decision_text = "证据不足压制" if decision == "suppressed_unproven" else decision
+        decision_text = {
+            "suppressed_unproven": "证据不足压制",
+            "needs_manual_review": "待人工复核",
+        }.get(decision, decision)
         lines = [
-            "## ① 漏洞描述",
+            "## ① 编码质量问题描述",
             f.get("description") or f.get("title") or "(无)",
             "",
             "## ② 对抗验证结论",
@@ -1456,16 +1459,13 @@ class Pipeline:
                 self.processed_keys.add(k)
                 self.pending_findings.pop(k, None)
                 f["verify_status"] = decision
-                quality_rec: Optional[Dict[str, Any]] = None
-                if decision == "suppressed_unproven":
-                    quality_rec = self._record_quality_finding(f, votes, final_vote, decision)
-                    f["quality_finding_id"] = quality_rec.get("id")
+                quality_rec = self._record_quality_finding(f, votes, final_vote, decision)
+                f["quality_finding_id"] = quality_rec.get("id")
                 payload = self._candidate_decision_payload(f, decision, votes, final_vote)
-                if quality_rec:
-                    payload["id"] = quality_rec.get("id")
-                    payload["finding_status"] = quality_rec.get("finding_status")
-                    payload["tags"] = quality_rec.get("tags") or []
-                    payload["corrected_severity"] = quality_rec.get("corrected_severity")
+                payload["id"] = quality_rec.get("id")
+                payload["finding_status"] = quality_rec.get("finding_status")
+                payload["tags"] = quality_rec.get("tags") or []
+                payload["corrected_severity"] = quality_rec.get("corrected_severity")
                 self._save_candidate_state(payload)
                 self.emit(EV.CANDIDATE_DECIDED, payload)
                 self.log(f"候选 {k} 终局决策:{decision} {f.get('title')}")

@@ -654,7 +654,7 @@ function viewDashboard(runId) {
   function jumpToCandidate(c) {
     if (!c) return;
     if (c.status === "confirmed" && c.id) return jumpToFinding(c.id);
-    if (c.status === "suppressed_unproven" && c.id) return jumpToFinding(c.id);
+    if (["suppressed_unproven", "needs_manual_review"].includes(c.status) && c.id) return jumpToFinding(c.id);
     if (c.status === "rejected") return jumpToNonIssue(c.key || candKeyOf(c));
     showTab("candidates", { type: "candidate", key: c.key || candKeyOf(c) });
   }
@@ -991,7 +991,7 @@ function viewDashboard(runId) {
   }
   function candidateActionLabel(c) {
     if (c.status === "confirmed" && c.id) return "查看漏洞";
-    if (c.status === "suppressed_unproven" && c.id) return "查看漏洞条目";
+    if (["suppressed_unproven", "needs_manual_review"].includes(c.status) && c.id) return "查看漏洞条目";
     if (c.status === "rejected") return "查看非问题";
     if (["suppressed_unproven", "needs_manual_review", "verify_failed"].includes(c.status)) return "查看候选";
     return "定位候选";
@@ -1156,7 +1156,7 @@ function viewDashboard(runId) {
         ? linkButton(String(c.id), () => jumpToCandidate(c), "查看漏洞")
         : c.status === "rejected"
           ? linkButton("非问题", () => jumpToCandidate(c), "查看非问题")
-        : c.status === "suppressed_unproven" && c.id
+        : ["suppressed_unproven", "needs_manual_review"].includes(c.status) && c.id
           ? linkButton(String(c.id), () => jumpToCandidate(c), "查看漏洞页质量问题条目")
         : el("span", { class: "muted" }, "—");
       tb.append(el("tr", { class: "cand-row cand-" + cssKey(c.status), "data-cand-key": c.key || candKeyOf(c) },
