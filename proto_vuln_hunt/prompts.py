@@ -620,7 +620,8 @@ class PromptBuilder:
             f"- poc_result:{poc_brief}。\n"
             f"- confidence_basis:置信度={rec.get('confidence')},一句话说明依据。\n\n"
             f"对抗性验证结论(供你提炼字段内容,不要整段照抄):{votes_brief}\n"
-            "**只输出 JSON 对象本身。**"
+            "最终按下面的结构化输出要求收尾。"
+            + must_struct(schema)
         )
 
     # ── 汇总(INDEX.md 正文) ──

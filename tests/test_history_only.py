@@ -6,6 +6,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from proto_vuln_hunt.config import Config, HistorySpec, RecheckSpec
+from proto_vuln_hunt import schemas as S
 from proto_vuln_hunt.pipeline import Pipeline
 from proto_vuln_hunt.server import build_run_config
 from proto_vuln_hunt.store import RunStore
@@ -175,7 +176,38 @@ class HistoryOnlyImportTests(unittest.IsolatedAsyncioTestCase):
                         "reasoning": "confirmed",
                     }
                 if role == "report":
-                    return "## 漏洞描述\nconfirmed"
+                    prompt = _args[0] if _args else ""
+                    if kwargs.get("schema") != S.HISTORY_REPORT_SCHEMA:
+                        raise AssertionError("history-only report must use HISTORY_REPORT_SCHEMA")
+                    for needle in ("JSON Schema", '"summary"', '"judgement"', '"history"'):
+                        if needle not in prompt:
+                            raise AssertionError(f"history report prompt missing schema marker: {needle}")
+                    return {
+                        "summary": "overflow variant",
+                        "description": "copy length is unchecked",
+                        "judgement": "a.c:10 copies attacker-controlled len without a bound check",
+                        "vuln_code": "void parse(char *dst, const char *src, int len) { memcpy(dst, src, len); }",
+                        "vuln_code_loc": "a.c:10-12",
+                        "data_flow": "a.c:1 -> a.c:10",
+                        "call_chain": ["a.c:1 entry", "a.c:10 sink"],
+                        "impact": "remote overflow",
+                        "poc_result": "static witness len=512",
+                        "fix_suggestion": "check len against destination size before memcpy",
+                        "confidence_basis": "verified by witness and final adjudication",
+                        "history": {
+                            "source": "abc123 fix overflow",
+                            "root_cause": "missing bounds check before memcpy",
+                            "root_cause_analysis": "the historical code trusted an external length before copying",
+                            "before_code": "memcpy(dst, src, len);",
+                            "after_code": "if (len <= dst_size) memcpy(dst, src, len);",
+                            "why_recurred": "the same guard was not applied at this call site",
+                            "comparison": [{
+                                "dimension": "guard",
+                                "history": "added length guard",
+                                "current": "guard missing",
+                            }],
+                        },
+                    }
                 raise AssertionError(f"unexpected role: {role}")
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -197,6 +229,9 @@ class HistoryOnlyImportTests(unittest.IsolatedAsyncioTestCase):
             finding = store.load_findings()[0]
             self.assertEqual(finding["variant_of"], "missing bounds check before memcpy(出处:abc123 fix overflow)")
             self.assertEqual(finding["corrected_severity"], "high")
+            self.assertFalse(finding["report_failed"])
+            self.assertIn("与历史问题的对比", finding["report_body"])
+            self.assertIsInstance(finding["report_struct"], dict)
 
     async def test_empty_import_source_fails_instead_of_falling_back_to_commits(self):
         with tempfile.TemporaryDirectory() as tmp:
