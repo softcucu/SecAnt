@@ -8,18 +8,17 @@
 backend: claude
 
 # ── 模型:按阶段(role)分别指定;不再支持 models.default 回落 ──
-# 当前会运行的 role 必须显式配置。常用 role:recon / history / recheck / decompose / audit / verify / report / poc
+# 当前会运行的 role 必须显式配置。常用 role:threat / history / recheck / audit / verify / report / poc
 # 每个 role 可写单个模型,也可写模型列表;列表会按 agent 调用轮换使用。
 # 注意:
 #   · claude   模型名形如  claude-opus-4-8 / claude-sonnet-4-6 / claude-haiku-4-5-20251001
 #   · opencode 模型名形如  provider/model,如 anthropic/claude-sonnet-4-6、openai/gpt-5
 #   · codex    模型名形如  gpt-5-codex / o3 等
 models:
-  recon: claude-opus-4-8        # 侦察/威胁建模用更强的模型
+  threat: claude-opus-4-8       # 基于攻击树的威胁分析:关键资产/攻击目标/domain/surface/method
   history: claude-sonnet-4-6    # git 历史问题模式挖掘(每条提交一个 agent;与 high audit finder 同级调度)
   recheck: claude-sonnet-4-6    # 专用优先排查 agent(历史变体 + 风险点复查;最高优先级、默认并发 1)
-  decompose: claude-sonnet-4-6  # region 拆解
-  audit:                         # 审计 finder 可用多模型轮换,分散容量/视角
+  audit:                         # 攻击方式审计 finder 可用多模型轮换,分散容量/视角
     - claude-sonnet-4-6
     - claude-opus-4-8
   verify: claude-sonnet-4-6     # 对抗验证
@@ -69,21 +68,17 @@ params:
   finders_per_lens: 2           # 每个攻击面每个 lens 每轮派几个 finder
   dry_rounds: 2                 # 连续几轮无新增即收敛
   max_rounds: 6                 # 审计循环硬上限
-  verify_votes: 3               # 兼容旧配置;当前验证固定为 witness/blocker 5-agent 交叉验证
-  run_mode: full                # full | history_only;history_only 只做历史模式/导入模式 → recheck → verify/report/PoC
-  # history_import_from: ./pvh-runs/<run_id>  # 可选:从既有 run 目录或 recon.json 导入 history[];导入后跳过 git commit 分析
+  verify_votes: 3               # witness/blocker 交叉验证的投票规模
+  run_mode: full                # 2.0 仅支持完整流程;保留字段用于 run 清单显示
+  # history_import_from: ./pvh-runs/<run_id>  # 可选:从既有 run 目录或 history.json 导入历史问题模式;导入后跳过 git commit 分析
   threat_model: REMOTE          # REMOTE | LOCAL_UNPRIVILEGED | BOTH
   enable_poc: true              # 高危项是否进隔离 worktree 编译 PoC
   lenses: [memory, integer, race, injection, authn, crypto, dos, infoleak, resource-realtime]
-  decompose: true               # 审计前把大 region 拆成有界子任务
-  unit_line_budget: 1500         # 动态拆解预算:约每 N 行代码允许 1 个子任务
-  max_files_per_unit: 4          # 动态拆解预算:约每 N 个文件允许 1 个子任务
-  max_subtasks_per_region: 40    # 动态预算的硬封顶;设为 0 表示不额外封顶
 
 # ── git 历史问题模式挖掘(统一调度队列中与 high audit finder 同级) ──
-# 从侦察中抽离:遍历 git log 的提交,**每条提交派 1 个 agent**(role=history)读其改动,
+# 遍历 git log 的提交,**每条提交派 1 个 agent**(role=history)读其改动,
 # 判定是否安全修复;相关者提炼成「历史问题模式」,随挖随补回灌到 Web「历史问题」页签与审计队列(同类变体排查种子)。
-# 这一块不阻塞侦察和审计;健康检查后即与 recon 同时启动,并与 high audit finder 按同一优先级参与统一排队。
+# 这一块不阻塞威胁分析和审计;健康检查后即与 threat 同时启动,并与 high audit finder 按同一优先级参与统一排队。
 # 断点续跑时会先恢复 historyDone,避免重复分析已处理提交。
 history:
   enabled: true                 # 总开关(非 git 仓自动跳过)
@@ -142,7 +137,7 @@ health_check:
 # ── 后端 CLI 任务执行失败后的重试 ──
 # 注意:opencode/claude/codex 内部已自行重试瞬时 API 抖动;这一层只在 **CLI 任务整体失败** 时重试,
 # 即:子进程非零退出 / 超时 / 输出无法解析为所需的结构化 JSON。max_attempts 是单组重试次数;
-# recon 会一直重试到成功或用户停止,audit/recheck 单组耗尽后把审计项放回队尾稍后继续重试。
+# threat 会一直重试到成功或用户停止,audit/recheck 单组耗尽后把审计项放回队尾稍后继续重试。
 retry:
   max_attempts: 4               # 失败后最多再重试几次(总尝试 = 1 + max_attempts)
   backoff_base_ms: 2000         # 退避基数(指数增长;疑似限流时自动延长)

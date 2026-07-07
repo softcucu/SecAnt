@@ -25,21 +25,15 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--concurrency", type=int, help="同时运行的 agent 上限")
     p.add_argument("--model", help="为所有会运行的任务 role 显式设置同一组模型(多个模型可用逗号分隔)")
     p.add_argument("--model-concurrency", dest="model_concurrency", help="每个模型自己的并发上限,如 default=1,openai/gpt-5=2")
-    p.add_argument("--history-only", dest="run_mode", action="store_const", const="history_only",
-                   help="仅运行历史漏洞排查:history 模式/导入模式 → recheck → verify/report")
     p.add_argument("--history-import-from", dest="history_import_from",
-                   help="从已有 run 目录或 recon.json 导入已分析好的历史问题模式,并跳过 git commit 分析")
+                   help="从已有 run 目录或 history.json 导入已分析好的历史问题模式,并跳过 git commit 分析")
     p.add_argument("--threat-model", dest="threat_model", choices=["REMOTE", "LOCAL_UNPRIVILEGED", "BOTH"])
     p.add_argument("--lenses", help="逗号分隔的 lens 子集,如 memory,integer,dos")
     p.add_argument("--finders-per-lens", dest="finders_per_lens", type=int)
     p.add_argument("--max-rounds", dest="max_rounds", type=int)
     p.add_argument("--dry-rounds", dest="dry_rounds", type=int)
     p.add_argument("--verify-votes", dest="verify_votes", type=int)
-    p.add_argument("--unit-line-budget", dest="unit_line_budget", type=int, help="region 动态拆解时每个子任务的目标行数")
-    p.add_argument("--max-files-per-unit", dest="max_files_per_unit", type=int, help="region 动态拆解时每个子任务的目标文件数")
-    p.add_argument("--max-subtasks-per-region", dest="max_subtasks_per_region", type=int, help="动态子任务预算硬封顶;0 表示不额外封顶")
     p.add_argument("--no-poc", dest="enable_poc", action="store_false", default=None, help="禁用 PoC 阶段")
-    p.add_argument("--no-decompose", dest="decompose", action="store_false", default=None, help="禁用区域拆解")
     p.add_argument("--fresh", action="store_true", default=None, help="忽略断点从头跑")
     p.add_argument("--methods-dir", dest="methods_dir", help="方法库目录")
     p.add_argument("--no-export", dest="export", action="store_false", default=True, help="跑完不导出 MD/SARIF 文件")
@@ -64,10 +58,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _overrides_from_args(args) -> dict:
     overrides = {}
-    for k in ("target", "scope", "out_dir", "backend", "concurrency", "run_mode", "history_import_from", "threat_model",
+    for k in ("target", "scope", "out_dir", "backend", "concurrency", "history_import_from", "threat_model",
               "finders_per_lens", "max_rounds", "dry_rounds", "verify_votes",
-              "unit_line_budget", "max_files_per_unit", "max_subtasks_per_region",
-              "enable_poc", "decompose", "fresh", "methods_dir", "host", "port", "runs_dir"):
+              "enable_poc", "fresh", "methods_dir", "host", "port", "runs_dir"):
         v = getattr(args, k, None)
         if v is not None:
             overrides[k] = v
@@ -96,9 +89,7 @@ def cmd_run(args) -> int:
             "concurrency": cfg.concurrency, "lenses": cfg.lenses,
             "threat_model": cfg.threat_model, "finders_per_lens": cfg.finders_per_lens,
             "max_rounds": cfg.max_rounds, "dry_rounds": cfg.dry_rounds, "verify_votes": cfg.verify_votes,
-            "enable_poc": cfg.enable_poc, "decompose": cfg.decompose, "resume": cfg.resume,
-            "unit_line_budget": cfg.unit_line_budget, "max_files_per_unit": cfg.max_files_per_unit,
-            "max_subtasks_per_region": cfg.max_subtasks_per_region,
+            "enable_poc": cfg.enable_poc, "resume": cfg.resume,
             "methods_dir": cfg.methods_abs, "methods_ok": cfg.methods_ok(),
             "model_config_error": cfg.model_config_error(),
             "backend_command": cfg.backend_spec().command,

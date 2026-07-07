@@ -93,7 +93,6 @@ class TestAuditRetryQueue(unittest.IsolatedAsyncioTestCase):
                 finders_per_lens=1,
                 max_rounds=1,
                 dry_rounds=1,
-                decompose=False,
             )
             store = RunStore(cfg.out_dir).ensure()
             p = Pipeline(cfg, store=store)
@@ -142,7 +141,7 @@ class TestRecheckRetryQueue(unittest.IsolatedAsyncioTestCase):
 
 class TestRecheckGivesUp(unittest.IsolatedAsyncioTestCase):
     """持续失败的优先排查项必须在 max_retries 次后放弃,而不是无限回灌优先队列。
-    这是修复“跑完 recon 后只剩 1 个 recheck、其它 agent 全停”死循环的关键不变量。"""
+    这是修复“威胁分析后只剩 1 个 recheck、其它 agent 全停”死循环的关键不变量。"""
 
     class _FailRunner:
         agent_count = 0
@@ -193,7 +192,7 @@ class TestRecheckGivesUp(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             cfg = Config(target=tmp, out_dir=os.path.join(tmp, "out"), lenses=["memory"],
-                         finders_per_lens=1, max_rounds=1, dry_rounds=1, decompose=False)
+                         finders_per_lens=1, max_rounds=1, dry_rounds=1)
             cfg.recheck = RecheckSpec(enabled=True, max_retries=1)
             store = RunStore(cfg.out_dir).ensure()
             p = Pipeline(cfg, store=store)
@@ -274,22 +273,21 @@ class TestConfig(unittest.TestCase):
         self.assertIn("recheck", ROLES)
 
     def test_models_default_is_not_a_role_fallback(self):
-        cfg = Config(models={"default": ["m"]}, decompose=False, enable_poc=False)
+        cfg = Config(models={"default": ["m"]}, enable_poc=False)
         cfg.history.enabled = False
         cfg.recheck.enabled = False
         self.assertEqual(cfg.models_for("audit"), [])
-        self.assertIn("models.default 已不支持", cfg.model_config_error())
+        self.assertIn("不支持的模型 role: models.default", cfg.model_config_error())
         self.assertIn("audit", cfg.missing_model_roles())
 
     def test_required_roles_accept_explicit_models(self):
         cfg = Config(
             models={
-                "recon": ["m"],
+                "threat": ["m"],
                 "audit": ["m"],
                 "verify": ["m"],
                 "report": ["m"],
             },
-            decompose=False,
             enable_poc=False,
         )
         cfg.history.enabled = False
@@ -299,22 +297,20 @@ class TestConfig(unittest.TestCase):
     def test_active_models_only_include_required_roles(self):
         cfg = Config(
             models={
-                "recon": ["recon-m"],
+                "threat": ["threat-m"],
                 "history": ["unused-history-m"],
                 "recheck": ["unused-recheck-m"],
-                "decompose": ["unused-decompose-m"],
                 "audit": ["audit-m"],
                 "verify": ["verify-m"],
                 "report": ["report-m"],
                 "poc": ["unused-poc-m"],
             },
-            decompose=False,
             enable_poc=False,
         )
         cfg.history.enabled = False
         cfg.recheck.enabled = False
 
-        self.assertEqual(cfg.active_models(), ["recon-m", "audit-m", "verify-m", "report-m"])
+        self.assertEqual(cfg.active_models(), ["threat-m", "audit-m", "verify-m", "report-m"])
         self.assertIn("unused-history-m", cfg.all_models())
         self.assertIn("unused-poc-m", cfg.all_models())
 

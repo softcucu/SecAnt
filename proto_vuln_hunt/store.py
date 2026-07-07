@@ -2,7 +2,8 @@
 
   run.json             —— 清单:id / 时间戳 / 状态 / 配置快照 / 汇总(runs 列表与 dashboard 头部读它)
   checkpoint.json      —— 运行时机制态(round/seq/processed/pending/dedup…),高频小幅刷
-  recon.json           —— 纯静态侦察认知(用途/威胁/仓库知识/build_hint/初始攻击面/历史模式),写一次
+  history.json         —— git 历史安全修复提炼出的历史问题模式
+  threat-analysis/graph.json —— 基于攻击树的威胁分析图(资产/风险/goal/domain/surface/method)
   attack-surface.json  —— 攻击面(初始+动态)+ 覆盖台账 + progress,每轮整体快照(状态持续演变)
   candidates/<hash>.json —— 每条候选/非问题的当前状态(候选、已确认、已否决、验证失败)
   findings/<id>.json   —— 每条确认漏洞一个文件,确认即写;人工反馈可追加更新
@@ -11,8 +12,7 @@
   events.jsonl         —— append-only 事件日志(SSE 重放 / 服务重启回看)
   exports/             —— 按需生成的 MD / SARIF(由 exporters.py 渲染)
 
-判据:会演变的(攻击面/覆盖)单文件快照;漏洞/风险多文件独立寻址;纯认知(recon)单文件。
-旧版单一 state.json 仍可被向后兼容读取(_legacy_combined)。
+判据:会演变的(攻击面/覆盖)单文件快照;漏洞/风险多文件独立寻址;威胁分析与历史模式独立存储。
 Web 的 run 放在 runs_root/<run_id>/;CLI 仍可用 <out_dir>/ 当 run 目录(resume 行为不变)。
 """
 from __future__ import annotations
@@ -54,16 +54,28 @@ class RunStore:
         return os.path.join(self.dir, "run.json")
 
     @property
-    def state_path(self) -> str:                 # 旧版合并文件(仅作兼容读取)
-        return os.path.join(self.dir, "state.json")
-
-    @property
     def checkpoint_path(self) -> str:            # 运行时机制态(高频小幅刷)
         return os.path.join(self.dir, "checkpoint.json")
 
     @property
-    def recon_path(self) -> str:                 # 纯静态侦察认知(写一次)
-        return os.path.join(self.dir, "recon.json")
+    def history_path(self) -> str:
+        return os.path.join(self.dir, "history.json")
+
+    @property
+    def threat_analysis_dir(self) -> str:
+        return os.path.join(self.dir, "threat-analysis")
+
+    @property
+    def threat_analysis_raw_path(self) -> str:
+        return os.path.join(self.threat_analysis_dir, "raw.json")
+
+    @property
+    def threat_analysis_path(self) -> str:
+        return os.path.join(self.threat_analysis_dir, "graph.json")
+
+    @property
+    def threat_analysis_warnings_path(self) -> str:
+        return os.path.join(self.threat_analysis_dir, "warnings.json")
 
     @property
     def attack_surface_path(self) -> str:        # 攻击面(初始+动态)+ 覆盖台账(每轮快照)
@@ -106,8 +118,8 @@ class RunStore:
         return self
 
     def exists(self) -> bool:
-        return (os.path.isfile(self.manifest_path) or os.path.isfile(self.state_path)
-                or os.path.isfile(self.checkpoint_path) or os.path.isfile(self.recon_path))
+        return (os.path.isfile(self.manifest_path) or os.path.isfile(self.checkpoint_path)
+                or os.path.isfile(self.threat_analysis_path) or os.path.isfile(self.attack_surface_path))
 
     def delete(self) -> bool:
         """整目录删除该 run(不可逆)。目录不存在视为已删除,返回 False。"""
@@ -167,10 +179,6 @@ class RunStore:
         except Exception:
             return None
 
-    def _legacy_combined(self) -> Optional[Dict[str, Any]]:
-        """旧版单一 state.json(把所有东西塞一起的格式),仅用于向后兼容读取。"""
-        return self._read_json(self.state_path)
-
     @staticmethod
     def _safe_id(fid: str) -> bool:
         return bool(fid) and "/" not in fid and "\\" not in fid and not fid.startswith(".")
@@ -180,17 +188,29 @@ class RunStore:
         _atomic_write(self.checkpoint_path, json.dumps(d, ensure_ascii=False))
 
     def load_checkpoint(self) -> Optional[Dict[str, Any]]:
-        return self._read_json(self.checkpoint_path) or self._legacy_combined()
+        d = self._read_json(self.checkpoint_path)
+        return d if isinstance(d, dict) else None
 
-    # recon:纯静态侦察认知
-    def save_recon(self, d: Dict[str, Any]) -> None:
-        _atomic_write(self.recon_path, json.dumps(d, ensure_ascii=False, indent=2))
+    # history:历史安全修复提炼出的模式库
+    def save_history(self, items: List[Dict[str, Any]]) -> None:
+        _atomic_write(self.history_path, json.dumps(items or [], ensure_ascii=False, indent=2))
 
-    def load_recon(self) -> Dict[str, Any]:
-        d = self._read_json(self.recon_path)
-        if d is not None:
-            return d
-        return (self._legacy_combined() or {}).get("recon") or {}
+    def load_history(self) -> List[Dict[str, Any]]:
+        d = self._read_json(self.history_path)
+        return d if isinstance(d, list) else []
+
+    # threat-analysis:攻击树威胁分析图
+    def save_threat_analysis(self, graph: Dict[str, Any], raw: Optional[Dict[str, Any]] = None) -> None:
+        os.makedirs(self.threat_analysis_dir, exist_ok=True)
+        if raw is not None:
+            _atomic_write(self.threat_analysis_raw_path, json.dumps(raw, ensure_ascii=False, indent=2))
+        _atomic_write(self.threat_analysis_path, json.dumps(graph, ensure_ascii=False, indent=2))
+        warnings = graph.get("warnings") if isinstance(graph, dict) else []
+        _atomic_write(self.threat_analysis_warnings_path, json.dumps(warnings or [], ensure_ascii=False, indent=2))
+
+    def load_threat_analysis(self) -> Dict[str, Any]:
+        d = self._read_json(self.threat_analysis_path)
+        return d if isinstance(d, dict) else {}
 
     # attack-surface:攻击面(初始+动态)+ 覆盖台账 + progress
     def save_attack_surface(self, d: Dict[str, Any]) -> None:
@@ -198,15 +218,10 @@ class RunStore:
 
     def load_attack_surface(self) -> Dict[str, Any]:
         d = self._read_json(self.attack_surface_path)
-        if d is not None:
+        if isinstance(d, dict):
             return d
-        leg = self._legacy_combined() or {}
-        ledger = leg.get("auditLedger", [])
-        return {"round": leg.get("round", 0), "ledger": ledger, "surfaces": leg.get("surfaceLog", []),
-                "regions": (leg.get("recon") or {}).get("regions", []),
-                "progress": {"done": sum(1 for r in ledger if str(r.get("status")).startswith("completed")),
-                             "clean": sum(1 for r in ledger if r.get("status") == "completed-clean"),
-                             "total": len(ledger)}}
+        return {"round": 0, "ledger": [], "surfaces": [], "regions": [],
+                "progress": {"done": 0, "clean": 0, "total": 0}}
 
     # findings:每条确认漏洞一个文件
     def save_finding(self, rec: Dict[str, Any]) -> None:
@@ -219,11 +234,8 @@ class RunStore:
         if not self._safe_id(fid):
             return None
         d = self._read_json(os.path.join(self.findings_dir, f"{fid}.json"))
-        if d is not None:
+        if isinstance(d, dict):
             return d
-        for c in (self._legacy_combined() or {}).get("confirmed", []):
-            if c.get("id") == fid:
-                return c
         return None
 
     def update_finding_feedback(self, fid: str, feedback: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -249,7 +261,7 @@ class RunStore:
                         out.append(d)
         if out:
             return out
-        return (self._legacy_combined() or {}).get("confirmed", [])
+        return []
 
     # candidates:候选 / 已确认 / 已否决 / 验证失败的当前态
     @staticmethod
@@ -303,7 +315,7 @@ class RunStore:
                         out.append(d)
         if out:
             return out
-        return (self._legacy_combined() or {}).get("riskNotes", [])
+        return []
 
     # 聚合成 exporters 期望的 state 形状(供导出与兜底)
     def load_full_state(self) -> Dict[str, Any]:
@@ -312,7 +324,8 @@ class RunStore:
         m = self.load_manifest() or {}
         return {
             "round": asf.get("round") or ck.get("round") or 0,
-            "recon": self.load_recon(),
+            "history": self.load_history(),
+            "threatAnalysis": self.load_threat_analysis(),
             "surfaceLog": asf.get("surfaces", []),
             "auditLedger": asf.get("ledger", []),
             "riskNotes": self.load_risks(),
@@ -478,7 +491,7 @@ class RunRegistry:
             if not m:
                 continue
             cfg = m.get("config") or {}
-            history_count = len((store.load_recon() or {}).get("history") or [])
+            history_count = len(store.load_history())
             out.append({
                 "id": m.get("id", name), "status": m.get("status"),
                 "created_at": m.get("created_at"), "updated_at": m.get("updated_at"),

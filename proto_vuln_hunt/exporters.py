@@ -1,6 +1,6 @@
 """从结构化 run 态按需渲染 Markdown / SARIF(不在 run 过程中写盘)。
 
-输入是 RunStore.load_full_state() 聚合出的 state(其 recon / auditLedger / surfaceLog / riskNotes / confirmed)
+输入是 RunStore.load_full_state() 聚合出的 state(其 threatAnalysis / history / auditLedger / surfaceLog / riskNotes / confirmed)
 加一个 meta(target / scope / threat_model / methods / backend)。供 Web 导出端点与 CLI `--export` 复用。
 """
 from __future__ import annotations
@@ -28,20 +28,32 @@ def _as_md(v: Any, empty: str = "(无)") -> str:
     return str(v) if v else empty
 
 
-# ──────────────────────── RECON.md ────────────────────────
-def render_recon_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
-    sd = state.get("recon") or {}
+# ──────────────────────── THREAT-ANALYSIS.md ────────────────────────
+def render_threat_analysis_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
+    graph = state.get("threatAnalysis") or {}
     sn = _scope_note(meta)
-    rg = sorted(sd.get("regions") or [], key=lambda r: SEV_RANK.get(r.get("priority"), 3))
-    if rg:
-        rows = ["| 优先级 | 攻击面区域 | 类别 | 不可信输入 | 信任边界 | 涉及文件 |", "|---|---|---|---|---|---|"]
-        for r in rg:
-            rows.append(f"| {r.get('priority') or '?'} | {r.get('name') or ''} | {r.get('category') or ''} | "
-                        f"{_nl(r.get('untrusted_input'))} | {_nl(r.get('trust_boundary')) or '—'} | {', '.join(r.get('files') or [])} |")
-        reg_table = "\n".join(rows)
+    assets = graph.get("assets") or []
+    audit_items = graph.get("audit_items") or []
+    stats = graph.get("stats") or {}
+    if assets:
+        rows = ["| 关键资产 | 类型 | 重要性 | 关键风险 |", "|---|---|---|---|"]
+        for a in assets:
+            risks = "；".join(r.get("name") or "" for r in (a.get("risks") or []))
+            rows.append(f"| {a.get('name') or ''} | {a.get('asset_type') or ''} | {a.get('criticality') or ''} | {_nl(risks)} |")
+        asset_table = "\n".join(rows)
     else:
-        reg_table = "(无)"
-    hist = sd.get("history") or []
+        asset_table = "(威胁分析未识别关键资产)"
+    if audit_items:
+        rows = ["| 优先级 | 关键资产 | 攻击目标 | 攻击域 | 攻击面 | 攻击方式 | 代码路径 |", "|---|---|---|---|---|---|---|"]
+        for it in audit_items:
+            ctx = it.get("attack_context") or {}
+            rows.append(f"| {it.get('priority') or ''} | {ctx.get('asset_name') or ''} | {ctx.get('attack_goal') or ''} | "
+                        f"{ctx.get('domain') or ''} | {ctx.get('surface') or ''} | {ctx.get('method') or it.get('name') or ''} | "
+                        f"{', '.join(it.get('files') or []) or '—'} |")
+        item_table = "\n".join(rows)
+    else:
+        item_table = "(威胁分析未生成审计项)"
+    hist = state.get("history") or []
     if hist:
         rows = ["| 历史问题模式 | 出处 | 相关 lens | 涉及文件 |", "|---|---|---|---|"]
         for h in hist:
@@ -50,14 +62,12 @@ def render_recon_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
     else:
         hist_table = "(未提炼到历史问题模式)"
     return (
-        f"# 侦察 / 威胁建模报告 — {meta.get('target')}{sn}\n\n"
-        f"**威胁模型**: {meta.get('threat_model')}　|　**生成阶段**: Recon\n\n"
-        f"## 1. 项目用途与目标(它是做什么的)\n{sd.get('purpose') or '(侦察未归纳)'}\n\n"
-        f"## 2. 威胁分析\n{_as_md(sd.get('threat_summary'), '(侦察未给出)')}\n\n"
-        f"## 3. 仓库知识与安全背景\n{_as_md(sd.get('repo_knowledge'))}\n\n"
-        f"## 4. 攻击面地图(按优先级)\n{reg_table}\n\n"
-        f"## 5. 历史问题模式(由统一调度的 git history 任务提炼,同类变体排查种子)\n{hist_table}\n\n"
-        f"## 6. 编译提示(供 PoC)\n{sd.get('build_hint') or '(未识别)'}\n\n"
+        f"# 攻击树威胁分析 — {meta.get('target')}{sn}\n\n"
+        f"**威胁模型**: {meta.get('threat_model')}　|　资产 {stats.get('assets', 0)} 个,攻击树 {stats.get('trees', 0)} 棵,"
+        f"攻击面 {stats.get('surfaces', 0)} 个,攻击方式 {stats.get('methods', 0)} 个。\n\n"
+        f"## 1. 关键资产\n{asset_table}\n\n"
+        f"## 2. 攻击方式审计清单\n{item_table}\n\n"
+        f"## 3. 历史问题模式(同类变体排查种子)\n{hist_table}\n\n"
         "---\n*由 proto-vuln-hunt(python) 从结构化态导出。*\n"
     )
 
@@ -65,7 +75,7 @@ def render_recon_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
 # ──────────────────────── ATTACK-SURFACE.md ────────────────────────
 def render_attack_surface_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
     sn = _scope_note(meta)
-    regions = (state.get("recon") or {}).get("regions") or []
+    attack_items = (state.get("threatAnalysis") or {}).get("audit_items") or []
     surface_log = state.get("surfaceLog") or []
     ledger = state.get("auditLedger") or []
     led_by_key = {r.get("key"): r for r in ledger}
@@ -74,12 +84,14 @@ def render_attack_surface_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str
         rec = led_by_key.get(key)
         return LEDGER_STATUS.get(rec["status"] if rec else "pending", "⏳ 待审")
 
-    init = sorted(regions, key=lambda r: SEV_RANK.get(r.get("priority"), 3))
+    init = sorted(attack_items, key=lambda r: SEV_RANK.get(r.get("priority"), 3))
     if init:
-        rows = ["| 状态 | 优先级 | 区域 | 类别 | 不可信输入 | 涉及文件 |", "|---|---|---|---|---|---|"]
+        rows = ["| 状态 | 优先级 | 资产 | 攻击目标 | 攻击面 | 攻击方式 | 涉及文件 |", "|---|---|---|---|---|---|---|"]
         for r in init:
-            rows.append(f"| {label('region:' + str(r.get('name')))} | {r.get('priority') or '?'} | {r.get('name') or ''} | "
-                        f"{r.get('category') or ''} | {_nl(r.get('untrusted_input'))} | {', '.join(r.get('files') or [])} |")
+            ctx = r.get("attack_context") or {}
+            rows.append(f"| {label('attack_method:' + str(r.get('id') or r.get('name')))} | {r.get('priority') or '?'} | "
+                        f"{ctx.get('asset_name') or ''} | {ctx.get('attack_goal') or ''} | {ctx.get('surface') or ''} | "
+                        f"{ctx.get('method') or r.get('name') or ''} | {', '.join(r.get('files') or []) or '—'} |")
         init_table = "\n".join(rows)
     else:
         init_table = "(无)"
@@ -107,10 +119,10 @@ def render_attack_surface_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str
     n_clean = sum(1 for r in ledger if r.get("status") == "completed-clean")
     return (
         f"# 攻击面(初始 + 审计中动态扩展)+ 审计覆盖 — {meta.get('target')}{sn}\n\n"
-        f"**威胁模型**: {meta.get('threat_model')}　|　详见 RECON.md。\n"
+        f"**威胁模型**: {meta.get('threat_model')}　|　详见 THREAT-ANALYSIS.md。\n"
         f"**状态图例**: {'　'.join(LEDGER_STATUS.values())}\n"
         f"**进度**: 已完成 {n_done} 项(其中未发现漏洞 {n_clean} 项),台账共 {len(ledger)} 项。\n\n"
-        f"## A. 初始攻击面(侦察阶段)\n{init_table}\n\n"
+        f"## A. 攻击树审计项\n{init_table}\n\n"
         f"## B. 审计中动态新增的攻击面\n{dyn_table}\n\n"
         f"## C. 审计覆盖台账(每个工作项的结果,含\"审过但未发现漏洞\")\n{led_table}\n\n"
         "---\n*由 proto-vuln-hunt(python) 从结构化态导出。*\n"
@@ -219,68 +231,6 @@ def _render_verify_votes_md(votes: List[Dict[str, Any]]) -> str:
     return "".join(rows)
 
 
-def _code_block(code: Optional[str], lang: str = "c") -> str:
-    """把代码原文包成 ```lang 代码块;已自带围栏的原样返回;空则给占位。"""
-    s = (code or "").strip()
-    if not s:
-        return "_(未取到代码)_"
-    if s.startswith("```"):
-        return s
-    return f"```{lang}\n{s}\n```"
-
-
-def render_history_report_body(struct: Dict[str, Any], finding: Dict[str, Any]) -> str:
-    """仅历史模式:把 report 结构化字段套用统一模板渲染成报告正文 Markdown。"""
-    s = struct or {}
-    loc = (s.get("vuln_code_loc") or "").strip() or \
-        f"{finding.get('file') or ''}:{finding.get('line') or '?'}"
-    chain = s.get("call_chain") or []
-    parts: List[str] = []
-
-    parts.append(f"## 一、漏洞概述\n\n{s.get('summary') or finding.get('title') or '(无)'}\n")
-
-    parts.append("## 二、漏洞分析\n")
-    parts.append(f"**漏洞描述**\n\n{s.get('description') or '(无)'}\n")
-    parts.append(f"**漏洞代码(完整上下文)** `{loc}`\n\n{_code_block(s.get('vuln_code'))}\n")
-    if (s.get("judgement") or "").strip():
-        parts.append(f"**漏洞判定原因**\n\n{s.get('judgement')}\n")
-    parts.append(f"**数据流**\n\n{s.get('data_flow') or '(无)'}\n")
-    if chain:
-        parts.append("**可达性调用链**\n\n" + _as_md(chain) + "\n")
-    parts.append(f"**影响与可利用性**\n\n{s.get('impact') or finding.get('exploitability') or '(无)'}\n")
-    if (s.get("mitigations") or "").strip():
-        parts.append(f"**已检查的缓解措施**\n\n{s.get('mitigations')}\n")
-
-    parts.append(f"## 三、PoC / 验证结果\n\n{s.get('poc_result') or '(无)'}\n")
-    parts.append(f"## 四、修复建议\n\n{s.get('fix_suggestion') or '(无)'}\n")
-
-    h = s.get("history") or {}
-    hp: List[str] = ["## 五、与历史问题的对比\n"]
-    if (h.get("source") or "").strip():
-        hp.append(f"- **历史出处**:{h.get('source')}")
-    hp.append(f"- **历史根因**:{h.get('root_cause') or finding.get('variant_of') or '(无)'}")
-    hp.append("")
-    if (h.get("root_cause_analysis") or "").strip():
-        hp.append(f"**历史问题根因分析**\n\n{h.get('root_cause_analysis')}\n")
-    hp.append("**历史修复前(有问题,完整上下文)**\n\n" + _code_block(h.get("before_code")) + "\n")
-    hp.append("**历史修复后(正确,完整上下文)**\n\n" + _code_block(h.get("after_code")) + "\n")
-    if (h.get("fix_note") or "").strip():
-        hp.append(f"**当时的修复**:{h.get('fix_note')}\n")
-    hp.append(f"**为何此处重蹈覆辙**:{h.get('why_recurred') or '(无)'}\n")
-    comp = h.get("comparison") or []
-    if comp:
-        hp.append("| 维度 | 历史问题 | 本处漏洞 |")
-        hp.append("|---|---|---|")
-        for row in comp:
-            hp.append(f"| {_nl(row.get('dimension'))} | {_nl(row.get('history'))} | {_nl(row.get('current'))} |")
-    parts.append("\n".join(hp) + "\n")
-
-    if (s.get("confidence_basis") or "").strip():
-        parts.append(f"> 置信度:{finding.get('confidence') or '?'} —— {s.get('confidence_basis')}\n")
-
-    return "\n".join(parts)
-
-
 def render_finding_md(finding: Dict[str, Any]) -> str:
     fm = {
         "id": finding.get("id"), "title": finding.get("title"), "bug_class": finding.get("bug_class"),
@@ -293,11 +243,7 @@ def render_finding_md(finding: Dict[str, Any]) -> str:
         "verification_status": finding.get("verification_status") or "",
     }
     fm_lines = "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False) if isinstance(v, str) else v}" for k, v in fm.items())
-    # 仅历史模式:有结构化报告字段时,始终用统一模板现渲染(模板可演进、可重导出)。
-    if isinstance(finding.get("report_struct"), dict):
-        body = render_history_report_body(finding["report_struct"], finding).strip()
-    else:
-        body = (finding.get("report_body") or "").strip()
+    body = (finding.get("report_body") or "").strip()
     if not body:
         poc = finding.get("poc")
         body = (f"## ① 漏洞描述\n{finding.get('description') or finding.get('title')}\n\n"
@@ -332,8 +278,8 @@ def render_index_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
         counts[c.get("bug_class")] = counts.get(c.get("bug_class"), 0) + 1
     top_sev = (final[0].get("corrected_severity") or final[0].get("severity")) if final else "none"
     summary = state.get("summary") or {}
-    regions = (state.get("recon") or {}).get("regions") or []
-    history = (state.get("recon") or {}).get("history") or []
+    attack_items = (state.get("threatAnalysis") or {}).get("audit_items") or []
+    history = state.get("history") or []
     lines = [
         f"# 漏洞挖掘汇总 — {meta.get('target')}{sn}", "",
         f"- 威胁模型: {meta.get('threat_model')}　|　后端: {meta.get('backend')}　|　"
@@ -353,10 +299,12 @@ def render_index_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
                      f"{c.get('file')}:{c.get('line') or 0} | [findings/{c.get('id')}.md](findings/{c.get('id')}.md) |")
     if not final:
         lines.append("| — | — | — | — | (本次未确认漏洞) | — | — |")
-    # 攻击面地图 + 历史模式提要
-    lines += ["", "## 攻击面地图(精炼)", ""]
-    for r in regions:
-        lines.append(f"- **{r.get('name')}** ({r.get('category')}, {r.get('priority')}) — {_nl(r.get('untrusted_input'))}")
+    # 攻击树审计项 + 历史模式提要
+    lines += ["", "## 攻击树审计项(精炼)", ""]
+    for it in attack_items:
+        ctx = it.get("attack_context") or {}
+        lines.append(f"- **{ctx.get('surface') or it.get('name')} / {ctx.get('method') or it.get('name')}** "
+                     f"({it.get('priority')}, {ctx.get('asset_name') or ''}) — {_nl(ctx.get('attack_goal'))}")
     if history:
         lines += ["", "## 历史问题模式", ""]
         for h in history:
@@ -402,7 +350,7 @@ def export_all(out_dir: str, state: Dict[str, Any], meta: Dict[str, Any]) -> Dic
             f.write(text)
         written[name] = path
 
-    w("RECON.md", render_recon_md(state, meta))
+    w("THREAT-ANALYSIS.md", render_threat_analysis_md(state, meta))
     w("ATTACK-SURFACE.md", render_attack_surface_md(state, meta))
     w("RISKS.md", render_risks_md(state, meta))
     w("INDEX.md", render_index_md(state, meta))

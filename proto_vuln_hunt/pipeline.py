@@ -1,9 +1,10 @@
-"""编排器:侦察 → 统一优先级调度(拆解 / history / audit / recheck / 验证流水线) →
+"""编排器:攻击树威胁分析 → 统一优先级调度(history / audit / recheck / 验证流水线) →
 流式产出确认漏洞 →(高危)PoC → 汇总。断点续跑 + 并发门 + CLI 任务失败重试。
 
-结构化为主:运行期**只写结构化态**(经 RunStore 按关注点分文件落盘:checkpoint.json / recon.json /
+结构化为主:运行期**只写结构化态**(经 RunStore 按关注点分文件落盘:checkpoint.json /
+history.json / threat-analysis/graph.json /
 attack-surface.json / findings/<id>.json / risks/<id>.json / usage.jsonl)并发结构化事件(经 EventBus → SSE + events.jsonl);
-不再在运行期写 RECON/ATTACK-SURFACE/RISKS/findings/INDEX/SARIF 这些 Markdown——它们改由 exporters.py
+不再在运行期写 THREAT-ANALYSIS/ATTACK-SURFACE/RISKS/findings/INDEX/SARIF 这些 Markdown——它们改由 exporters.py
 从结构化态**按需渲染**(Web 导出端点 / CLI `--export`)。漏洞/风险确认即各写一个文件(流式落盘)。
 """
 from __future__ import annotations
@@ -19,19 +20,17 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from . import events as EV
-from . import exporters as export
 from . import schemas as S
+from . import threat_analysis as TA
 from .backends import AgentRunner
 from .common import (QUALITY_FINDING_STATUS, QUALITY_FINDING_TAG, class_code,
                      finalize_findings, finding_key, is_quality_issue_finding,
                      item_key, most_severe, pad3, slim_finding)
-from .config import RUN_MODE_HISTORY_ONLY, Config, normalize_model_time_windows_with_errors, normalize_models
+from .config import Config, normalize_model_time_windows_with_errors, normalize_models
 from .prompts import PromptBuilder
 from .store import RunStore, STATUS_DONE, STATUS_ERROR, STATUS_INCOMPLETE, STATUS_RUNNING, STATUS_STOPPED
 
 _CODE_REF_RE = re.compile(r"\S+:\d+")
-_SOURCE_EXTS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inc", ".ipp", ".s", ".S"}
-_COUNT_SKIP_DIRS = {".git", ".proto-vuln-hunt", "pvh-runs"}
 _FINAL_DECISIONS = {"confirmed", "rejected", "suppressed_unproven", "needs_manual_review"}
 
 
@@ -54,7 +53,7 @@ class Pipeline:
         self.health_state: Dict[str, Dict[str, Any]] = {}   # model -> 最新健康记录
 
         # ── 运行状态(可被断点恢复) ──
-        self.surface_data: Dict[str, Any] = {}
+        self.threat_graph: Dict[str, Any] = {}
         self.regions: List[Dict[str, Any]] = []
         self.history: List[Dict[str, Any]] = []      # 由 git 历史挖掘回灌的「历史问题模式」
         self.history_keys = set()                    # 历史模式去重(按 pattern 文本)
@@ -77,8 +76,6 @@ class Pipeline:
         self.queue: List[Dict[str, Any]] = []
         self._queue_seq = 0
         self._audit_passes: Dict[str, Dict[str, Any]] = {}
-        self._decompose_total = 0
-        self._decompose_done = 0
         self._history_enqueued = False
         self._retrying_past_max_rounds = False
         self._final_failed_sweep_done = False
@@ -343,11 +340,11 @@ class Pipeline:
     def _has_incomplete_counts(counts: Dict[str, int]) -> bool:
         return any(int(v or 0) > 0 for v in counts.values())
 
-    def persist_recon(self) -> None:
+    def persist_history(self) -> None:
         try:
-            self.store.save_recon(self.surface_data)
+            self.store.save_history(self.history)
         except Exception as e:  # noqa: BLE001
-            self.log(f"⚠ recon 写入失败(忽略继续): {str(e)[:120]}")
+            self.log(f"⚠ history 写入失败(忽略继续): {str(e)[:120]}")
 
     def checkpoint(self, rnd: int) -> None:
         """每个检查点:刷机制态 + 攻击面/覆盖快照 + 汇总(漏洞/风险已各自即时落盘)。"""
@@ -462,17 +459,13 @@ class Pipeline:
 
     def _work_priority(self, item: Dict[str, Any]) -> int:
         kind = item.get("kind")
-        if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY and kind == "_finding":
-            return 0
         if kind == "_recheck":
-            return 5 if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY else 0
+            return 0
         if kind == "_finding":
             return 5
         if kind in ("_finder", "_history_commit"):
             return 20 + self._area_rank(item)
-        if kind == "region" and self.cfg.decompose:
-            return 40 + self._area_rank(item)
-        if kind in ("region", "task", "surface"):
+        if kind in ("task", "surface", "attack_method"):
             return 20 + self._area_rank(item)
         return 50
 
@@ -486,25 +479,13 @@ class Pipeline:
             return "history"
         if kind == "_finder":
             return "audit"
-        if kind == "region" and self.cfg.decompose:
-            return "decompose"
         return None
 
     def _work_sort_key(self, item: Dict[str, Any]) -> tuple[int, int]:
         return (self._work_priority(item), int(item.get("_queue_seq") or 0))
 
     def _recheck_concurrency_limit(self) -> int:
-        """recheck 专用闸的并发上限。
-        普通模式:走 cfg.recheck.concurrency(默认 1,逐条串行排查)。
-        仅历史问题模式:recheck 即主力管线,解除这道专用闸——改由全局并发 + 模型槽位
-        约束(限额取 role 容量;后续 role 级闸 role_capacity_limit/模型信号量仍会兜底,
-        不会超发)。这样仪表盘里调的全局并发 / 每模型并发就能真正驱动实时 recheck 并行。
-        """
-        if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY:
-            limit_fn = getattr(self.runner, "role_capacity_limit", None)
-            if callable(limit_fn):
-                return max(1, int(limit_fn("recheck")))
-            return max(1, int(self.cfg.concurrency))
+        """recheck 专用闸的并发上限:默认 1,逐条串行排查历史变体和风险点。"""
         return max(1, int(self.cfg.recheck.concurrency))
 
     def _can_dispatch_work(self, item: Dict[str, Any]) -> bool:
@@ -550,11 +531,7 @@ class Pipeline:
         return self._RISK_SEV_ORDER.get(sev or "info", 0) >= self._RISK_SEV_ORDER.get(th, 2)
 
     def _enqueue_risk(self, note: Dict[str, Any]) -> None:
-        """把一条风险点放进优先排查队列(置 recheck_status=queued)。调用方负责落盘。
-        仅历史模式不放回风险线索:这里是把风险点重新投入排查队列的唯一闸口,
-        命中该模式时直接不入队(只走 recheck→verify→report→可选 poc,不再触发 audit 扩面)。"""
-        if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY:
-            return
+        """把一条风险点放进优先排查队列(置 recheck_status=queued)。调用方负责落盘。"""
         note["recheck_status"] = "queued"
         self.pq.append({"kind": "risk", "id": note["id"], "area": note.get("area"),
                         "note": note.get("note"), "file": note.get("file"),
@@ -578,9 +555,7 @@ class Pipeline:
         self.risk_notes.append(note)
         self.risk_by_id[note["id"]] = note
         # 达阈值且非复查自身产出的风险点 → 自动进专用优先排查队列(防自激:复查产出的不再回灌)。
-        # 仅历史模式:不放回任何风险线索,只记录登记供报告引用,绝不回灌触发 audit 扩面。
-        enq = (self.cfg.recheck.enabled and not from_recheck and self._risk_sev_ok(note["severity_hint"])
-               and self.cfg.run_mode != RUN_MODE_HISTORY_ONLY)
+        enq = self.cfg.recheck.enabled and not from_recheck and self._risk_sev_ok(note["severity_hint"])
         if enq:
             note["recheck_status"] = "queued"
         self.store.save_risk(note)            # 写一次即落盘:risks/<id>.json
@@ -711,9 +686,7 @@ class Pipeline:
             "concurrency": cfg.concurrency, "threat_model": cfg.threat_model,
             "lenses": cfg.lenses, "finders_per_lens": cfg.finders_per_lens,
             "max_rounds": cfg.max_rounds, "dry_rounds": cfg.dry_rounds,
-            "verify_votes": cfg.verify_votes, "enable_poc": cfg.enable_poc, "decompose": cfg.decompose,
-            "unit_line_budget": cfg.unit_line_budget, "max_files_per_unit": cfg.max_files_per_unit,
-            "max_subtasks_per_region": cfg.max_subtasks_per_region,
+            "verify_votes": cfg.verify_votes, "enable_poc": cfg.enable_poc,
             "methods_dir": cfg.methods_abs, "methods_ok": cfg.methods_ok(),
         }
 
@@ -723,6 +696,9 @@ class Pipeline:
     # ──────────────────────── lens 选择 ────────────────────────
     def lenses_for(self, item: Dict[str, Any]) -> List[str]:
         active = self.cfg.lenses
+        if item.get("kind") == "attack_method":
+            hits = [l for l in (item.get("lens_hints") or [item.get("lens_hint")]) if l in active]
+            return hits or active
         if item.get("kind") == "task":
             hits = [l for l in (item.get("lens_hints") or []) if l in active]
             return hits or active
@@ -731,142 +707,6 @@ class Pipeline:
         if item.get("kind") == "surface" and item.get("lens_hint") in active:
             return [item["lens_hint"]]
         return active
-
-    # ──────────────────────── 区域拆解 ────────────────────────
-    @staticmethod
-    def _path_within(path: str, base: str) -> bool:
-        try:
-            return os.path.commonpath([path, base]) == base
-        except ValueError:
-            return False
-
-    @staticmethod
-    def _count_file_lines(path: str) -> int:
-        lines = 0
-        saw_data = False
-        last = b""
-        try:
-            with open(path, "rb") as f:
-                while True:
-                    chunk = f.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    saw_data = True
-                    lines += chunk.count(b"\n")
-                    last = chunk[-1:]
-        except OSError:
-            return 0
-        if saw_data and last != b"\n":
-            lines += 1
-        return lines
-
-    def _iter_region_code_files(self, region: Dict[str, Any]) -> List[str]:
-        base = os.path.realpath(self._abs_target())
-        out: List[str] = []
-        seen = set()
-        for raw in region.get("files") or []:
-            if not isinstance(raw, str):
-                continue
-            name = raw.strip()
-            if not name:
-                continue
-            if os.path.isabs(name):
-                path = os.path.realpath(os.path.abspath(os.path.expanduser(name)))
-            else:
-                path = os.path.realpath(os.path.abspath(os.path.join(base, name)))
-            if not self._path_within(path, base):
-                continue
-            if os.path.isfile(path):
-                if path not in seen:
-                    seen.add(path)
-                    out.append(path)
-                continue
-            if not os.path.isdir(path):
-                continue
-            for root, dirs, files in os.walk(path):
-                dirs[:] = [d for d in dirs if d not in _COUNT_SKIP_DIRS]
-                for fn in files:
-                    if os.path.splitext(fn)[1].lower() not in _SOURCE_EXTS:
-                        continue
-                    fp = os.path.join(root, fn)
-                    if fp not in seen:
-                        seen.add(fp)
-                        out.append(fp)
-        return out
-
-    def _region_code_volume(self, region: Dict[str, Any]) -> tuple[int, int]:
-        files = self._iter_region_code_files(region)
-        return sum(self._count_file_lines(p) for p in files), len(files)
-
-    def _subtask_limit_for_region(self, region: Dict[str, Any]) -> tuple[int, int, int]:
-        lines, file_count = self._region_code_volume(region)
-        unit = max(1, int(self.cfg.unit_line_budget))
-        max_files = max(1, int(self.cfg.max_files_per_unit))
-        line_units = (lines + unit - 1) // unit if lines > 0 else 0
-        file_units = (file_count + max_files - 1) // max_files if file_count > 0 else 0
-        dynamic = max(1, line_units, file_units) if (line_units or file_units) else 8
-        hard_cap = int(self.cfg.max_subtasks_per_region or 0)
-        if hard_cap > 0:
-            dynamic = min(dynamic, hard_cap)
-        return max(1, dynamic), lines, file_count
-
-    async def decompose_region(self, region: Dict[str, Any]) -> int:
-        rkey = item_key(region)
-        rec = self.ledger_rec(region)
-        tasks: List[Dict[str, Any]] = []
-        subtask_limit, region_lines, region_file_count = self._subtask_limit_for_region(region)
-        if self.cfg.decompose:
-            r = await self.runner.run(
-                self.pb.decompose(region, S.SUBTASKS_SCHEMA, subtask_limit=subtask_limit,
-                                  region_lines=region_lines, region_file_count=region_file_count),
-                role="decompose", label=f"decompose:{str(region.get('name'))[:26]}",
-                schema=S.SUBTASKS_SCHEMA, retries=1, fallback=None)
-            if r and isinstance(r, dict) and isinstance(r.get("subtasks"), list):
-                for s in r["subtasks"][:subtask_limit]:
-                    tasks.append({
-                        "kind": "task", "region": region.get("name"), "objective": s.get("objective") or "(未命名子任务)",
-                        "files": s.get("files") or region.get("files") or [],
-                        "functions": s.get("functions") or [], "entry_points": s.get("entry_points") or region.get("entry_points") or [],
-                        "lens_hints": s.get("lens_hints") or [], "est_lines": s.get("est_lines") or 0,
-                        "category": region.get("category"), "untrusted_input": region.get("untrusted_input"),
-                        "trust_boundary": region.get("trust_boundary"), "priority": region.get("priority"),
-                    })
-        if not tasks:
-            fl = region.get("files") or []
-            if len(fl) > 1:
-                step = self.cfg.max_files_per_unit
-                for i in range(0, len(fl), step):
-                    grp = fl[i:i + step]
-                    tasks.append({"kind": "task", "region": region.get("name"), "objective": f"审计文件 {', '.join(grp)}",
-                                  "files": grp, "functions": [], "entry_points": region.get("entry_points") or [],
-                                  "lens_hints": [], "category": region.get("category"),
-                                  "untrusted_input": region.get("untrusted_input"), "trust_boundary": region.get("trust_boundary"),
-                                  "priority": region.get("priority")})
-                self.log(f"⚠ {region.get('name')} 拆解降级为按文件切({len(tasks)} 个子任务)")
-            else:
-                tasks.append({"kind": "task", "region": region.get("name"), "objective": f"审计区域 {region.get('name')}",
-                              "files": fl, "functions": [], "entry_points": region.get("entry_points") or [],
-                              "lens_hints": [], "category": region.get("category"),
-                              "untrusted_input": region.get("untrusted_input"), "trust_boundary": region.get("trust_boundary"),
-                              "priority": region.get("priority")})
-        for t in tasks:
-            self._enqueue_work(t)
-        self.completed_items.add(rkey)
-        rec["status"] = "decomposed"
-        rec["subtasks"] = len(tasks)
-        rec["subtaskLimit"] = subtask_limit
-        rec["regionLines"] = region_lines
-        rec["regionFiles"] = region_file_count
-        rec["lastRound"] = self.round
-        if self._decompose_total:
-            self._decompose_done += 1
-            if self._decompose_done >= self._decompose_total:
-                task_n = sum(1 for it in self.queue if it.get("kind") == "task")
-                self.emit(EV.DECOMPOSE_DONE, {"tasks": task_n, "regions": self._decompose_done})
-                self.checkpoint(self.round)
-                self.emit_coverage()
-        self.log(f"🧩 拆解 {region.get('name')} → {len(tasks)} 个审计子任务")
-        return len(tasks)
 
     # ──────────────────────── 逐发现流水线:验证→(PoC)→报告正文 ────────────────────────
     @staticmethod
@@ -881,6 +721,7 @@ class Pipeline:
             "good_validation_ref": f.get("good_validation_ref") or "",
             "risk_id": f.get("risk_id") or "",
             "risk_area": f.get("risk_area") or "",
+            "attack_context": f.get("attack_context") or {},
         }
 
     def _save_candidate_state(self, rec: Dict[str, Any]) -> None:
@@ -1489,20 +1330,10 @@ class Pipeline:
                 if poc:
                     self.emit(EV.POC_DONE, {"id": fid, "compiled": poc.get("compiled"), "triggered": poc.get("triggered")})
 
-            # 仅历史模式且命中历史变体:report 只产出结构化 JSON,由程序套统一模板渲染成 MD。
-            if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY and (rec.get("variant_of") or "").strip():
-                struct = await self.runner.run(
-                    self.pb.report_history(rec, poc, S.HISTORY_REPORT_SCHEMA),
-                    role="report", label=f"report:{fid}", schema=S.HISTORY_REPORT_SCHEMA, fallback=None)
-                rec["report_struct"] = struct if isinstance(struct, dict) else None
-                rec["report_body"] = (export.render_history_report_body(struct, rec)
-                                      if isinstance(struct, dict) else "")
-                rec["report_failed"] = not isinstance(struct, dict)
-            else:
-                body = await self.runner.run(self.pb.report_body(rec, poc),
-                                             role="report", label=f"report:{fid}", schema=None, fallback=None)
-                rec["report_body"] = body or ""
-                rec["report_failed"] = not body
+            body = await self.runner.run(self.pb.report_body(rec, poc),
+                                         role="report", label=f"report:{fid}", schema=None, fallback=None)
+            rec["report_body"] = body or ""
+            rec["report_failed"] = not body
             rec["poc"] = poc
             rec["output_ts"] = time.time()
             self.confirmed.append(rec)
@@ -1600,13 +1431,12 @@ class Pipeline:
             return await self.runner.run(self.pb.poc(rec, self.build_hint, S.POC_SCHEMA),
                                          role="poc", label=f"poc:{rec['id']}", schema=S.POC_SCHEMA, cwd=cwd)
 
-    # ──────────────────────── 历史模式导入 / history-only 初始化 ────────────────────────
+    # ──────────────────────── 历史模式导入 ────────────────────────
     @staticmethod
-    def _read_json_obj(path: str) -> Optional[Dict[str, Any]]:
+    def _read_json_doc(path: str) -> Optional[Any]:
         try:
             with open(path, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            return d if isinstance(d, dict) else None
+                return json.load(f)
         except Exception:
             return None
 
@@ -1614,26 +1444,23 @@ class Pipeline:
         raw = os.path.abspath(os.path.expanduser(source or ""))
         if not raw:
             raise ValueError("history_import_from 为空")
-        docs: List[Dict[str, Any]] = []
+        docs: List[Any] = []
         if os.path.isdir(raw):
-            for fn in ("recon.json", "state.json"):
-                d = self._read_json_obj(os.path.join(raw, fn))
-                if d:
-                    docs.append(d)
+            d = self._read_json_doc(os.path.join(raw, "history.json"))
+            if d is not None:
+                docs.append(d)
         elif os.path.isfile(raw):
-            d = self._read_json_obj(raw)
-            if d:
+            d = self._read_json_doc(raw)
+            if d is not None:
                 docs.append(d)
         else:
             raise ValueError(f"history_import_from 不存在: {source}")
 
         for d in docs:
-            hist = d.get("history")
-            if isinstance(hist, list):
-                return hist
-            recon = d.get("recon")
-            if isinstance(recon, dict) and isinstance(recon.get("history"), list):
-                return recon["history"]
+            if isinstance(d, list):
+                return [x for x in d if isinstance(x, dict)]
+            if isinstance(d, dict) and isinstance(d.get("history"), list):
+                return [x for x in d["history"] if isinstance(x, dict)]
         return []
 
     def _normalize_history_entry(self, raw: Dict[str, Any], *, source_hint: str = "") -> Optional[Dict[str, Any]]:
@@ -1662,10 +1489,9 @@ class Pipeline:
             return False
         self.history_keys.add(pk)
         self.history.append(entry)
-        self.surface_data["history"] = self.history
         self._enqueue_variant(entry)
         self.emit(EV.HISTORY_ADDED, {**entry, "total": len(self.history), "imported": imported})
-        self.persist_recon()
+        self.persist_history()
         prefix = "导入历史模式" if imported else "历史模式"
         self.log(f"🕮 {prefix} +1[{entry['lens_hint']}]:{pattern[:60]} ← {str(entry.get('source') or '')[:40]}")
         return True
@@ -1682,40 +1508,22 @@ class Pipeline:
         if not raw_items or added == 0:
             raise ValueError(f"未能从 {source} 导入任何历史问题模式")
         self._history_enqueued = True
-        self.persist_recon()
+        self.persist_history()
         self.checkpoint(self.round)
         self.emit_coverage()
         self.log(f"🕮 已从 {source} 导入 {added} 条历史问题模式;跳过 git commit 分析")
         return added
 
-    def init_history_only_surface(self) -> None:
-        self.surface_data = {
-            "purpose": "仅历史漏洞排查",
-            "threat_summary": ["本次 run 只基于历史安全修复模式做同类变体排查。"],
-            "repo_knowledge": [],
-            "regions": [],
-            "history": self.history,
-            "build_hint": "",
-        }
-        self.regions = []
-        self.build_hint = ""
-        self.persist_recon()
-        self.emit(EV.RECON_DONE, {"resumed": False, "regions": 0, "history": len(self.history),
-                                  "purpose": self.surface_data["purpose"],
-                                  "threat_summary": self.surface_data["threat_summary"],
-                                  "history_only": True})
-        self.checkpoint(0)
-        self.emit_coverage()
-
-    # ──────────────────────── 阶段 ① 侦察 / 断点恢复 ────────────────────────
+    # ──────────────────────── 阶段 ① 威胁分析 / 断点恢复 ────────────────────────
     def restore_checkpoint(self) -> bool:
         """恢复断点机制态。成功后 history 挖掘可立即跳过已分析提交。"""
         if self._restored_checkpoint:
             return True
         ckpt = self.store.load_checkpoint() if self.cfg.resume else None
-        recon_doc = self.store.load_recon() if self.cfg.resume else {}
-        if ckpt and recon_doc and isinstance(ckpt.get("pendingQueue"), list):
-            self.surface_data = recon_doc
+        threat_doc = self.store.load_threat_analysis() if self.cfg.resume else {}
+        if ckpt and isinstance(ckpt.get("pendingQueue"), list):
+            self.threat_graph = threat_doc or {}
+            self.history = self.store.load_history() if self.cfg.resume else []
             self.seq = ckpt.get("seq", 0)
             self.risk_seq = ckpt.get("risk_seq", 0)
             self.start_round = ckpt.get("round", 0)
@@ -1727,11 +1535,6 @@ class Pipeline:
             self.completed_items.update(ckpt.get("completedItems") or [])
             self.queue = ckpt.get("pendingQueue") or []
             self.pq = ckpt.get("pendingPriorityQueue") or []
-            # 兼容旧断点:历史变体过去落在主队列,迁移到优先排查队列
-            legacy_variants = [it for it in self.queue if it.get("kind") == "variant"]
-            if legacy_variants:
-                self.queue = [it for it in self.queue if it.get("kind") != "variant"]
-                self.pq.extend(legacy_variants)
             asf = self.store.load_attack_surface()
             self.surface_log = asf.get("surfaces") or []
             self.ledger_arr = asf.get("ledger") or []
@@ -1754,61 +1557,61 @@ class Pipeline:
                 fk = finding_key(f)
                 self.pending_findings[fk] = f
                 self.dedup_keys.add(fk)
-            self.regions = self.surface_data.get("regions") or []
-            self.history = self.surface_data.get("history") or []
+            self.regions = asf.get("regions") or self.threat_graph.get("audit_items") or []
             for h in self.history:
                 self.history_keys.add((h.get("pattern") or "").strip().lower())
             self.history_done.update(ckpt.get("historyDone") or [])
             self._enqueue_failed_rechecks()
-            self.build_hint = self.surface_data.get("build_hint") or ""
+            self.build_hint = ""
             quality_issues = sum(1 for c in self.confirmed if is_quality_issue_finding(c))
             confirmed_real = max(0, len(self.confirmed) - quality_issues)
             self.log(f"♻ 从断点恢复:已完成 {self.start_round} 轮,确认 {confirmed_real} 条,质量问题 {quality_issues} 条,待审队列 {len(self.queue)} 项,"
                      f"在途候选 {len(self.pending_findings)} 条,已处理 {len(self.processed_keys)} 个,已完成攻击面 {len(self.completed_items)} 个")
-            self.emit(EV.RECON_DONE, {"resumed": True, "regions": len(self.regions), "history": len(self.history),
-                                      "purpose": self.surface_data.get("purpose"),
-                                      "threat_summary": self.surface_data.get("threat_summary")})
+            if self.threat_graph:
+                stats = self.threat_graph.get("stats") or {}
+                self.emit(EV.THREAT_ANALYSIS_DONE, {"resumed": True, **stats,
+                                                    "warnings": len(self.threat_graph.get("warnings") or [])})
             self.emit_coverage()
             self._restored_checkpoint = True
             return True
         return False
 
-    async def recon(self, *, try_restore: bool = True) -> None:
+    async def threat_analysis(self, *, try_restore: bool = True) -> None:
         if try_restore and self.restore_checkpoint():
             return
         if self.cfg.resume:
-            self.log("未找到可用断点,从头开始侦察")
-        surface = await self.runner.run(self.pb.recon(S.SURFACE_SCHEMA), role="recon", label="recon",
-                                        schema=S.SURFACE_SCHEMA, retry_forever=True, fallback=None,
-                                        should_stop=self.stop_requested)
-        if not surface and self.stop_requested():
-            self.log("侦察阶段收到停止请求,不再兜底继续")
+            self.log("未找到可用断点,从头开始攻击树威胁分析")
+        raw = await self.runner.run(self.pb.threat_analysis(S.THREAT_ANALYSIS_SCHEMA),
+                                    role="threat", label="threat-analysis",
+                                    schema=S.THREAT_ANALYSIS_SCHEMA, retry_forever=True,
+                                    fallback=None, should_stop=self.stop_requested)
+        if not raw and self.stop_requested():
+            self.log("威胁分析阶段收到停止请求,不再继续")
             return
-        if not surface:
-            self.log("⚠ 侦察失败,使用兜底攻击面继续审计")
-            surface = {
-                "regions": [{"name": "全仓(侦察失败兜底)", "category": "parser",
-                             "files": [self.cfg.scope] if self.cfg.scope else ["."], "entry_points": [],
-                             "untrusted_input": "协议/文件/网络输入(侦察未细分)", "trust_boundary": "",
-                             "crypto_apis": [], "priority": "high"}],
-                "history": [], "build_hint": "", "repo_knowledge": "(侦察阶段失败,无仓库知识)",
-            }
-        self.surface_data = surface
-        self.regions = sorted(surface.get("regions") or [], key=lambda r: ({"high": 0, "medium": 1, "low": 2}).get(r.get("priority"), 3))
-        # 历史问题模式不再由侦察 agent 产出,改由 history 任务在统一队列中产出。
-        self.surface_data["history"] = self.history
-        self.build_hint = surface.get("build_hint") or ""
-        for r in self.regions:
-            self._enqueue_work({"kind": "region", **r})
-        self.log(f"侦察完成:攻击面区域 {len(self.regions)} 个,build_hint {'有' if self.build_hint else '无'}"
-                 f"(历史问题模式由统一调度的 git history 任务产出)")
-        if surface.get("purpose"):
-            self.log(f"项目用途: {str(surface['purpose'])[:120]}")
-        self.emit(EV.RECON_DONE, {"resumed": False, "regions": len(self.regions),
-                                  "purpose": surface.get("purpose"), "threat_summary": surface.get("threat_summary"),
-                                  "build_hint": self.build_hint})
-        self.persist_recon()
+        if not isinstance(raw, dict):
+            self.log("⚠ 威胁分析失败:未得到合法攻击树结构,本次不会产生审计项")
+            raw = {"assets": [], "attack_trees": [], "code_path_mappings": []}
+        graph = TA.normalize(raw)
+        self.threat_graph = graph
+        self.regions = sorted(graph.get("audit_items") or [],
+                              key=lambda r: ({"high": 0, "medium": 1, "low": 2}).get(r.get("priority"), 3))
+        self.build_hint = ""
+        for item in self.regions:
+            self._enqueue_work(item)
+        try:
+            self.store.save_threat_analysis(graph, raw=raw)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"⚠ 威胁分析图写入失败(忽略继续): {str(e)[:120]}")
+        stats = graph.get("stats") or {}
+        self.log("攻击树威胁分析完成:"
+                 f"资产 {stats.get('assets', 0)} 个,攻击树 {stats.get('trees', 0)} 棵,"
+                 f"攻击面 {stats.get('surfaces', 0)} 个,攻击方式 {stats.get('methods', 0)} 个,"
+                 f"审计项 {stats.get('audit_items', 0)} 个")
+        if graph.get("warnings"):
+            self.log(f"⚠ 威胁分析规范化告警 {len(graph.get('warnings') or [])} 条,详见 threat-analysis/warnings.json")
+        self.emit(EV.THREAT_ANALYSIS_DONE, {**stats, "warnings": len(graph.get("warnings") or [])})
         self.checkpoint(0)
+        self.emit_coverage()
 
     def _mark_retry_after_failure(self, item: Dict[str, Any]) -> int:
         n = int(item.get("retry_after_failure") or 0) + 1
@@ -1993,11 +1796,6 @@ class Pipeline:
 
     def _pop_next_work(self) -> Optional[Dict[str, Any]]:
         self._ensure_queue_order()
-        if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY:
-            work = self._pop_dispatchable_queued_kind("_finding")
-            if work is not None:
-                return work
-
         if self.cfg.recheck.enabled and self.pq and self._active_roles.get("recheck", 0) < self._recheck_concurrency_limit():
             probe = {"kind": "_recheck"}
             if self._can_dispatch_work(probe):
@@ -2014,7 +1812,7 @@ class Pipeline:
             expanded = False
             for idx, item in ordered:
                 kind = item.get("kind")
-                if kind == "task" or kind == "surface" or (kind == "region" and not self.cfg.decompose):
+                if kind in ("task", "surface", "attack_method"):
                     self.queue.pop(idx)
                     self._start_audit_pass(item)
                     expanded = True
@@ -2051,8 +1849,6 @@ class Pipeline:
                 finally:
                     self._recheck_inflight -= 1
                 return
-            if kind == "region" and self.cfg.decompose:
-                await self.decompose_region(work)
         finally:
             if role:
                 self._active_roles[role] = max(0, self._active_roles.get(role, 0) - 1)
@@ -2062,7 +1858,7 @@ class Pipeline:
                              extra_pending: Optional[Callable[[], bool]] = None) -> None:
         """统一调度循环。
 
-        stop_when 用于 recon 并行窗口:条件满足后不再启动新工作,但会等待已启动工作收尾;
+        stop_when 用于威胁分析并行窗口:条件满足后不再启动新工作,但会等待已启动工作收尾;
         stop_when_idle=True 用于正式审计阶段:队列和在途项都清空后退出。
         """
         active: List[asyncio.Task] = []
@@ -2125,9 +1921,6 @@ class Pipeline:
         self.round = self.start_round
         self._retrying_past_max_rounds = False
         self._enqueue_history_commits()
-        self._decompose_total = sum(1 for it in self.queue if it.get("kind") == "region" and item_key(it) not in self.completed_items)
-        if self._decompose_total and self.cfg.decompose:
-            self.log(f"区域拆解已入统一队列:{self._decompose_total} 个 region 将按优先级逐步拆解,拆出即审")
 
         await self._run_scheduler(stop_when_idle=True, extra_pending=self._history_active)
         final_sweep_enqueued = 0
@@ -2143,10 +1936,7 @@ class Pipeline:
         else:
             self._final_failed_sweep_done = True
         if not self.queue and not self.pq and not self._audit_passes and not self._recheck_inflight:
-            if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY:
-                self.log("历史问题排查完成:工作队列已排空,审计结束")
-            else:
-                self.log(f"轮 {self.round}: 工作队列已空且无新攻击面回灌")
+            self.log(f"轮 {self.round}: 工作队列已空且无新攻击面回灌")
 
         incomplete = self._incomplete_counts()
         if self.stop_requested():
@@ -2235,6 +2025,13 @@ class Pipeline:
             self.dedup_keys.add(fk)
             if audit_model:
                 f["audit_model"] = audit_model
+            if item.get("kind") == "attack_method":
+                ctx = item.get("attack_context") or {}
+                f["attack_context"] = ctx
+                if not (f.get("variant_of") or "").strip():
+                    f["variant_of"] = "攻击树审计 " + " / ".join(
+                        str(x) for x in [ctx.get("asset_name"), ctx.get("attack_goal"),
+                                          ctx.get("surface"), ctx.get("method")] if x)
             # 历史问题变体排查命中:回填它"和哪个历史问题类似"(agent 未填则用模式/出处兜底)
             if from_recheck and item.get("kind") == "variant" and not (f.get("variant_of") or "").strip():
                 src = (item.get("source") or "").strip()
@@ -2255,10 +2052,7 @@ class Pipeline:
             self._save_candidate_state(payload)
             self.emit(EV.CANDIDATE_FOUND, payload)
             self._enqueue_finding(f)
-        # 仅历史模式:不把复查/挖掘提炼出的新攻击面放回主队列。surface 会被 _start_audit_pass
-        # 展开成 finder(audit 角色),正是“触发 audit 等流程”的来源;该模式只做 recheck→verify→report。
-        history_only = self.cfg.run_mode == RUN_MODE_HISTORY_ONLY
-        for s in (() if history_only else new_surfaces):
+        for s in new_surfaces:
             sk = (s.get("name") or "").strip().lower()
             if not sk or sk in self.seen_surface:
                 continue
@@ -2478,11 +2272,7 @@ class Pipeline:
         incomplete_counts = self._incomplete_counts()
         has_incomplete = self._has_incomplete_counts(incomplete_counts)
         status = STATUS_STOPPED if self.stop_requested() else (STATUS_INCOMPLETE if has_incomplete else STATUS_DONE)
-        # 仅历史模式无轮次概念:历史变体排查完即收敛,不参照 maxRounds。
-        if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY:
-            converged = status == STATUS_DONE
-        else:
-            converged = status == STATUS_DONE and self.round < self.cfg.max_rounds
+        converged = status == STATUS_DONE and self.round < self.cfg.max_rounds
 
         summary = {
             **self._summary_snapshot(self.round),
@@ -2503,8 +2293,7 @@ class Pipeline:
             "dynamic_surfaces": len(self.surface_log), "risk_notes": len(self.risk_notes),
             "resumed_from_round": self.start_round, "rounds": self.round,
             "converged": converged, "stop_reason": stop_reason, "candidates": len(self.dedup_keys),
-            "subtasks_total": sum(1 for r in self.ledger_arr if r.get("kind") == "task"),
-            "regions_decomposed": sum(1 for r in self.ledger_arr if r.get("status") == "decomposed"),
+            "attack_methods_total": sum(1 for r in self.ledger_arr if r.get("kind") == "attack_method"),
             "pending_findings": incomplete_counts["pending_findings"],
             "failed_candidates": incomplete_counts["failed_candidates"],
             "failed_rechecks": incomplete_counts["failed_rechecks"],
@@ -2527,16 +2316,10 @@ class Pipeline:
         self.store.init_manifest(self.manifest_config())
         self.store.set_status(STATUS_RUNNING)
         self.emit(EV.RUN_STATUS, {"status": STATUS_RUNNING})
-        if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY:
-            # 仅历史模式没有"轮"的概念:不做 finder 扩面/多轮重审,历史变体排查完即停。
-            self.log(f"目标={self.cfg.target}{sn} 模式={self.cfg.run_mode} 后端={self.cfg.backend} 并发={self.cfg.concurrency} "
-                     f"流程=recheck→verify→report{'→poc' if self.cfg.enable_poc else ''}(无轮次,审计完即停) "
-                     f"验证=witness/blocker(5-agent) resume={self.cfg.resume} 威胁模型={self.cfg.threat_model}")
-        else:
-            self.log(f"目标={self.cfg.target}{sn} 模式={self.cfg.run_mode} 后端={self.cfg.backend} 并发={self.cfg.concurrency} "
-                     f"每lens finder={self.cfg.finders_per_lens} dryRounds={self.cfg.dry_rounds} "
-                     f"maxRounds={self.cfg.max_rounds} 验证=witness/blocker(5-agent) PoC={self.cfg.enable_poc} "
-                     f"resume={self.cfg.resume} 威胁模型={self.cfg.threat_model}")
+        self.log(f"目标={self.cfg.target}{sn} 模式={self.cfg.run_mode} 后端={self.cfg.backend} 并发={self.cfg.concurrency} "
+                 f"攻击树威胁分析→攻击方式审计 每项finder={self.cfg.finders_per_lens} dryRounds={self.cfg.dry_rounds} "
+                 f"maxRounds={self.cfg.max_rounds} 验证=witness/blocker(5-agent) PoC={self.cfg.enable_poc} "
+                 f"resume={self.cfg.resume} 威胁模型={self.cfg.threat_model}")
         self.log(f"启用 lens: {', '.join(self.cfg.lenses)} | run 目录: {self.store.dir} | "
                  f"方法库: {self.cfg.methods_abs} ({'就绪' if self.cfg.methods_ok() else '不可用→内联兜底'})")
         history_sched: Optional[asyncio.Task] = None
@@ -2548,23 +2331,19 @@ class Pipeline:
             self._reconcile_health_models()  # 续跑/重启:剔除旧 health 快照里已不在当前配置的模型
             if self.cfg.health.enabled and self.cfg.health.on_start and not self.stop_requested():
                 await self.health_check_all()
-            if not resumed and self.cfg.run_mode == RUN_MODE_HISTORY_ONLY:
-                self.init_history_only_surface()
             if not resumed and self.cfg.history_import_from:
                 self.import_history_patterns()
 
-            if self.cfg.run_mode == RUN_MODE_HISTORY_ONLY:
-                stop_reason = await self.audit()
-            elif not resumed:
-                recon_task = asyncio.create_task(self.recon(try_restore=False))
+            if not resumed:
+                threat_task = asyncio.create_task(self.threat_analysis(try_restore=False))
                 await asyncio.sleep(0)
                 self._enqueue_history_commits()
                 history_sched = asyncio.create_task(
-                    self._run_scheduler(stop_when=lambda: recon_task.done(), stop_when_idle=False)
+                    self._run_scheduler(stop_when=lambda: threat_task.done(), stop_when_idle=False)
                 )
                 self._history_task = history_sched
                 try:
-                    await recon_task
+                    await threat_task
                 except Exception:
                     if not history_sched.done():
                         history_sched.cancel()

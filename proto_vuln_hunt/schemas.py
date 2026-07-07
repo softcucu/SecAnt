@@ -5,36 +5,95 @@
 再由 backends.extract_json 从 stdout 中解析。
 """
 
-SURFACE_SCHEMA = {
+THREAT_ANALYSIS_SCHEMA = {
     "type": "object",
-    "required": ["regions"],
+    "required": ["assets", "attack_trees", "code_path_mappings"],
     "properties": {
-        "purpose": {"type": "string", "description": "这个代码仓是做什么的/要实现什么目标"},
-        "threat_summary": {
-            "type": "array",
-            "description": "基于用途的威胁分析(逐条列出:谁是攻击者、从哪些入口能影响系统、最该担心什么影响、攻击面有多大)",
-            "items": {"type": "string"},
+        "schema_version": {"type": "string"},
+        "analysis_id": {"type": "string"},
+        "sources": {
+            "type": "object",
+            "properties": {
+                "repositories": {"type": "array", "items": {"type": "string"}},
+                "documents": {"type": "array", "items": {"type": "string"}},
+            },
         },
-        "build_hint": {"type": "string", "description": "如何编译此目标(用于后续 PoC harness),没有就留空"},
-        "repo_knowledge": {
-            "type": "array",
-            "description": "从 README/docs/SECURITY/CHANGELOG 读到的安全相关背景(逐条列出关键事实)",
-            "items": {"type": "string"},
-        },
-        "regions": {
+        "assets": {
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["name", "category", "files", "untrusted_input", "priority"],
+                "required": ["asset_id", "name", "asset_type", "criticality", "risks"],
                 "properties": {
+                    "asset_id": {"type": "string"},
                     "name": {"type": "string"},
-                    "category": {"type": "string", "enum": ["parser", "network", "ipc", "auth-state", "key-mgmt", "cert-mgmt", "crypto", "deserialization", "state-machine", "memory-mgmt", "other"]},
-                    "files": {"type": "array", "items": {"type": "string"}},
-                    "entry_points": {"type": "array", "items": {"type": "string"}},
-                    "untrusted_input": {"type": "string"},
-                    "trust_boundary": {"type": "string"},
-                    "crypto_apis": {"type": "array", "items": {"type": "string"}},
-                    "priority": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "description": {"type": "string"},
+                    "asset_type": {"type": "string", "enum": ["service", "data", "credential", "privilege", "software", "configuration", "key", "device", "other"]},
+                    "criticality": {"type": "string", "enum": ["critical", "high", "medium", "low"]},
+                    "risks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["risk_id", "name", "security_property", "description"],
+                            "properties": {
+                                "risk_id": {"type": "string"},
+                                "name": {"type": "string"},
+                                "security_property": {"type": "string", "enum": ["confidentiality", "integrity", "availability", "authenticity", "authorization", "accountability"]},
+                                "description": {"type": "string"},
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        "attack_trees": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["tree_id", "asset_id", "risk_id", "attack_goal", "root_node_id", "nodes"],
+                "properties": {
+                    "tree_id": {"type": "string"},
+                    "asset_id": {"type": "string"},
+                    "risk_id": {"type": "string"},
+                    "attack_goal": {"type": "string"},
+                    "root_node_id": {"type": "string"},
+                    "nodes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["node_id", "node_type", "name", "order", "basis"],
+                            "properties": {
+                                "node_id": {"type": "string"},
+                                "parent_id": {"type": ["string", "null"]},
+                                "node_type": {"type": "string", "enum": ["goal", "domain", "surface", "method"]},
+                                "name": {"type": "string"},
+                                "surface_type": {"type": "string", "enum": ["protocol", "api", "interface", "service", "port", "file", "message", "configuration", "command", "package", "physical", "other"]},
+                                "order": {"type": "integer"},
+                                "basis": {"type": "array", "items": {"type": "string"}},
+                                "preconditions": {"type": "array", "items": {"type": "string"}},
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        "code_path_mappings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["surface_node_id", "code_paths"],
+                "properties": {
+                    "surface_node_id": {"type": "string"},
+                    "code_paths": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["path", "description"],
+                            "properties": {
+                                "path": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                        },
+                    },
                 },
             },
         },
@@ -277,54 +336,6 @@ POC_SCHEMA = {
     },
 }
 
-# 仅历史模式:确认漏洞的结构化报告字段。LLM 只填字段,程序用统一模板渲染成 Markdown。
-HISTORY_REPORT_SCHEMA = {
-    "type": "object",
-    "required": ["summary", "description", "judgement", "vuln_code", "data_flow", "impact",
-                 "fix_suggestion", "history"],
-    "properties": {
-        "summary": {"type": "string", "description": "一句话概述:这是什么漏洞、在哪、为什么是它(攻击者能做什么)"},
-        "description": {"type": "string", "description": "漏洞分析说明:破坏了什么不变量、攻击者控制什么、缺陷如何形成"},
-        "judgement": {"type": "string", "description": "漏洞判定原因:为什么确信这是真实漏洞——把判断依据与推理过程逐条讲清(危险写法具体在哪一行、缺了哪一步校验/为何现有校验不足、不可信输入如何到达此处且可被攻击者控制、可达性/触发条件如何成立),让读者据此即可独立复核此结论"},
-        "vuln_code": {"type": "string", "description": "本处漏洞的真实代码——用 Read 取**完整上下文原文**:至少覆盖整个所在函数,并带上理解此漏洞所必需的相邻定义/调用方/结构体/宏(保证读者**不看原始仓库**也能完整读懂并复核此漏洞);贴原文不要转述,可用注释标出关键漏洞行"},
-        "vuln_code_loc": {"type": "string", "description": "上面代码片段的位置,如 path:line-line"},
-        "data_flow": {"type": "string", "description": "数据流:不可信来源(path:line)→ sink(path:line),中途有无校验、为何不足"},
-        "call_chain": {"type": "array", "items": {"type": "string"}, "description": "从真实入口到 sink 的可达性调用链,每项 path:line + 一句话"},
-        "impact": {"type": "string", "description": "影响与可利用性(结合威胁模型)"},
-        "mitigations": {"type": "string", "description": "已检查的缓解:canary/ASLR/FORTIFY/sanitizer/类型上界等是否存在、可否绕过"},
-        "poc_result": {"type": "string", "description": "PoC / 验证结果说明;无动态 PoC 则给静态触发构造说明"},
-        "fix_suggestion": {"type": "string", "description": "修复建议:具体怎么改,最好与历史修复后的正确写法对齐"},
-        "confidence_basis": {"type": "string", "description": "置信度依据(一句话)"},
-        "history": {
-            "type": "object",
-            "description": "与历史已修问题的对比(本漏洞是其同类变体)",
-            "required": ["root_cause", "root_cause_analysis", "before_code", "after_code", "why_recurred"],
-            "properties": {
-                "source": {"type": "string", "description": "历史问题出处:修复提交 hash / 文件 等"},
-                "root_cause": {"type": "string", "description": "历史问题的根因 / 缺陷类型(一句话抽象概括,作为标题用)"},
-                "root_cause_analysis": {"type": "string", "description": "历史问题根因分析:展开讲清楚——历史代码当时为什么会出错(破坏了什么不变量、错误假设是什么)、攻击者当时如何利用、这一类缺陷的本质模式是什么;让读者理解根因而非只看结论"},
-                "before_code": {"type": "string", "description": "历史修复前(有问题)的关键代码——用 git show 取**完整上下文原文**(至少覆盖整个改动函数),保证不看原始提交也能看懂当时的缺陷;不要只贴一两行"},
-                "after_code": {"type": "string", "description": "历史修复后(正确)的关键代码——用 git show 取**完整上下文原文**(与 before_code 对应的同一函数修复后版本),便于和修复前逐行对照;不要只贴一两行"},
-                "fix_note": {"type": "string", "description": "当时是怎么修的(一句话)"},
-                "why_recurred": {"type": "string", "description": "为什么此处重蹈覆辙:漏了同款修复 / 历史修复没覆盖到本调用点"},
-                "comparison": {
-                    "type": "array",
-                    "description": "历史 vs 本处的逐维度对比(渲染成对比表)",
-                    "items": {
-                        "type": "object",
-                        "required": ["dimension", "history", "current"],
-                        "properties": {
-                            "dimension": {"type": "string", "description": "对比维度,如 根因 / 危险写法 / 是否做了同款校验 / 触发条件 / 位置"},
-                            "history": {"type": "string", "description": "历史问题在该维度的情况"},
-                            "current": {"type": "string", "description": "本处漏洞在该维度的情况"},
-                        },
-                    },
-                },
-            },
-        },
-    },
-}
-
 # 单条 git 提交的「是否安全修复 + 问题模式」判定(每条提交一个 agent)
 HISTORY_COMMIT_SCHEMA = {
     "type": "object",
@@ -335,28 +346,5 @@ HISTORY_COMMIT_SCHEMA = {
         "lens_hint": {"type": "string", "enum": ["memory", "integer", "race", "injection", "authn", "crypto", "dos", "infoleak", "resource-realtime"]},
         "files": {"type": "array", "items": {"type": "string"}, "description": "该问题模式涉及/出现的文件"},
         "rationale": {"type": "string", "description": "判定理由 + 改动要点摘要"},
-    },
-}
-
-SUBTASKS_SCHEMA = {
-    "type": "object",
-    "required": ["subtasks"],
-    "properties": {
-        "subtasks": {
-            "type": "array",
-            "description": "把该攻击面区域拆成的、各自有界且可被单个 agent 快速审完的审计子任务",
-            "items": {
-                "type": "object",
-                "required": ["objective", "files", "lens_hints"],
-                "properties": {
-                    "objective": {"type": "string"},
-                    "files": {"type": "array", "items": {"type": "string"}},
-                    "functions": {"type": "array", "items": {"type": "string"}},
-                    "entry_points": {"type": "array", "items": {"type": "string"}},
-                    "lens_hints": {"type": "array", "items": {"type": "string", "enum": ["memory", "integer", "race", "injection", "authn", "crypto", "dos", "infoleak", "resource-realtime"]}},
-                    "est_lines": {"type": "integer"},
-                },
-            },
-        },
     },
 }

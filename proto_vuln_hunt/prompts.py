@@ -6,7 +6,8 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+import os
+from typing import Any, Dict, List
 
 
 OUTPUT_LANGUAGE_ZH = (
@@ -112,9 +113,11 @@ class PromptBuilder:
         self.target = cfg.target
         self.scope_note = f"(仅审子路径:{cfg.scope})" if cfg.scope else ""
         self.threat = cfg.threat_model
-        self.run_mode = getattr(cfg, "run_mode", "full")
         self.methods_ok = cfg.methods_ok()
         self.methods_dir = cfg.methods_abs
+        root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
+        self.attack_tree_skill = os.path.join(root, "attack-tree-threat-analysis.md")
+        self.attack_method_catalog = os.path.join(root, "attack-method-reference-catalog.md")
 
     # ── 方法库接入 ──
     def methods_instruction(self, lens_key: str, is_proto: bool = True) -> str:
@@ -159,24 +162,33 @@ class PromptBuilder:
             return ""
         return f"\n本 finder **优先覆盖这些文件**(其余文件由同 lens 的其它并行 finder 负责,避免重叠):{', '.join(mine)}"
 
-    # ── 侦察 ──
-    def recon(self, schema) -> str:
+    # ── 攻击树威胁分析 ──
+    def threat_analysis(self, schema) -> str:
+        skill_note = ""
+        if os.path.isfile(self.attack_tree_skill):
+            skill_note = (
+                "本阶段必须先 Read 并遵循以下攻击树威胁分析 Skill:\n"
+                f"- {self.attack_tree_skill}\n"
+            )
+            if os.path.isfile(self.attack_method_catalog):
+                skill_note += f"其中 method 选择参考库:\n- {self.attack_method_catalog}\n"
         return (
-            f"你在对一份 C/C++ 源码树做白盒漏洞挖掘的**侦察(威胁建模)**阶段。目标目录:{self.target}{self.scope_note}(威胁模型:{self.threat})\n"
-            "这通常是网络协议栈/解析器为主、混合认证登录/密钥管理/证书管理等管理面的项目。\n\n"
-            "请用 rg / Read / ctags 等工具,**先理解系统、再据此推攻击面**,按以下顺序产出:\n\n"
-            "(0) **先搞清这个仓是做什么的**(purpose):读 README、docs/、设计文档、主程序入口与目录结构,"
-            "归纳:它是什么系统、解决什么问题、核心功能、典型部署形态。攻击面必须从\"用途\"推导。\n\n"
-            "(1) **威胁分析**(threat_summary,**列表**:每个攻击者/入口/担心的影响各写一条):基于用途,"
-            "判断谁是攻击者、从哪些入口能影响系统、最该担心的影响、整体攻击面有多大。\n\n"
-            "(2) **读仓库知识**(repo_knowledge,**列表**:每条一个关键事实):SECURITY.md/CHANGELOG/NEWS/issue 描述、"
-            "代码内 FIXME/TODO/XXX/HACK/CVE 注释里读到的**安全相关背景**逐条记下。\n"
-            "(注意:从 git 提交历史挖掘已知问题模式由统一调度的 history 任务负责,本阶段**不需要**看 git log,也不产出 history。)\n\n"
-            "(3) **建攻击面地图 regions[]**:把代码划分为攻击面区域,每个标注涉及文件、入口函数、不可信输入怎么进来、"
-            "跨越的信任边界、调用到的 crypto/认证原语、优先级。重点覆盖:协议收包/解析/反序列化入口、认证状态机、"
-            "密钥/证书生命周期、加密调用点、IPC、序列化边界。\n\n"
-            "(4) 若能看出如何编译,给出 build_hint(供后续 PoC 最小 harness 编译)。\n\n"
-            "只输出威胁建模与地图,**不要现在就找具体 bug**。优先级按\"不可信输入可达性 + 是否跨信任边界\"排序。"
+            f"你在 SecAnt 流水线的**第一阶段:基于攻击树的威胁分析**。目标目录:{self.target}{self.scope_note}"
+            f"(威胁模型:{self.threat})。\n"
+            f"{skill_note}\n"
+            "目标:基于源代码和可选产品文档,识别关键资产、关键风险,并按固定四层攻击树建模:"
+            "goal → domain → surface → method;同时为每个 surface 定位真实存在的模块级代码路径。\n\n"
+            "严格边界:\n"
+            "- 这是理论威胁分析和后续审计范围设计,不是漏洞审计,不要输出已确认漏洞。\n"
+            "- 关键资产不是攻击树节点;关键风险对应攻击目标 goal。\n"
+            "- method 是针对 surface 的理论攻击方式,必须写 preconditions,不要机械罗列无关方法。\n"
+            "- code_path_mappings 只绑定 surface,路径必须通过目录浏览/文件检索/代码内容确认真实存在;无法确认则 code_paths=[]。\n\n"
+            "执行建议:\n"
+            "1. 先读 README/docs/目录结构/主要入口,理解产品能力和部署形态。\n"
+            "2. 识别关键资产及关键风险,风险名称描述损害结果,不要写攻击技术名。\n"
+            "3. 为每个关键风险建立一棵攻击树,保持 goal→domain→surface→method 层级。\n"
+            "4. 结合代码结构为每个 surface 定位模块级代码路径。\n"
+            "5. 输出完整结构化结果。不要只把结果写入 res.json;最终回答必须是 JSON 代码块,由 SecAnt 接收并规范化为内部攻击树图。"
             + must_struct(schema)
         )
 
@@ -201,42 +213,41 @@ class PromptBuilder:
             + must_struct(schema)
         )
 
-    # ── 区域拆解 ──
-    def decompose(self, region: Dict[str, Any], schema, *, subtask_limit: Optional[int] = None,
-                  region_lines: int = 0, region_file_count: int = 0) -> str:
-        files = ", ".join(region.get("files") or []) or "(自行定位)"
-        eps = ", ".join(region.get("entry_points") or []) or "自行定位"
-        limit = max(1, int(subtask_limit or self.cfg.max_subtasks_per_region))
-        if region_lines > 0 or region_file_count > 0:
-            volume = f"本区域静态估算约 {region_lines} 行 / {region_file_count} 个文件,"
-        else:
-            volume = "本区域代码量无法从 regions.files 静态估算,"
-        return (
-            f"你在对 C/C++ 源码做白盒审计的**任务拆解**阶段(威胁模型:{self.threat})。目标:{self.target}{self.scope_note}\n"
-            f"攻击面区域「{region.get('name')}」({region.get('category')}),涉及文件:{files}\n"
-            f"不可信输入:{region.get('untrusted_input') or '见侦察'}　入口点:{eps}\n\n"
-            "把这个区域拆成若干**有界的审计子任务**,使每个子任务能被一个 agent 快速、低成本地审完。要求:\n"
-            "- **先测绘后拆解**:用 rg/ctags/grep + 只看函数签名/调用关系/短片段摸清结构(别通读全文)。\n"
-            f"- **每个子任务有界**:约 ≤ {self.cfg.unit_line_budget} 行 / ≤ ~12 个函数;区域大就多拆;超大单函数自成一个子任务。\n"
-            "- **聚焦内聚**:一个子任务 = 一个函数簇 / 一条数据流路径 / 一个解析器 / 一个状态机 / 一个文件的核心逻辑。\n"
-            "- **覆盖完整**:子任务合起来覆盖该区域所有安全相关代码;每个子任务写清覆盖哪些 files/functions。\n"
-            "- **标注 lens**:给每个子任务标 lens_hints(最相关的 1~3 个),后续只派这些 lens 的 finder。\n"
-            f"- **动态拆解预算**:{volume}本次最多输出 {limit} 个子任务;小区域不要为了凑数拆碎,大区域可接近上限。\n"
-            "- 只输出拆解结果,**不要现在找具体 bug**。"
-            + must_struct(schema)
-        )
-
     # ── 审计 finder ──
     def audit(self, item: Dict[str, Any], lens_key: str, idx: int, schema) -> str:
         kind = item.get("kind")
-        if kind == "task":
+        if kind == "attack_method":
+            ctx_obj = item.get("attack_context") or {}
+            code_paths = ctx_obj.get("code_paths") or []
+            code_path_text = "; ".join(
+                f"{p.get('path')}({p.get('description') or '无说明'})" for p in code_paths if p.get("path")
+            )
+            head = (
+                f"攻击树审计项「{ctx_obj.get('surface') or item.get('name')} / "
+                f"{ctx_obj.get('method') or item.get('objective')}」"
+            )
+            files = ", ".join(item.get("files") or [])
+            ctx = (
+                f"关键资产:{ctx_obj.get('asset_name') or '?'}({ctx_obj.get('asset_type') or 'unknown'}, "
+                f"criticality={ctx_obj.get('criticality') or '?'})\n"
+                f"关键风险:{ctx_obj.get('risk_name') or '?'}\n"
+                f"攻击目标:{ctx_obj.get('attack_goal') or '?'}\n"
+                f"攻击域:{ctx_obj.get('domain') or '?'}\n"
+                f"攻击面:{ctx_obj.get('surface') or '?'}({ctx_obj.get('surface_type') or 'other'})\n"
+                f"理论攻击方式:{ctx_obj.get('method') or item.get('name') or '?'}\n"
+                f"攻击前置条件:{'; '.join(ctx_obj.get('preconditions') or []) or '(未识别明确前提)'}\n"
+                f"攻击面代码路径:{code_path_text or '(威胁分析未定位到可信路径,需要自行从 surface 名称和代码结构定位)'}\n"
+                "任务:围绕这个攻击树叶子 method,判断代码中是否存在可达、可控、能导致对应风险的真实漏洞。"
+                "不要泛扫整个仓,优先覆盖威胁分析给出的代码路径;只有追踪 source→sink 时才跳读外部相关函数。"
+            )
+        elif kind == "task":
             head = f"审计子任务「{item.get('objective')}」(属攻击面区域:{item.get('region') or '?'})"
             files = ", ".join(item.get("files") or [])
             fns = ", ".join(item.get("functions") or [])
             ctx = (
                 f"**范围仅限**:{('文件 ' + files) if files else '(见目标)'}{(' 的函数 ' + fns) if fns else ''}"
                 f"{('(约 ' + str(item.get('est_lines')) + ' 行)') if item.get('est_lines') else ''}\n"
-                f"不可信输入:{item.get('untrusted_input') or '见侦察'}　信任边界:{item.get('trust_boundary') or '(未注明)'}　"
+                f"不可信输入:{item.get('untrusted_input') or '见威胁分析'}　信任边界:{item.get('trust_boundary') or '(未注明)'}　"
                 f"入口点:{', '.join(item.get('entry_points') or []) or '自行定位'}\n"
                 "**严格限定**:只精读上述范围内的代码;**不要通读范围外的文件**,只在追溯 source→sink 时才跳读外部的相关函数;够了就收尾返回。"
             )
@@ -244,7 +255,7 @@ class PromptBuilder:
             head = f"攻击面区域「{item.get('name')}」({item.get('category')})"
             files = ", ".join(item.get("files") or [])
             ctx = (
-                f"不可信输入:{item.get('untrusted_input') or '见侦察'}\n"
+                f"不可信输入:{item.get('untrusted_input') or '见威胁分析'}\n"
                 f"信任边界:{item.get('trust_boundary') or '(未注明)'}\n"
                 f"入口点:{', '.join(item.get('entry_points') or []) or '自行定位'}"
             )
@@ -592,36 +603,6 @@ class PromptBuilder:
             f"{extras}"
             f"对抗性验证结论(供你参考,提炼进报告):{votes_brief}\n"
             "**只输出报告正文 Markdown 本身**(从 ## ① 漏洞描述 之类开始),不要任何额外说明、不要代码块包裹整篇。"
-        )
-
-    # ── 仅历史模式:返回结构化字段(由程序套用统一模板渲染成 MD)──
-    def report_history(self, rec: Dict[str, Any], poc: Any, schema) -> str:
-        votes_brief = self._votes_brief(rec)
-        poc_brief = self._poc_brief(poc)
-        variant_of = (rec.get("variant_of") or "").strip()
-        return (
-            f"为下面这**一条**已确认漏洞填写一份结构化报告,**只输出符合给定 schema 的 JSON 对象**"
-            f"(不要写 Markdown、不要任何额外说明)。我会用统一模板把这些字段渲染成报告。\n"
-            f"{OUTPUT_LANGUAGE_ZH}\n"
-            f"目标仓:{self.target}{self.scope_note};漏洞位置 {rec.get('file')}:{rec.get('line') or '?'} 函数 {rec.get('function')}。"
-            f"威胁模型:{self.threat}。\n"
-            f"**这是「历史漏洞同类变体排查」命中的结果**:本漏洞是某历史已修问题的同类变体,历史来源:{variant_of}。\n\n"
-            "填写要点(报告要**自洽完备**:读者不看原始仓库,仅凭这份报告即可完整理解并复核漏洞):\n"
-            "- summary / description / impact / fix_suggestion:漏洞分析说明,准确充分,不堆砌套话。\n"
-            "- judgement(漏洞判定原因):把你判定这是真实漏洞的依据与推理逐条讲清——危险写法在哪一行、缺了哪一步校验/为何现有校验不足、不可信输入如何到达且可被攻击者控制、可达性与触发条件如何成立;让读者据此即可独立复核此结论。\n"
-            "- vuln_code:用 Read 取本处**真实代码原文的完整上下文**——至少覆盖整个所在函数,并带上理解漏洞所必需的相邻定义/调用方/结构体/宏;在 vuln_code_loc 填位置;贴原文不要转述,可用注释标出关键漏洞行。\n"
-            "- data_flow / call_chain:给出来源→sink 的传播路径与可达性调用链(path:line)。\n"
-            "- history:这是报告的重点对比块——用 `git show`/Read 取历史问题的**真实代码**:"
-            "before_code(修复前有问题的写法)、after_code(修复后正确的写法),**各取完整上下文(至少整个改动函数)**、保证不看原始提交也能逐行对照看懂;"
-            "root_cause(根因/缺陷类型,一句话概括)、root_cause_analysis(历史问题根因分析:展开讲清历史代码当时为什么出错、破坏了什么不变量/错误假设、攻击者当时如何利用、这类缺陷的本质模式)、"
-            "fix_note(当时怎么修)、why_recurred(为什么此处重蹈覆辙)、source(出处);"
-            "comparison 给出逐维度对比行(根因 / 危险写法 / 是否做了同款校验 / 触发条件 / 位置)。"
-            "若历史代码取不到,如实在对应字段说明,并据 variant_of 概述。\n"
-            f"- poc_result:{poc_brief}。\n"
-            f"- confidence_basis:置信度={rec.get('confidence')},一句话说明依据。\n\n"
-            f"对抗性验证结论(供你提炼字段内容,不要整段照抄):{votes_brief}\n"
-            "最终按下面的结构化输出要求收尾。"
-            + must_struct(schema)
         )
 
     # ── 汇总(INDEX.md 正文) ──

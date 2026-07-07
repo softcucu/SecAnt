@@ -206,7 +206,7 @@ async function viewRuns() {
     tb.append(el("tr", {},
       el("td", {}, stPill(r.running ? "running" : r.status)),
       el("td", { html: `<a href="#/run/${encodeURIComponent(r.id)}">${esc(r.target || r.id)}</a>` + (r.scope ? `<div class="muted" style="font-size:12px">${esc(r.scope)}</div>` : "")}),
-      el("td", {}, r.run_mode === "history_only" ? "仅历史" : "完整"),
+      el("td", {}, "完整"),
       el("td", {}, r.backend || "—"),
       el("td", {}, String(s.confirmed ?? 0)),
       el("td", {}, String(s.rounds ?? 0)),
@@ -238,19 +238,15 @@ async function viewNew() {
   const area = (id, val, rows = 3) => el("textarea", { id, rows }, val == null ? "" : val);
   const num = (id, val) => inp(id, val, "number");
 
-  const runModeSel = el("select", { id: "run_mode" },
-    el("option", { value: "full", selected: (d.run_mode || "full") === "full" ? "" : null }, "完整审计"),
-    el("option", { value: "history_only", selected: d.run_mode === "history_only" ? "" : null }, "仅历史漏洞排查"));
   const backendSel = el("select", { id: "backend" }, ...meta.backends.map(b => el("option", { value: b, selected: b === d.backend ? "" : null }, b)));
   const tmSel = el("select", { id: "threat_model" }, ...["REMOTE", "LOCAL_UNPRIVILEGED", "BOTH"].map(t => el("option", { value: t, selected: t === d.threat_model ? "" : null }, t)));
   const lensChecks = el("div", { class: "checks" }, ...meta.lenses.map(l =>
     el("label", {}, el("input", { type: "checkbox", value: l, class: "lens", checked: (d.lenses || []).includes(l) ? "" : null }), l)));
-  const modelRoles = meta.roles.filter(role => role !== "synthesis" && role !== "util");
-  // history_only 模式只用 recheck/verify/report(+可选 history/poc),其余角色与攻击面相关配置无关
-  const HISTORY_ONLY_HIDDEN_ROLES = new Set(["recon", "audit", "decompose"]);
+  const modelRoles = meta.roles.filter(role => !["synthesis", "util"].includes(role));
   const modelFieldByRole = {};
   modelRoles.forEach(role => {
-    modelFieldByRole[role] = f("模型 · " + role, inp("model_" + role, modelText((d.models || {})[role]), "text"));
+    const roleModels = (d.models || {})[role] || null;
+    modelFieldByRole[role] = f("模型 · " + role, inp("model_" + role, modelText(roleModels), "text"));
   });
   const modelRows = el("div", { class: "grid" }, ...modelRoles.map(role => modelFieldByRole[role]));
   const historyRuns = runs.filter(r => (r.history_count || 0) > 0);
@@ -260,15 +256,13 @@ async function viewNew() {
       `${r.id} · 历史 ${r.history_count || 0} · ${r.target || ""}`)));
   const historyImportBox = el("div", { id: "history_import_box" },
     f("导入已有历史模式 run", historyRunSel),
-    f("或导入 run 目录 / recon.json", inp("history_import_from", d.history_import_from || "", "text")));
+    f("或导入 run 目录 / history.json", inp("history_import_from", d.history_import_from || "", "text")));
 
   const lensField = el("label", { class: "field" }, el("span", {}, "lens(攻击面镜头)"), lensChecks);
   const findersField = f("每 lens finder 数", num("finders_per_lens", d.finders_per_lens));
-  const decomposeLabel = el("label", {}, el("input", { type: "checkbox", id: "decompose", checked: d.decompose ? "" : null }), "区域拆解");
   const left = el("div", {},
     f("目标源码根目录 *", inp("target", "")),
     f("子路径 scope(可选)", inp("scope", "")),
-    f("运行模式", runModeSel),
     historyImportBox,
     f("后端 CLI", backendSel),
     f("并发数", num("concurrency", d.concurrency)),
@@ -281,8 +275,7 @@ async function viewNew() {
     f("收敛空轮 dry_rounds", num("dry_rounds", d.dry_rounds)),
     f("兼容参数 verify_votes", num("verify_votes", d.verify_votes)),
     el("div", { class: "checks", style: "margin:8px 0 14px" },
-      el("label", {}, el("input", { type: "checkbox", id: "enable_poc", checked: d.enable_poc ? "" : null }), "启用 PoC"),
-      decomposeLabel),
+      el("label", {}, el("input", { type: "checkbox", id: "enable_poc", checked: d.enable_poc ? "" : null }), "启用 PoC")),
     el("div", { class: "panel", style: "padding:10px" },
       el("div", { class: "muted", style: "margin-bottom:6px" }, "每角色模型(运行中的角色必须填写)"),
       modelRows,
@@ -291,20 +284,6 @@ async function viewNew() {
   );
 
   const submit = el("button", { class: "btn" }, "🚀 启动审计");
-  function syncRunMode() {
-    const historyOnly = runModeSel.value === "history_only";
-    historyImportBox.style.display = historyOnly ? "" : "none";
-    // 仅历史模式下隐藏攻击面相关配置(lens / finder 数 / 区域拆解)及不参与的模型角色
-    lensField.style.display = historyOnly ? "none" : "";
-    findersField.style.display = historyOnly ? "none" : "";
-    decomposeLabel.style.display = historyOnly ? "none" : "";
-    modelRoles.forEach(role => {
-      modelFieldByRole[role].style.display = (historyOnly && HISTORY_ONLY_HIDDEN_ROLES.has(role)) ? "none" : "";
-    });
-    submit.textContent = historyOnly ? "启动历史排查" : "🚀 启动审计";
-  }
-  runModeSel.addEventListener("change", syncRunMode);
-  syncRunMode();
   submit.addEventListener("click", async () => {
     const target = document.getElementById("target").value.trim();
     if (!target) { flash("请填写目标目录"); return; }
@@ -317,18 +296,17 @@ async function viewNew() {
     const payload = {
       target, scope: document.getElementById("scope").value.trim(),
       backend: document.getElementById("backend").value, concurrency: +document.getElementById("concurrency").value,
-      run_mode: document.getElementById("run_mode").value,
       threat_model: document.getElementById("threat_model").value, lenses,
       finders_per_lens: +document.getElementById("finders_per_lens").value, max_rounds: +document.getElementById("max_rounds").value,
       dry_rounds: +document.getElementById("dry_rounds").value, verify_votes: +document.getElementById("verify_votes").value,
-      enable_poc: document.getElementById("enable_poc").checked, decompose: document.getElementById("decompose").checked,
+      enable_poc: document.getElementById("enable_poc").checked,
       models, model_concurrency: parseKvInts(document.getElementById("model_concurrency").value),
       model_time_windows: parseModelWindows(document.getElementById("model_time_windows").value),
     };
     const importRunId = document.getElementById("history_import_run_id").value;
     const importPath = document.getElementById("history_import_from").value.trim();
-    if (payload.run_mode === "history_only" && importRunId) payload.history_import_run_id = importRunId;
-    else if (payload.run_mode === "history_only" && importPath) payload.history_import_from = importPath;
+    if (importRunId) payload.history_import_run_id = importRunId;
+    else if (importPath) payload.history_import_from = importPath;
     submit.disabled = true;
     try { const r = await api("POST", "/api/runs", payload); location.hash = "#/run/" + encodeURIComponent(r.run_id); }
     catch (e) { flash("启动失败: " + e.message); submit.disabled = false; }
@@ -341,7 +319,7 @@ async function viewNew() {
 // ──────────────────────── view: dashboard ────────────────────────
 function viewDashboard(runId) {
   app.innerHTML = "";
-  const S = { findings: new Map(), risks: new Map(), health: new Map(), agentMap: new Map(), candidateMap: new Map(), nonIssueMap: new Map(), coverage: null, recon: null, log: [], usageRows: [], usageIds: new Set(), usage: emptyUsage(), manifest: null, meta: null, candidates: 0, candidateTotal: 0, nonIssueTotal: 0, usageTotal: 0, riskTotal: 0, status: "queued", round: 0, dry: 0, agents: 0, elapsed: 0 };
+  const S = { findings: new Map(), risks: new Map(), health: new Map(), agentMap: new Map(), candidateMap: new Map(), nonIssueMap: new Map(), coverage: null, history: [], threat: null, log: [], usageRows: [], usageIds: new Set(), usage: emptyUsage(), manifest: null, meta: null, candidates: 0, candidateTotal: 0, nonIssueTotal: 0, usageTotal: 0, riskTotal: 0, status: "queued", round: 0, dry: 0, agents: 0, elapsed: 0 };
   let activeTab = "findings";
   let initialModeTabApplied = false;
   const nonIssueOpenKeys = new Set();
@@ -431,31 +409,6 @@ function viewDashboard(runId) {
     return Math.max(finiteNumber(S.elapsed) || 0, elapsedBase + (Date.now() - elapsedBaseAt) / 1000);
   }
   function runConfig() { return (S.manifest && S.manifest.config) || {}; }
-  function isHistoryOnly() { return runConfig().run_mode === "history_only"; }
-  function historyVariantLedger() {
-    return (((S.coverage || {}).ledger || []).filter(r => r.kind === "variant"));
-  }
-  function historyModeStats() {
-    const hist = (S.recon || {}).history || [];
-    const variants = historyVariantLedger();
-    const counts = {};
-    for (const v of variants) counts[v.status || "pending"] = (counts[v.status || "pending"] || 0) + 1;
-    const completedClean = counts["completed-clean"] || 0;
-    const completedFindings = counts["completed-findings"] || 0;
-    const failed = (counts.incomplete || 0) + (counts.abandoned || 0);
-    const running = counts["in-progress"] || 0;
-    const pending = (counts.pending || 0) + Math.max(0, hist.length - variants.length);
-    const total = Math.max(hist.length, variants.length);
-    return {
-      total,
-      pending,
-      running,
-      completed: completedClean + completedFindings,
-      clean: completedClean,
-      hits: completedFindings,
-      failed,
-    };
-  }
   function resetElapsedClock(seconds) {
     const n = finiteNumber(seconds);
     S.elapsed = Math.max(0, n == null ? (finiteNumber(S.elapsed) || 0) : n);
@@ -493,30 +446,10 @@ function viewDashboard(runId) {
     const cfg = runConfig();
     const agentCount = Math.max(S.agents || 0, S.agentMap.size, S.usageRows.length);
     const elapsed = Math.round(currentElapsed());
-    if (isHistoryOnly()) {
-      const hs = historyModeStats();
-      const source = cfg.history_import_from ? `导入 ${cfg.history_import_from}` : "git commit";
-      header.append(el("div", { class: "row", style: "justify-content:space-between;margin-bottom:10px" },
-        el("div", { class: "row" }, stPill(S.status),
-          el("span", { class: "muted" }, `${esc(cfg.target || "")}${cfg.scope ? " · " + esc(cfg.scope) : ""}`),
-          el("span", { class: "muted" }, `仅历史漏洞排查 · ${esc(source)} · 后端 ${esc(cfg.backend || "?")}`)),
-        el("div", { class: "muted" }, `排查 ${hs.completed}/${hs.total || "?"} · 用时 ${elapsed}s`)));
-      header.append(el("div", { class: "stats history-stats" },
-        el("div", { class: "stat" }, el("div", { class: "n" }, String(hs.total)), el("div", { class: "l" }, "历史模式")),
-        el("div", { class: "stat" }, el("div", { class: "n" }, String(hs.completed)), el("div", { class: "l" }, "已排查")),
-        el("div", { class: "stat" }, el("div", { class: "n" }, String(hs.hits)), el("div", { class: "l" }, "命中模式")),
-        el("div", { class: "stat" }, el("div", { class: "n" }, String(hs.failed)), el("div", { class: "l" }, "失败/未覆盖")),
-        el("div", { class: "stat" }, el("div", { class: "n" }, String(S.candidates)), el("div", { class: "l" }, "候选")),
-        el("div", { class: "stat" }, el("div", { class: "n" }, String(S.findings.size)), el("div", { class: "l" }, "漏洞条目")),
-        el("div", { class: "stat" }, el("div", { class: "n" }, String(qualityCount)), el("div", { class: "l" }, "质量问题")),
-        el("div", { class: "stat" }, el("div", { class: "n" }, String(agentCount)), el("div", { class: "l" }, "agent 调用")),
-        el("div", { class: "stat" }, el("div", { class: "n" }, fmtTok(S.usage.total_tokens)), el("div", { class: "l" }, "总 token"))));
-      return;
-    }
     header.append(el("div", { class: "row", style: "justify-content:space-between;margin-bottom:10px" },
       el("div", { class: "row" }, stPill(S.status),
         el("span", { class: "muted" }, `${esc(cfg.target || "")}${cfg.scope ? " · " + esc(cfg.scope) : ""}`),
-        el("span", { class: "muted" }, `模式 ${cfg.run_mode === "history_only" ? "仅历史" : "完整"} · 后端 ${esc(cfg.backend || "?")} · 威胁 ${esc(cfg.threat_model || "?")}`)),
+        el("span", { class: "muted" }, `后端 ${esc(cfg.backend || "?")} · 威胁 ${esc(cfg.threat_model || "?")}`)),
       el("div", { class: "muted" }, `轮 ${S.round}/${cfg.max_rounds ?? "?"} · dry ${S.dry} · 用时 ${elapsed}s`)));
     const stats = el("div", { class: "stats" },
       el("div", { class: "stat" }, el("div", { class: "n" }, String(suspectedCount)), el("div", { class: "l" }, "漏洞条目")),
@@ -533,13 +466,9 @@ function viewDashboard(runId) {
     header.append(stats);
   }
 
-  const FULL_TABS = [["findings", "漏洞"], ["candidates", "候选"], ["nonissues", "非问题"], ["agents", "实时Agent"], ["health", "模型"], ["coverage", "攻击面覆盖"], ["history", "历史问题"], ["risks", "潜在风险点"], ["usage", "历史任务"], ["recon", "侦察"], ["activity", "活动"], ["exports", "导出"]];
+  const FULL_TABS = [["threat", "威胁分析"], ["findings", "漏洞"], ["candidates", "候选"], ["nonissues", "非问题"], ["agents", "实时Agent"], ["health", "模型"], ["coverage", "攻击面覆盖"], ["history", "历史问题"], ["risks", "潜在风险点"], ["usage", "历史任务"], ["activity", "活动"], ["exports", "导出"]];
   function visibleTabs() {
-    if (!isHistoryOnly()) return FULL_TABS;
-    const tabs = [["coverage", "排查进度"], ["history", "历史模式"], ["findings", "漏洞"], ["candidates", "候选"], ["nonissues", "非问题"], ["agents", "实时Agent"], ["health", "模型"]];
-    if ((S.riskTotal || 0) > 0 || S.risks.size) tabs.push(["risks", "风险线索"]);
-    tabs.push(["usage", "调用记录"], ["activity", "活动"], ["exports", "导出"]);
-    return tabs;
+    return FULL_TABS;
   }
   function renderTabs() {
     tabsBar.innerHTML = "";
@@ -554,8 +483,9 @@ function viewDashboard(runId) {
       usage: Math.max(S.usageTotal || 0, S.usageRows.length),
       health: S.health.size,
       agents: activeAgents,
-      history: (S.recon?.history || []).length,
-      coverage: isHistoryOnly() ? historyModeStats().total : 0,
+      history: (S.history || []).length,
+      threat: (S.threat?.stats?.audit_items || 0),
+      coverage: 0,
     };
     for (const [key, label] of tabs) {
       const t = el("div", { class: "tab" + (key === activeTab ? " active" : "") }, label);
@@ -577,11 +507,11 @@ function viewDashboard(runId) {
     else if (activeTab === "nonissues") rendered = renderNonIssues();
     else if (activeTab === "agents") rendered = renderAgents();
     else if (activeTab === "health") rendered = renderModels();
+    else if (activeTab === "threat") rendered = renderThreat();
     else if (activeTab === "coverage") rendered = renderCoverage();
     else if (activeTab === "history") rendered = renderHistory();
     else if (activeTab === "risks") rendered = renderRisks();
     else if (activeTab === "usage") rendered = renderUsage();
-    else if (activeTab === "recon") rendered = renderRecon();
     else if (activeTab === "activity") rendered = renderActivity();
     else if (activeTab === "exports") rendered = renderExports();
     requestAnimationFrame(applyPendingFocus);
@@ -1333,13 +1263,8 @@ function viewDashboard(runId) {
   function renderConfigPanel() {
     const cfg = runConfig();
     const running = isRunClockActive();
-    let roles = ((S.meta && S.meta.roles) || ["recon", "history", "recheck", "decompose", "audit", "verify", "report", "poc"])
-      .filter(r => r !== "synthesis" && r !== "util");
-    if (isHistoryOnly()) {
-      const allowed = new Set(["recheck", "verify", "report", "poc"]);
-      if (!cfg.history_import_from) allowed.add("history");
-      roles = roles.filter(r => allowed.has(r));
-    }
+    let roles = ((S.meta && S.meta.roles) || ["threat", "history", "recheck", "audit", "verify", "report", "poc"])
+      .filter(r => !["synthesis", "util"].includes(r));
     const f = (label, node) => el("label", { class: "field" }, el("span", {}, label), node);
     const inputs = {};
     const modelGrid = el("div", { class: "grid" }, ...roles.map(role => {
@@ -1434,9 +1359,8 @@ function viewDashboard(runId) {
     failed: "失败",
   };
   const AGENT_ROLE_TXT = {
-    recon: "侦察",
+    threat: "威胁分析",
     history: "历史",
-    decompose: "拆解",
     audit: "审计",
     verify: "验证",
     report: "报告",
@@ -1445,9 +1369,9 @@ function viewDashboard(runId) {
     recheck: "复查",
     util: "工具",
   };
-  const AGENT_ROLE_ORDER = ["recheck", "recon", "history", "decompose", "audit", "verify", "report", "poc", "synthesis", "util"];
+  const AGENT_ROLE_ORDER = ["recheck", "threat", "history", "audit", "verify", "report", "poc", "synthesis", "util"];
   // 始终常驻显示的 8 个角色分组(与 pipeline 实际拉起的 role 一一对应),无论当前是否有在跑的 agent。
-  const AGENT_REAL_ROLES = ["recon", "decompose", "history", "audit", "verify", "recheck", "report", "poc"];
+  const AGENT_REAL_ROLES = ["threat", "history", "audit", "verify", "recheck", "report", "poc"];
   function isAgentActive(a) { return ["queued", "running", "retrying", "failed_attempt"].includes(a.status); }
   function agentPill(s) { return el("span", { class: "pill agent-" + cssKey(s) }, AGENT_TXT[s] || s || "unknown"); }
   function agentOrderValue(a) {
@@ -1795,7 +1719,7 @@ function viewDashboard(runId) {
       if (!byRole.has(k)) byRole.set(k, []);
       byRole.get(k).push(a);
     }
-    const roles = isHistoryOnly() ? ["history", "recheck", "verify", "report", "poc"] : [...AGENT_REAL_ROLES];
+    const roles = [...AGENT_REAL_ROLES];
     for (const k of byRole.keys()) if (!roles.includes(k)) roles.push(k);
     for (const key of roles) {
       tabBody.append(renderAgentGroup({ key, agents: (byRole.get(key) || []).sort(agentSort) }));
@@ -1815,60 +1739,9 @@ function viewDashboard(runId) {
       el("span", { class: "smeta" }, meta));
   }
 
-  function renderHistoryProgress() {
-    const c = S.coverage;
-    const hist = (S.recon || {}).history || [];
-    if (!c && !hist.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无历史排查数据。")); return; }
-    if (!candidatesLoaded) fetchCandidates();
-    const hs = historyModeStats();
-    const pct = hs.total ? Math.round(100 * hs.completed / hs.total) : 0;
-    tabBody.append(el("div", { class: "panel history-progress-panel" },
-      el("div", { class: "row", style: "justify-content:space-between" },
-        el("strong", {}, `历史模式排查:${hs.completed}/${hs.total} 已完成`),
-        el("span", { class: "muted" }, pct + "%")),
-      el("div", { class: "bar" }, el("span", { style: `width:${pct}%;background:var(--ok)` })),
-      el("div", { class: "history-progress-grid" },
-        el("div", {}, el("div", { class: "n" }, String(hs.pending)), el("div", { class: "l" }, "待排查")),
-        el("div", {}, el("div", { class: "n" }, String(hs.running)), el("div", { class: "l" }, "排查中")),
-        el("div", {}, el("div", { class: "n" }, String(hs.clean)), el("div", { class: "l" }, "未命中")),
-        el("div", {}, el("div", { class: "n" }, String(hs.hits)), el("div", { class: "l" }, "有候选")),
-        el("div", {}, el("div", { class: "n" }, String(hs.failed)), el("div", { class: "l" }, "失败")))));
-
-    const variants = variantStatusByPattern();
-    const rows = hist.length ? hist : historyVariantLedger().map(v => ({
-      pattern: v.pattern || v.name,
-      source: v.source || "",
-      lens_hint: (v.lenses || [])[0] || "",
-      files: [],
-    }));
-    if (!rows.length) return;
-    const tbl = el("table", { class: "data-table history-progress-table" }, el("thead", {}, el("tr", {},
-      el("th", {}, "状态"), el("th", {}, "lens"), el("th", {}, "问题模式"), el("th", {}, "候选"),
-      el("th", {}, "pass"), el("th", {}, "出处"), el("th", {}, "相关文件"))));
-    const tb = el("tbody");
-    for (const h of rows) {
-      const key = String(h.pattern || "").trim().toLowerCase();
-      const v = variants.get(key);
-      const status = v?.status || "pending";
-      const related = candidatesForHistory(h);
-      const empty = !candidatesLoaded ? "候选关联加载中…" : (v?.candidates ? `候选 ${v.candidates}(旧数据未保存关联)` : "—");
-      tb.append(el("tr", {},
-        el("td", {}, statusBadge(status)),
-        el("td", {}, el("span", { class: "tag" }, h.lens_hint || (v?.lenses || [])[0] || "—")),
-        el("td", {}, h.pattern || v?.name || ""),
-        el("td", {}, renderRelatedCandidates(related, empty)),
-        el("td", {}, String(v?.passes || 0)),
-        el("td", {}, h.source || v?.source || "—"),
-        el("td", { class: "loc" }, (h.files || []).join(", ") || "—")));
-    }
-    tbl.append(tb);
-    tabBody.append(el("div", { class: "panel" }, el("div", { class: "table-wrap" }, tbl)));
-  }
-
   function renderCoverage() {
-    if (isHistoryOnly()) { renderHistoryProgress(); return; }
     const c = S.coverage;
-    if (!c) { tabBody.append(el("div", { class: "panel empty" }, "暂无覆盖数据(运行开始后会出现攻击面审计进度与拆解的子任务)。")); return; }
+    if (!c) { tabBody.append(el("div", { class: "panel empty" }, "暂无覆盖数据(运行开始后会出现攻击方式审计进度)。")); return; }
     if (!candidatesLoaded) fetchCandidates();
     const p = c.progress || { done: 0, clean: 0, total: 0 };
     const pct = p.total ? Math.round(100 * p.done / p.total) : 0;
@@ -1879,6 +1752,7 @@ function viewDashboard(runId) {
       el("div", { class: "bar" }, el("span", { style: `width:${pct}%;background:var(--ok)` }))));
 
     const ledger = c.ledger || [];
+    const attackMethods = ledger.filter(r => r.kind === "attack_method");
     const regionRecs = ledger.filter(r => r.kind === "region");
     const tasks = ledger.filter(r => r.kind === "task");
     const variants = ledger.filter(r => r.kind === "variant");
@@ -1889,10 +1763,33 @@ function viewDashboard(runId) {
       tasksByRegion.get(k).push(t);
     }
 
-    // 攻击面 × 拆解的子任务(region 卡片,内嵌子任务)
+    if (attackMethods.length) {
+      const itemByKey = new Map((S.threat?.audit_items || []).map(i => [`attack_method:${i.id}`, i]));
+      tabBody.append(el("h3", { class: "section-title" }, "攻击树方法审计进度"));
+      const mt = el("table", { class: "data-table" }, el("thead", {}, el("tr", {},
+        el("th", {}, "状态"), el("th", {}, "攻击目标"), el("th", {}, "攻击面 / 方式"),
+        el("th", {}, "pass"), el("th", {}, "候选"), el("th", {}, "风险"), el("th", {}, "代码路径"))));
+      const mtb = el("tbody");
+      for (const r of attackMethods) {
+        const item = itemByKey.get(r.key) || {};
+        const ctx = item.attack_context || {};
+        mtb.append(el("tr", {},
+          el("td", {}, statusBadge(r.status || "pending")),
+          el("td", {}, ctx.attack_goal || "—"),
+          el("td", {}, `${ctx.surface || r.name || "—"} / ${ctx.method || r.name || "—"}`),
+          el("td", {}, String(r.passes || 0)),
+          el("td", {}, String(r.candidates || 0)),
+          el("td", {}, String(r.risks || 0)),
+          el("td", { class: "loc" }, (ctx.code_paths || []).map(p => p.path).join(", ") || (item.files || []).join(", ") || "—")));
+      }
+      mt.append(mtb);
+      tabBody.append(el("div", { class: "panel" }, el("div", { class: "table-wrap" }, mt)));
+    }
+
+    // 兼容旧 run:region/task 台账仍按区域卡片展示。
     const regionNames = new Set(regionRecs.map(r => r.name));
     if (regionRecs.length || tasks.length) {
-      tabBody.append(el("h3", { class: "section-title" }, "攻击面审计进度(区域 → 拆解的子任务)"));
+      tabBody.append(el("h3", { class: "section-title" }, "旧版攻击面审计进度(区域 → 子任务)"));
       const regionFrag = document.createDocumentFragment();
       for (const rg of regionRecs) {
         const subs = tasksByRegion.get(rg.name) || [];
@@ -1967,13 +1864,13 @@ function viewDashboard(runId) {
       tabBody.append(el("div", { class: "panel" }, el("div", { class: "table-wrap" }, st)));
     }
   }
-  const STATUS_TXT = { "decomposed": "🧩 已拆解", "completed-clean": "✅ 未发现", "completed-findings": "⚠️ 有候选", "in-progress": "🔄 进行中", "incomplete": "⛔ 未审完", "abandoned": "⛔ 复查失败", "pending": "⏳ 待审" };
+  const STATUS_TXT = { "completed-clean": "✅ 未发现", "completed-findings": "⚠️ 有候选", "in-progress": "🔄 进行中", "incomplete": "⛔ 未审完", "abandoned": "⛔ 复查失败", "pending": "⏳ 待审" };
   function statusBadge(s) { return el("span", {}, STATUS_TXT[s] || s || "?"); }
 
   const RECHECK_TXT = { none: "—", queued: "排队中", running: "排查中", done: "已排查", failed: "排查失败" };
   const RISK_STATUS_ORDER = ["none", "queued", "running", "done", "failed"];
   const RISK_STATUS_LABEL = { none: "未排查", queued: "排队中", running: "排查中", done: "已排查", failed: "排查失败" };
-  const HISTORY_STATUS_ORDER = ["pending", "in-progress", "completed-clean", "completed-findings", "incomplete", "abandoned", "decomposed"];
+  const HISTORY_STATUS_ORDER = ["pending", "in-progress", "completed-clean", "completed-findings", "incomplete", "abandoned"];
 
   function severitySelect(r) {
     const sel = el("select", { class: "sevsel" });
@@ -2020,38 +1917,103 @@ function viewDashboard(runId) {
     tabBody.append(panel);
   }
 
-  const PRI_PILL = { high: "high", medium: "medium", low: "low" };
-  function renderRecon() {
-    const r = S.recon;
-    if (!r) { tabBody.append(el("div", { class: "panel empty" }, "侦察数据加载中…")); return; }
-    const sec = (t, b) => el("div", { class: "panel" }, el("h3", {}, t), el("div", { class: "md", html: mdToHtml(b || "(无)") }));
-    const toMd = (v) => Array.isArray(v) ? v.map(x => "- " + x).join("\n") : v;   // threat_summary/repo_knowledge 现为列表
-    tabBody.append(sec("项目用途", r.purpose), sec("威胁分析", toMd(r.threat_summary)), sec("仓库知识", toMd(r.repo_knowledge)));
-    if (r.build_hint) tabBody.append(sec("编译提示 build_hint", r.build_hint));
+  const PRI_PILL = { high: "high", medium: "medium", low: "low", critical: "critical" };
+  function renderThreat() {
+    const g = S.threat;
+    if (!g || !Array.isArray(g.assets)) {
+      tabBody.append(el("div", { class: "panel empty" }, "攻击树威胁分析尚未完成。"));
+      fetchThreat();
+      return;
+    }
+    const stats = g.stats || {};
+    tabBody.append(el("div", { class: "stats" },
+      el("div", { class: "stat" }, el("div", { class: "n" }, String(stats.assets || 0)), el("div", { class: "l" }, "关键资产")),
+      el("div", { class: "stat" }, el("div", { class: "n" }, String(stats.trees || 0)), el("div", { class: "l" }, "攻击目标")),
+      el("div", { class: "stat" }, el("div", { class: "n" }, String(stats.surfaces || 0)), el("div", { class: "l" }, "攻击面")),
+      el("div", { class: "stat" }, el("div", { class: "n" }, String(stats.methods || 0)), el("div", { class: "l" }, "攻击方式")),
+      el("div", { class: "stat" }, el("div", { class: "n" }, String(stats.audit_items || 0)), el("div", { class: "l" }, "审计项"))));
 
-    // 攻击面地图(recon 识别的初始攻击面区域)
-    const regions = r.regions || [];
-    if (regions.length) {
-      tabBody.append(el("h3", { class: "section-title" }, `攻击面地图 · ${regions.length} 个区域`));
-      for (const rg of [...regions].sort((a, b) => (({ high: 0, medium: 1, low: 2 })[a.priority] ?? 3) - (({ high: 0, medium: 1, low: 2 })[b.priority] ?? 3))) {
-        const card = el("div", { class: "region" },
-          el("div", { class: "region-head" },
-            sevPill(PRI_PILL[rg.priority] || "info"),
-            el("span", { class: "rname" }, rg.name || "(未命名)"),
-            el("span", { class: "tag" }, rg.category || "other"),
-            rg.trust_boundary ? el("span", { class: "rmeta" }, "信任边界:" + rg.trust_boundary) : null),
-          rg.untrusted_input ? el("div", { class: "region-why" }, el("strong", {}, "不可信输入:"), " " + rg.untrusted_input) : null,
-          (rg.entry_points || []).length ? el("div", { class: "region-why" }, el("strong", {}, "入口:"), " " + rg.entry_points.join(", ")) : null,
-          (rg.crypto_apis || []).length ? el("div", { class: "region-why" }, el("strong", {}, "crypto API:"), " " + rg.crypto_apis.join(", ")) : null,
-          (rg.files || []).length ? el("div", { class: "region-files" }, (rg.files || []).join("  ·  ")) : null);
-        tabBody.append(card);
-      }
-    } else {
-      tabBody.append(el("div", { class: "panel empty" }, "尚无攻击面区域(侦察未完成或失败)。"));
+    if ((g.warnings || []).length) {
+      const details = el("details", { class: "panel" },
+        el("summary", {}, `规范化告警 · ${g.warnings.length}`),
+        el("ul", {}, ...(g.warnings || []).slice(0, 80).map(w => el("li", {}, w))));
+      tabBody.append(details);
     }
 
-  }
+    const assets = new Map((g.assets || []).map(a => [a.asset_id, a]));
+    const risks = new Map();
+    for (const a of (g.assets || [])) for (const r of (a.risks || [])) risks.set(`${a.asset_id}:${r.risk_id}`, r);
+    const nodes = new Map((g.nodes || []).map(n => [n.node_id, n]));
+    const children = new Map();
+    for (const n of (g.nodes || [])) {
+      const pid = n.parent_id || "";
+      if (!children.has(pid)) children.set(pid, []);
+      children.get(pid).push(n);
+    }
+    for (const arr of children.values()) arr.sort((a, b) => (a.order || 0) - (b.order || 0));
+    const mappings = new Map((g.code_path_mappings || []).map(m => [m.surface_node_id, m]));
+    const ledger = new Map((((S.coverage || {}).ledger) || []).map(r => [r.key, r]));
+    const auditByMethod = new Map((g.audit_items || []).map(i => [i.attack_context?.method_node_id, i]));
+    const statusForMethod = (methodNodeId) => {
+      const item = auditByMethod.get(methodNodeId);
+      return item ? (ledger.get(`attack_method:${item.id}`)?.status || "pending") : "pending";
+    };
+    const nodeBlock = (n, depth = 0) => {
+      const cls = `threat-node threat-${cssKey(n.node_type)}`;
+      const kids = children.get(n.node_id) || [];
+      const headKids = [el("span", { class: "tag" }, n.node_type), el("strong", {}, n.name || "(未命名)")];
+      if (n.node_type === "surface" && n.surface_type) headKids.push(el("span", { class: "tag" }, n.surface_type));
+      if (n.node_type === "method") headKids.push(statusBadge(statusForMethod(n.node_id)));
+      const body = el("div", { class: cls, style: `margin-left:${Math.min(depth, 3) * 14}px` },
+        el("div", { class: "threat-node-head" }, ...headKids));
+      if (n.node_type === "surface") {
+        const mp = mappings.get(n.node_id);
+        const paths = (mp && mp.code_paths) || [];
+        body.append(el("div", { class: "region-files" }, paths.length ? paths.map(p => `${p.path}${p.description ? " - " + p.description : ""}`).join("  ·  ") : "未定位到可信代码路径"));
+      }
+      if (n.node_type === "method" && (n.preconditions || []).length) {
+        body.append(el("div", { class: "region-why" }, el("strong", {}, "前置条件:"), " " + n.preconditions.join("; ")));
+      }
+      if ((n.basis || []).length) {
+        body.append(el("div", { class: "region-why muted" }, "依据: " + n.basis.join("; ")));
+      }
+      for (const k of kids) body.append(nodeBlock(k, depth + 1));
+      return body;
+    };
 
+    const byAsset = new Map();
+    for (const t of (g.trees || [])) {
+      if (!byAsset.has(t.asset_id)) byAsset.set(t.asset_id, []);
+      byAsset.get(t.asset_id).push(t);
+    }
+    if (!g.assets.length) {
+      tabBody.append(el("div", { class: "panel empty" }, "威胁分析没有识别出关键资产。"));
+      return;
+    }
+    for (const a of g.assets || []) {
+      const assetPanel = el("div", { class: "panel threat-asset" },
+        el("div", { class: "region-head" },
+          sevPill(PRI_PILL[a.criticality] || "info"),
+          el("span", { class: "rname" }, a.name || "(未命名资产)"),
+          el("span", { class: "tag" }, a.asset_type || "other"),
+          el("span", { class: "rmeta" }, `${(a.risks || []).length} 个关键风险`)),
+        a.description ? el("div", { class: "region-why" }, a.description) : null);
+      for (const t of byAsset.get(a.asset_id) || []) {
+        const risk = risks.get(`${a.asset_id}:${t.risk_id}`) || {};
+        const root = nodes.get(t.root_node_id);
+        const treeBox = el("details", { class: "threat-tree", open: "" },
+          el("summary", {},
+            el("span", { class: "tag" }, risk.security_property || "risk"),
+            " ",
+            el("strong", {}, t.attack_goal || root?.name || "未命名攻击目标"),
+            risk.name ? el("span", { class: "muted" }, " · " + risk.name) : null));
+        if (risk.description) treeBox.append(el("div", { class: "region-why" }, risk.description));
+        if (root) treeBox.append(nodeBlock(root, 0));
+        assetPanel.append(treeBox);
+      }
+      tabBody.append(assetPanel);
+    }
+  }
   function variantStatusByPattern() {
     const out = new Map();
     for (const v of ((S.coverage || {}).ledger || [])) {
@@ -2073,7 +2035,7 @@ function viewDashboard(runId) {
   }
   function renderHistory() {
     if (!candidatesLoaded) fetchCandidates();
-    const hist = (S.recon || {}).history || [];
+    const hist = S.history || [];
     if (!hist.length) {
       tabBody.append(el("div", { class: "panel empty" }, "暂无历史问题模式。"));
       return;
@@ -2237,8 +2199,9 @@ function viewDashboard(runId) {
         if (activeTab === "coverage" || activeTab === "history") renderTab(); break;
       case "round_start": S.round = d.round; renderHeader(); break;
       case "round_done": S.round = d.round; S.dry = d.dry_streak; renderHeader(); break;
-      case "recon_done": if (d.purpose != null || d.threat_summary != null) { S.recon = Object.assign({}, S.recon, d); } fetchRecon(); break;
-      case "history_added": flash(`🕮 历史问题模式 +1(共 ${d.total || "?"} 条):${(d.pattern || "").slice(0, 50)}`); fetchRecon(); fetchCoverage(); break;
+      case "threat_analysis_done": fetchThreat(); fetchCoverage(); break;
+      case "threat_node_upserted": fetchThreat(); break;
+      case "history_added": flash(`🕮 历史问题模式 +1(共 ${d.total || "?"} 条):${(d.pattern || "").slice(0, 50)}`); fetchHistory(); fetchCoverage(); break;
       case "run_done": applyMetrics(d); setRunStatus(d.status || "done"); renderHeader(); break;
       case "config_updated":
         if (S.manifest) {
@@ -2255,7 +2218,8 @@ function viewDashboard(runId) {
       case "log": S.log.push(d.message); if (S.log.length > 600) S.log.shift(); if (activeTab === "activity") renderTab(); break;
     }
   }
-  async function fetchRecon() { try { S.recon = await api("GET", `/api/runs/${encodeURIComponent(runId)}/recon`); renderTabs(); if (activeTab === "recon" || activeTab === "history") renderTab(); } catch (e) {} }
+  async function fetchHistory() { try { S.history = await api("GET", `/api/runs/${encodeURIComponent(runId)}/history`) || []; renderHeader(); renderTabs(); if (activeTab === "history" || activeTab === "coverage") renderTab(); } catch (e) {} }
+  async function fetchThreat() { try { S.threat = await api("GET", `/api/runs/${encodeURIComponent(runId)}/threat-analysis`); renderTabs(); if (activeTab === "threat") renderTab(); } catch (e) {} }
   async function fetchCoverage() { try { const c = await api("GET", `/api/runs/${encodeURIComponent(runId)}/coverage`); if (c) { S.coverage = Object.assign({}, S.coverage, c); if (activeTab === "coverage" || activeTab === "history") renderTab(); } } catch (e) {} }
   async function fetchRisks() { try { const list = await api("GET", `/api/runs/${encodeURIComponent(runId)}/risks`); for (const r of (list || [])) { const k = (r.area || "") + "::" + (r.file || ""); S.risks.set(k, r); } S.riskTotal = Math.max(S.riskTotal || 0, S.risks.size); renderHeader(); renderTabs(); if (activeTab === "risks") renderTab(); } catch (e) {} }
   async function fetchHealth() { try { const h = await api("GET", `/api/runs/${encodeURIComponent(runId)}/health`); for (const r of (h.models || [])) if (r.model) S.health.set(r.model, r); renderTabs(); if (activeTab === "health") renderTab(); } catch (e) {} }
@@ -2340,7 +2304,8 @@ function viewDashboard(runId) {
     S.agentMap.clear();
     for (const a of (snap.agents || [])) applyAgentUpdate(a);
     S.coverage = snap.coverage || null;
-    S.recon = snap.recon || null;
+    S.history = Array.isArray(snap.history) ? snap.history : [];
+    S.threat = snap.threat_analysis || null;
     applyUsageRows(snap.usage || []);
     usageLoaded = !snap.lite && Array.isArray(snap.usage);
     Object.assign(S.usage, emptyUsage());
@@ -2352,8 +2317,8 @@ function viewDashboard(runId) {
     S.usageTotal = Math.max(S.usageTotal || 0, S.usageRows.length);
     S.round = snap.round ?? S.round;
     setRunStatus(S.manifest.running ? "running" : S.manifest.status);
-    if (!initialModeTabApplied && isHistoryOnly()) {
-      activeTab = "coverage";
+    if (!initialModeTabApplied) {
+      activeTab = "threat";
       initialModeTabApplied = true;
     }
     return Number(snap.last_seq || 0);
@@ -2375,7 +2340,7 @@ function viewDashboard(runId) {
     // 首屏由 snapshot 提供完整关键数据;SSE 只接 snapshot 之后的新事件。
     const es = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events?last_id=${encodeURIComponent(lastSeq)}`);
     window._es = es;
-    const TYPES = ["run_status", "metrics", "usage", "agent_update", "candidate_found", "finding_confirmed", "finding_added", "finding_rejected", "candidate_failed", "candidate_decided", "risk_added", "recheck_enqueued", "recheck_done", "risk_severity_changed", "surface_added", "coverage_update", "round_start", "round_done", "recon_done", "history_added", "run_done", "log", "decompose_done", "poc_done", "error", "model_health", "health_check_start", "health_check_done", "config_updated"];
+    const TYPES = ["run_status", "metrics", "usage", "agent_update", "candidate_found", "finding_confirmed", "finding_added", "finding_rejected", "candidate_failed", "candidate_decided", "risk_added", "recheck_enqueued", "recheck_done", "risk_severity_changed", "surface_added", "coverage_update", "round_start", "round_done", "threat_analysis_done", "threat_node_upserted", "history_added", "run_done", "log", "poc_done", "error", "model_health", "health_check_start", "health_check_done", "config_updated"];
     for (const t of TYPES) es.addEventListener(t, (e) => { try { applyEvent(JSON.parse(e.data)); } catch (_) {} });
     es.onerror = () => { /* EventSource 自动重连 */ };
   }

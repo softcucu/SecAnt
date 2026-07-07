@@ -602,7 +602,7 @@ class ProcessDrainTests(unittest.IsolatedAsyncioTestCase):
                 target=d,
                 out_dir=os.path.join(d, "out"),
                 backend="dummy",
-                models={"recon": ["unit-model"]},
+                models={"threat": ["unit-model"]},
                 backends={
                     "dummy": BackendSpec(
                         name="dummy",
@@ -620,7 +620,7 @@ class ProcessDrainTests(unittest.IsolatedAsyncioTestCase):
 
             parsed = await runner.run(
                 "prompt",
-                role="recon",
+                role="threat",
                 label="unit",
                 schema=schema,
                 retry_forever=True,

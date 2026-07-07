@@ -9,7 +9,7 @@ QUALITY_FINDING_STATUS = "unproven_quality_issue"
 QUALITY_FINDING_TAG = "编码质量问题"
 
 LEDGER_STATUS = {
-    "decomposed": "🧩 已拆解为子任务", "completed-clean": "✅ 已完成(未发现)",
+    "completed-clean": "✅ 已完成(未发现)",
     "completed-findings": "⚠️ 已完成(有候选)", "in-progress": "🔄 进行中(将续审)",
     "incomplete": "⛔ 未审完(agent故障,待重审)", "pending": "⏳ 待审",
     "abandoned": "⛔ 复查失败(未覆盖)",
@@ -62,6 +62,8 @@ def item_key(it: Dict[str, Any]) -> str:
         return f"risk:{it.get('id')}"
     if k == "task":
         return f"task:{it.get('region') or ''}:{it.get('objective') or it.get('name')}"
+    if k == "attack_method":
+        return f"attack_method:{it.get('id') or it.get('name')}"
     return f"surface:{it.get('name')}"
 
 
@@ -88,6 +90,7 @@ def slim_finding(c: Dict[str, Any]) -> Dict[str, Any]:
         "finding_status": c.get("finding_status") or "",
         "verification_status": c.get("verification_status") or "",
         "original_severity": c.get("original_severity") or "",
+        "attack_context": c.get("attack_context") or {},
         "epistemic_verdict": c.get("epistemic_verdict") or "",
         "operational_decision": c.get("operational_decision") or "",
         "decision_reason": c.get("decision_reason") or "",

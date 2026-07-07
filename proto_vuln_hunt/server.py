@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 from . import exporters
 from . import events as EV
 from .common import finalize_findings, slim_finding
-from .config import ALL_LENSES, DEFAULT_BACKENDS, ROLES, RUN_MODES, Config, load_config
+from .config import ALL_LENSES, DEFAULT_BACKENDS, ROLES, Config, load_config
 from .events import EventBus
 from .store import (RunRegistry, RunStore, STATUS_INTERRUPTED, STATUS_QUEUED, STATUS_RUNNING)
 
@@ -25,10 +25,9 @@ _DASHBOARD_USAGE_LIMIT = 80
 
 # 允许从 Web 表单覆盖的 Config 字段(白名单,防注入任意字段)
 _RUN_FIELDS = {
-    "target", "scope", "backend", "concurrency", "run_mode", "history_import_from", "threat_model", "lenses",
+    "target", "scope", "backend", "concurrency", "history_import_from", "threat_model", "lenses",
     "finders_per_lens", "max_rounds", "dry_rounds", "verify_votes",
-    "enable_poc", "decompose", "unit_line_budget", "max_files_per_unit", "max_subtasks_per_region",
-    "methods_dir", "models", "model_concurrency", "model_time_windows", "resume", "fresh",
+    "enable_poc", "methods_dir", "models", "model_concurrency", "model_time_windows", "resume", "fresh",
 }
 
 # 续跑历史任务时,这些"后端/模型/并发"字段改用本次启动的基础配置(self.base,随服务重启读取最新
@@ -242,6 +241,7 @@ def _merge_candidate(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]
         "title", "bug_class", "file", "line", "lens", "severity", "function", "description",
         "source_to_sink", "variant_of", "confidence", "audit_model", "good_validation_ref",
         "risk_id", "risk_area",
+        "attack_context",
         "id", "corrected_severity", "reason", "attempts", "final_sweep", "votes",
         "verify_models", "vote_total", "vote_false", "vote_real", "rejection_reason",
         "epistemic_verdict", "operational_decision", "decision_reason", "residual_uncertainty",
@@ -333,7 +333,8 @@ def _dashboard_snapshot(store: RunStore, running: bool, last_seq: int,
     manifest["running"] = running
     last_seq = max(last_seq, store.last_event_seq())
     asf = store.load_attack_surface()
-    regions = asf.get("regions") or (store.load_recon() or {}).get("regions") or []
+    threat = store.load_threat_analysis()
+    regions = asf.get("regions") or threat.get("audit_items") or []
     summary = manifest.get("summary") or {}
     candidate_total = _int_count(summary.get("candidates"))
     candidates = [] if lite else _response_candidates(store, manifest)
@@ -357,7 +358,8 @@ def _dashboard_snapshot(store: RunStore, running: bool, last_seq: int,
         "risks": store.load_risks(),
         "coverage": {"ledger": asf.get("ledger") or [], "surfaces": asf.get("surfaces") or [],
                      "regions": regions, "progress": asf.get("progress") or {"done": 0, "clean": 0, "total": 0}},
-        "recon": store.load_recon(),
+        "threat_analysis": threat,
+        "history": store.load_history(),
         "health": health,
         "usage": [] if lite else store.load_usage(limit=_DASHBOARD_USAGE_LIMIT),
         "agents": agents or [],
@@ -388,7 +390,7 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
     async def meta():
         return {
             "backends": sorted(set(list(DEFAULT_BACKENDS) + list(cfg.backends))),
-            "lenses": ALL_LENSES, "roles": ROLES, "run_modes": RUN_MODES,
+            "lenses": ALL_LENSES, "roles": ROLES,
             "defaults": {
                 "backend": cfg.backend, "concurrency": cfg.concurrency, "models": cfg.models,
                 "run_mode": cfg.run_mode, "history_import_from": cfg.history_import_from,
@@ -397,9 +399,7 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
                 "threat_model": cfg.threat_model, "lenses": cfg.lenses,
                 "finders_per_lens": cfg.finders_per_lens, "max_rounds": cfg.max_rounds,
                 "dry_rounds": cfg.dry_rounds, "verify_votes": cfg.verify_votes,
-                "enable_poc": cfg.enable_poc, "decompose": cfg.decompose,
-                "unit_line_budget": cfg.unit_line_budget, "max_files_per_unit": cfg.max_files_per_unit,
-                "max_subtasks_per_region": cfg.max_subtasks_per_region,
+                "enable_poc": cfg.enable_poc,
                 "methods_dir": cfg.methods_abs,
                 "health": {"enabled": cfg.health.enabled, "on_start": cfg.health.on_start,
                            "gate": cfg.health.gate, "ttl_s": cfg.health.ttl_s},
@@ -476,9 +476,6 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
         if not rec:
             raise HTTPException(404, "finding not found")
         _apply_finding_output_times(store, [rec])
-        # 仅历史模式:正文以 report_struct 结构化存储,这里现渲染成 report_body 供 web 展示。
-        if not (rec.get("report_body") or "").strip() and isinstance(rec.get("report_struct"), dict):
-            rec["report_body"] = exporters.render_history_report_body(rec["report_struct"], rec)
         return rec
 
     @app.post("/api/runs/{run_id}/findings/{fid}/feedback")
@@ -508,7 +505,8 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
     async def coverage(run_id: str):
         store = _store_or_404(run_id)
         asf = store.load_attack_surface()
-        regions = asf.get("regions") or (store.load_recon() or {}).get("regions") or []
+        threat = store.load_threat_analysis()
+        regions = asf.get("regions") or threat.get("audit_items") or []
         return {"ledger": asf.get("ledger") or [], "surfaces": asf.get("surfaces") or [],
                 "regions": regions, "progress": asf.get("progress") or {"done": 0, "clean": 0, "total": 0}}
 
@@ -533,9 +531,13 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
             raise HTTPException(400, "severity_hint 必须是 high/medium/low/info 之一")
         return {"ok": manager.set_risk_severity(run_id, rid, sev)}
 
-    @app.get("/api/runs/{run_id}/recon")
-    async def recon(run_id: str):
-        return _store_or_404(run_id).load_recon()
+    @app.get("/api/runs/{run_id}/threat-analysis")
+    async def threat_analysis(run_id: str):
+        return _store_or_404(run_id).load_threat_analysis()
+
+    @app.get("/api/runs/{run_id}/history")
+    async def history(run_id: str):
+        return _store_or_404(run_id).load_history()
 
     # ── 运行中动态调参:模型增减 / 并发调整 ──
     @app.post("/api/runs/{run_id}/config")

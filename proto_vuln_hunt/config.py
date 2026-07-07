@@ -28,14 +28,13 @@ BUNDLED_METHODS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 # 审计 lens(9 类)
 ALL_LENSES = ["memory", "integer", "race", "injection", "authn", "crypto", "dos", "infoleak", "resource-realtime"]
 RUN_MODE_FULL = "full"
-RUN_MODE_HISTORY_ONLY = "history_only"
-RUN_MODES = [RUN_MODE_FULL, RUN_MODE_HISTORY_ONLY]
+RUN_MODES = [RUN_MODE_FULL]
 
 # 流水线里会用到的 agent 角色;每个会运行的角色都必须在 models 里显式指定模型。
 # history:统一调度队列中的「git 历史问题模式挖掘」(每条提交一个 agent,与 high audit finder 同级)。
 # recheck:专用优先排查角色——处理历史问题变体 + 已登记风险点的复查(最高优先级、默认并发 1)。
-ROLES = ["recon", "history", "recheck", "decompose", "audit", "verify", "report", "poc", "synthesis", "util"]
-TASK_MODEL_ROLES = ["recon", "history", "recheck", "decompose", "audit", "verify", "report", "poc"]
+ROLES = ["threat", "history", "recheck", "audit", "verify", "report", "poc", "synthesis", "util"]
+TASK_MODEL_ROLES = ["threat", "history", "recheck", "audit", "verify", "report", "poc"]
 
 
 # ──────────────────────────── 后端默认调用模板 ────────────────────────────
@@ -124,7 +123,7 @@ class RetrySpec:
 
     说明:后端 CLI 内部已自行处理瞬时 API 抖动(限流/5xx 等)的重试;本工具这一层只在
     **CLI 任务整体失败**时重试——即子进程非零退出 / 超时 / 输出无法解析为所需结构化 JSON。
-    max_attempts 是单组重试上限;recon/audit 等阶段可在其外层选择不限组数或回队继续重试。
+    max_attempts 是单组重试上限;threat/audit 等阶段可在其外层选择不限组数或回队继续重试。
     """
     max_attempts: int = 4          # 失败后最多再重试几次(总尝试 = 1 + max_attempts)
     backoff_base_ms: int = 2000    # 退避基数(指数增长)
@@ -134,11 +133,11 @@ class RetrySpec:
 
 @dataclass
 class HistorySpec:
-    """git 历史问题模式挖掘:从侦察中**抽离**出来,与 recon 同时启动。
+    """git 历史问题模式挖掘:与 threat 阶段并行启动。
 
     遍历 `git log` 的提交,**每条提交派 1 个 agent**(role=history)读其改动并判定是否安全修复;
     相关者提炼成「历史问题模式」回灌到 history[](作为同类变体排查种子)与审计队列。
-    这一块不阻塞侦察和审计:按 high audit finder 同级排队,历史模式随挖随补。
+    这一块不阻塞威胁分析和审计:按 high audit finder 同级排队,历史模式随挖随补。
     """
     enabled: bool = True
     max_commits: int = 200          # 最多分析多少条最近的提交
@@ -195,7 +194,7 @@ class Config:
 
     # 流水线参数(对齐 proto-vuln-hunt)
     run_mode: str = RUN_MODE_FULL
-    history_import_from: str = ""           # 可选:从既有 run 目录或 recon.json 导入 history[] 模式,跳过 commit 分析
+    history_import_from: str = ""           # 可选:从既有 run 目录或 history.json 导入历史问题模式,跳过 commit 分析
     finders_per_lens: int = 2
     dry_rounds: int = 2
     max_rounds: int = 6
@@ -203,11 +202,6 @@ class Config:
     threat_model: str = "REMOTE"
     enable_poc: bool = True
     lenses: List[str] = field(default_factory=lambda: list(ALL_LENSES))
-    decompose: bool = True
-    unit_line_budget: int = 1500
-    max_subtasks_per_region: int = 40    # 动态拆解预算的硬封顶;0 表示不额外封顶
-    max_files_per_unit: int = 4
-
     # 方法库 / 断点(默认用项目自带的 methods/;可在配置里覆盖为自定义目录)
     methods_dir: str = BUNDLED_METHODS_DIR
     resume: bool = True
@@ -241,9 +235,6 @@ class Config:
         self.dry_rounds = max(1, int(self.dry_rounds))
         self.max_rounds = max(1, int(self.max_rounds))
         self.verify_votes = max(1, int(self.verify_votes))
-        self.unit_line_budget = max(1, int(self.unit_line_budget))
-        self.max_subtasks_per_region = max(0, int(self.max_subtasks_per_region))
-        self.max_files_per_unit = max(1, int(self.max_files_per_unit))
         self.recheck.concurrency = max(1, int(self.recheck.concurrency))
         if self.recheck.risk_min_severity not in ("high", "medium", "low", "info"):
             self.recheck.risk_min_severity = "medium"
@@ -360,20 +351,11 @@ class Config:
         return seen
 
     def required_model_roles(self) -> List[str]:
-        if self.run_mode == RUN_MODE_HISTORY_ONLY:
-            roles = ["recheck", "verify", "report"]
-            if self.history.enabled and not self.history_import_from:
-                roles.append("history")
-            if self.enable_poc:
-                roles.append("poc")
-            return [r for r in TASK_MODEL_ROLES if r in roles]
-        roles = ["recon", "audit", "verify", "report"]
+        roles = ["threat", "audit", "verify", "report"]
         if self.history.enabled and not self.history_import_from:
             roles.append("history")
         if self.recheck.enabled:
             roles.append("recheck")
-        if self.decompose:
-            roles.append("decompose")
         if self.enable_poc:
             roles.append("poc")
         return [r for r in TASK_MODEL_ROLES if r in roles]
@@ -382,17 +364,13 @@ class Config:
         return [r for r in self.required_model_roles() if not self.models_for(r)]
 
     def unsupported_model_keys(self) -> List[str]:
-        return [k for k in self.models if k == "default"]
+        return [k for k in self.models if k == "default" or k not in ROLES]
 
     def model_config_error(self) -> str:
         problems: List[str] = []
-        if self.run_mode == RUN_MODE_HISTORY_ONLY and not self.recheck.enabled:
-            problems.append("history_only 模式需要 recheck.enabled=true")
-        if self.run_mode == RUN_MODE_HISTORY_ONLY and not self.history_import_from and not self.history.enabled:
-            problems.append("history_only 未指定 history_import_from 时需要 history.enabled=true")
         unsupported = self.unsupported_model_keys()
         if unsupported:
-            problems.append("models.default 已不支持;请为每个任务 role 显式配置模型")
+            problems.append("不支持的模型 role: " + ", ".join(f"models.{k}" for k in unsupported))
         missing = self.missing_model_roles()
         if missing:
             problems.append("缺少模型配置: " + ", ".join(f"models.{r}" for r in missing))

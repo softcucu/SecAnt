@@ -21,10 +21,9 @@ def _pipe(tmp, **overrides):
         "finders_per_lens": 1,
         "concurrency": 1,
         "models": {
-            "recon": ["unit-model"],
+            "threat": ["unit-model"],
             "history": ["unit-model"],
             "recheck": ["unit-model"],
-            "decompose": ["unit-model"],
             "audit": ["unit-model"],
             "verify": ["unit-model"],
             "report": ["unit-model"],
@@ -39,6 +38,40 @@ def _pipe(tmp, **overrides):
     )
     store = RunStore(cfg.out_dir).ensure()
     return Pipeline(cfg, store=store)
+
+
+def _threat_raw():
+    return {
+        "schema_version": "1.0",
+        "analysis_id": "unit",
+        "sources": {"repositories": ["."], "documents": []},
+        "assets": [{
+            "asset_id": "ASSET-001",
+            "name": "服务",
+            "asset_type": "service",
+            "criticality": "critical",
+            "risks": [{
+                "risk_id": "RISK-001",
+                "name": "服务不可用",
+                "security_property": "availability",
+                "description": "服务中断",
+            }],
+        }],
+        "attack_trees": [{
+            "tree_id": "TREE-001",
+            "asset_id": "ASSET-001",
+            "risk_id": "RISK-001",
+            "attack_goal": "造成服务中断",
+            "root_node_id": "NODE-001",
+            "nodes": [
+                {"node_id": "NODE-001", "parent_id": None, "node_type": "goal", "name": "造成服务中断", "order": 1, "basis": []},
+                {"node_id": "NODE-002", "parent_id": "NODE-001", "node_type": "domain", "name": "协议栈", "order": 1, "basis": []},
+                {"node_id": "NODE-003", "parent_id": "NODE-002", "node_type": "surface", "name": "协议入口", "surface_type": "protocol", "order": 1, "basis": []},
+                {"node_id": "NODE-004", "parent_id": "NODE-003", "node_type": "method", "name": "畸形消息", "order": 1, "basis": [], "preconditions": []},
+            ],
+        }],
+        "code_path_mappings": [{"surface_node_id": "NODE-003", "code_paths": [{"path": "src", "description": "入口"}]}],
+    }
 
 
 def _future_hour_window():
@@ -57,10 +90,9 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
 
         seen = []
         models = {
-            "recon": ["ready-model"],
+            "threat": ["ready-model"],
             "history": ["ready-model"],
             "recheck": ["ready-model"],
-            "decompose": ["ready-model"],
             "audit": ["closed-model", "ready-model"],
             "verify": ["ready-model"],
             "report": ["ready-model"],
@@ -92,23 +124,20 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
             p = _pipe(
                 tmp,
                 models={
-                    "recon": ["active-recon"],
+                    "threat": ["active-threat"],
                     "history": ["unused-history"],
                     "recheck": ["unused-recheck"],
-                    "decompose": ["unused-decompose"],
                     "audit": ["active-audit"],
                     "verify": ["active-verify"],
                     "report": ["active-report"],
                     "poc": ["unused-poc"],
                 },
-                decompose=False,
                 enable_poc=False,
                 history=HistorySpec(enabled=False),
                 recheck=RecheckSpec(enabled=False),
                 model_time_windows={
                     "unused-history": _future_hour_window(),
                     "unused-recheck": _future_hour_window(),
-                    "unused-decompose": _future_hour_window(),
                     "unused-poc": _future_hour_window(),
                 },
             )
@@ -116,11 +145,11 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
 
             result = await p.health_check_all()
 
-            self.assertEqual(seen, ["active-recon", "active-audit", "active-verify", "active-report"])
+            self.assertEqual(seen, ["active-threat", "active-audit", "active-verify", "active-report"])
             self.assertEqual(result["total"], 4)
             self.assertEqual(result["skipped_unavailable"], [])
 
-    async def test_history_commit_starts_while_recon_is_running(self):
+    async def test_history_commit_starts_while_threat_analysis_is_running(self):
         class DummyRunner:
             def __init__(self):
                 self.events = []
@@ -135,11 +164,11 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
 
             async def run(self, *_args, **kwargs):
                 role = kwargs.get("role")
-                if role == "recon":
-                    self.events.append("recon-start")
+                if role == "threat":
+                    self.events.append("threat-start")
                     await asyncio.sleep(0.05)
-                    self.events.append("recon-end")
-                    return {"regions": [], "history": [], "build_hint": "", "repo_knowledge": ""}
+                    self.events.append("threat-end")
+                    return {"assets": [], "attack_trees": [], "code_path_mappings": []}
                 if role == "history":
                     self.events.append("history")
                     return {"security_related": False}
@@ -148,7 +177,6 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             p = _pipe(
                 tmp,
-                decompose=False,
                 enable_poc=False,
                 history=HistorySpec(enabled=True),
                 recheck=RecheckSpec(enabled=False),
@@ -160,10 +188,10 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
 
             await p.run()
 
-            self.assertLess(runner.events.index("recon-start"), runner.events.index("history"))
-            self.assertLess(runner.events.index("history"), runner.events.index("recon-end"))
+            self.assertLess(runner.events.index("threat-start"), runner.events.index("history"))
+            self.assertLess(runner.events.index("history"), runner.events.index("threat-end"))
 
-    async def test_audit_starts_after_first_region_decomposes(self):
+    async def test_attack_methods_audit_directly(self):
         class DummyRunner:
             def __init__(self):
                 self.order = []
@@ -180,24 +208,21 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
                 role = kwargs.get("role")
                 label = kwargs.get("label") or role
                 self.order.append((role, label))
-                if role == "decompose":
-                    name = label.split(":", 1)[1]
-                    return {"subtasks": [{"objective": f"audit-{name}", "files": []}]}
                 return {"findings": [], "new_surfaces": [], "risk_notes": []}
 
         with tempfile.TemporaryDirectory() as tmp:
-            p = _pipe(tmp, decompose=True)
+            p = _pipe(tmp)
             runner = DummyRunner()
             p.runner = runner
-            p._enqueue_work({"kind": "region", "name": "r1", "priority": "high", "files": []})
-            p._enqueue_work({"kind": "region", "name": "r2", "priority": "high", "files": []})
+            p._enqueue_work({"kind": "attack_method", "id": "a1", "name": "m1", "priority": "high", "files": []})
+            p._enqueue_work({"kind": "attack_method", "id": "a2", "name": "m2", "priority": "high", "files": []})
 
             await p.audit()
 
             roles = [r for r, _ in runner.order]
-            self.assertEqual(roles, ["decompose", "audit", "decompose", "audit"])
+            self.assertEqual(roles, ["audit", "audit"])
 
-    async def test_recon_completion_does_not_wait_for_active_history_before_decompose(self):
+    async def test_threat_completion_does_not_wait_for_active_history_before_audit(self):
         class DummyRunner:
             def __init__(self):
                 self.events = []
@@ -212,24 +237,16 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
 
             async def run(self, *_args, **kwargs):
                 role = kwargs.get("role")
-                if role == "recon":
-                    self.events.append("recon-start")
+                if role == "threat":
+                    self.events.append("threat-start")
                     await asyncio.sleep(0.02)
-                    self.events.append("recon-end")
-                    return {
-                        "regions": [{"name": "r1", "priority": "high", "files": []}],
-                        "history": [],
-                        "build_hint": "",
-                        "repo_knowledge": "",
-                    }
+                    self.events.append("threat-end")
+                    return _threat_raw()
                 if role == "history":
                     self.events.append("history-start")
                     await asyncio.sleep(0.15)
                     self.events.append("history-end")
                     return {"security_related": False}
-                if role == "decompose":
-                    self.events.append("decompose-start")
-                    return {"subtasks": [{"objective": "audit-r1", "files": []}]}
                 if role == "audit":
                     self.events.append("audit")
                 return {"findings": [], "new_surfaces": [], "risk_notes": []}
@@ -238,7 +255,6 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
             p = _pipe(
                 tmp,
                 concurrency=2,
-                decompose=True,
                 enable_poc=False,
                 history=HistorySpec(enabled=True),
                 recheck=RecheckSpec(enabled=False),
@@ -250,11 +266,11 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
 
             await p.run()
 
-            self.assertLess(runner.events.index("history-start"), runner.events.index("recon-end"))
-            self.assertLess(runner.events.index("recon-end"), runner.events.index("decompose-start"))
-            self.assertLess(runner.events.index("decompose-start"), runner.events.index("history-end"))
+            self.assertLess(runner.events.index("history-start"), runner.events.index("threat-end"))
+            self.assertLess(runner.events.index("threat-end"), runner.events.index("audit"))
+            self.assertLess(runner.events.index("audit"), runner.events.index("history-end"))
 
-    async def test_recheck_spawned_when_history_finishes_during_decompose(self):
+    async def test_recheck_spawned_when_history_finishes_during_attack_method_audit(self):
         class DummyRunner:
             def __init__(self):
                 self.events = []
@@ -269,16 +285,11 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
 
             async def run(self, *_args, **kwargs):
                 role = kwargs.get("role")
-                if role == "recon":
-                    self.events.append("recon-start")
+                if role == "threat":
+                    self.events.append("threat-start")
                     await asyncio.sleep(0.02)
-                    self.events.append("recon-end")
-                    return {
-                        "regions": [{"name": "r1", "priority": "high", "files": []}],
-                        "history": [],
-                        "build_hint": "",
-                        "repo_knowledge": "",
-                    }
+                    self.events.append("threat-end")
+                    return _threat_raw()
                 if role == "history":
                     self.events.append("history-start")
                     await asyncio.sleep(0.08)
@@ -290,23 +301,20 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
                         "files": [],
                         "rationale": "unit",
                     }
-                if role == "decompose":
-                    self.events.append("decompose-start")
+                if role == "audit":
+                    self.events.append("audit-start")
                     await asyncio.sleep(0.35)
-                    self.events.append("decompose-end")
-                    return {"subtasks": [{"objective": "audit-r1", "files": []}]}
+                    self.events.append("audit-end")
+                    return {"findings": [], "new_surfaces": [], "risk_notes": []}
                 if role == "recheck":
                     self.events.append("recheck-start")
                     return {"findings": [], "new_surfaces": [], "risk_notes": []}
-                if role == "audit":
-                    self.events.append("audit")
                 return {"findings": [], "new_surfaces": [], "risk_notes": []}
 
         with tempfile.TemporaryDirectory() as tmp:
             p = _pipe(
                 tmp,
                 concurrency=3,
-                decompose=True,
                 enable_poc=False,
                 history=HistorySpec(enabled=True),
                 recheck=RecheckSpec(enabled=True),
@@ -318,9 +326,9 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
 
             await p.run()
 
-            self.assertLess(runner.events.index("decompose-start"), runner.events.index("history-end"))
+            self.assertLess(runner.events.index("audit-start"), runner.events.index("history-end"))
             self.assertLess(runner.events.index("history-end"), runner.events.index("recheck-start"))
-            self.assertLess(runner.events.index("recheck-start"), runner.events.index("decompose-end"))
+            self.assertLess(runner.events.index("recheck-start"), runner.events.index("audit-end"))
 
 
 class TestSchedulerPriority(unittest.TestCase):
@@ -334,33 +342,6 @@ class TestSchedulerPriority(unittest.TestCase):
 
             self.assertEqual(work["kind"], "_recheck")
             self.assertEqual(work["item"]["id"], "RISK-001")
-
-    def test_history_only_verify_work_is_selected_before_recheck(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            p = _pipe(
-                tmp,
-                run_mode="history_only",
-                history_import_from="imported",
-                concurrency=3,
-                recheck=RecheckSpec(enabled=True),
-                model_concurrency={"default": 3},
-            )
-            p.pq.append({"kind": "variant", "pattern": "missing check", "source": "abc", "lens_hint": "memory"})
-            p._enqueue_work({
-                "kind": "_finding",
-                "finding_key": "candidate-1",
-                "finding": {
-                    "title": "candidate",
-                    "bug_class": "memory",
-                    "file": "a.c",
-                    "line": 1,
-                },
-            })
-
-            work = p._pop_next_work()
-
-            self.assertEqual(work["kind"], "_finding")
-            self.assertEqual(work["finding"]["title"], "candidate")
 
     def test_history_and_audit_share_priority_class(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -397,10 +378,9 @@ class TestSchedulerPriority(unittest.TestCase):
 
     def test_time_window_unavailable_model_does_not_dispatch_role(self):
         models = {
-            "recon": ["ready-model"],
+            "threat": ["ready-model"],
             "history": ["ready-model"],
             "recheck": ["ready-model"],
-            "decompose": ["ready-model"],
             "audit": ["closed-model"],
             "verify": ["ready-model"],
             "report": ["ready-model"],
@@ -421,10 +401,9 @@ class TestSchedulerPriority(unittest.TestCase):
 
     def test_time_window_unavailable_front_work_does_not_block_ready_work(self):
         models = {
-            "recon": ["ready-model"],
+            "threat": ["ready-model"],
             "history": ["ready-model"],
             "recheck": ["ready-model"],
-            "decompose": ["ready-model"],
             "audit": ["closed-model"],
             "verify": ["ready-model"],
             "report": ["ready-model"],
@@ -447,35 +426,6 @@ class TestSchedulerPriority(unittest.TestCase):
             work = p._pop_next_work()
 
             self.assertEqual(work["kind"], "_history_commit")
-
-
-class TestDynamicDecomposeBudget(unittest.TestCase):
-    def test_subtask_limit_scales_with_region_line_count(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            src = os.path.join(tmp, "big.c")
-            with open(src, "w", encoding="utf-8") as f:
-                f.write("int x;\n" * 25000)
-            p = _pipe(tmp, unit_line_budget=1000, max_subtasks_per_region=0)
-
-            limit, lines, files = p._subtask_limit_for_region({"files": ["big.c"]})
-
-            self.assertEqual(lines, 25000)
-            self.assertEqual(files, 1)
-            self.assertEqual(limit, 25)
-
-    def test_subtask_limit_honors_hard_cap(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            src = os.path.join(tmp, "big.c")
-            with open(src, "w", encoding="utf-8") as f:
-                f.write("int x;\n" * 25000)
-            p = _pipe(tmp, unit_line_budget=1000, max_subtasks_per_region=12)
-
-            limit, lines, files = p._subtask_limit_for_region({"files": ["big.c"]})
-
-            self.assertEqual(lines, 25000)
-            self.assertEqual(files, 1)
-            self.assertEqual(limit, 12)
-
 
 class TestFinderResultShape(unittest.TestCase):
     def test_consume_accepts_top_level_finding_array(self):
