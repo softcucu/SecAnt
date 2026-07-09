@@ -176,15 +176,12 @@ class RunManager:
         return self.registry.delete(run_id)
 
     def set_risk_severity(self, run_id: str, rid: str, severity: str) -> bool:
-        """人工调整某条风险点级别。run 在跑 → 走 pipeline(联动入队/出队);否则直接改文件。"""
+        """兼容旧 Web 接口。风险点已改为即时消费,不再支持人工调级。"""
         rec = self.active.get(run_id)
         if rec and not rec["task"].done():
             if rec["pipeline"].adjust_risk_severity(rid, severity):
                 return True
-        store = self.registry.get(run_id)
-        if not store:
-            return False
-        return store.update_risk_severity(rid, severity) is not None
+        return False
 
     def reconfigure(self, run_id: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """运行中动态调整模型/并发。run 在跑 → 走 pipeline(实时改信号量 + 落盘 + SSE);
@@ -355,7 +352,7 @@ def _dashboard_snapshot(store: RunStore, running: bool, last_seq: int,
         "findings": _response_findings(store),
         "candidates": candidates,
         "nonissues": nonissues,
-        "risks": store.load_risks(),
+        "risks": [],
         "coverage": {"ledger": asf.get("ledger") or [], "surfaces": asf.get("surfaces") or [],
                      "regions": regions, "progress": asf.get("progress") or {"done": 0, "clean": 0, "total": 0}},
         "threat_analysis": threat,
@@ -512,7 +509,8 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
 
     @app.get("/api/runs/{run_id}/risks")
     async def risks(run_id: str):
-        return _store_or_404(run_id).load_risks()
+        _store_or_404(run_id)
+        return []
 
     @app.get("/api/runs/{run_id}/usage")
     async def usage(run_id: str, limit: int = _DASHBOARD_USAGE_LIMIT):

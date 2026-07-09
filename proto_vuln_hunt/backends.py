@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import codecs
 import collections
+import functools
+import socket
 import math
 import json
 import os
@@ -15,6 +17,10 @@ import re
 import shutil
 import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .config import Config, normalize_model_concurrency, normalize_models
@@ -837,6 +843,324 @@ class _ProbeOutputTiming:
         return round(output_tokens / total_s, 2)
 
 
+class _OpencodeServeClient:
+    """One long-lived `opencode serve` process for an AgentRunner.
+
+    Each agent call creates a fresh opencode session and submits one prompt to it.
+    The final session messages are converted back into opencode-like JSONL events,
+    so the existing parser and Web output viewer keep working.
+    """
+
+    def __init__(self, runner: "AgentRunner"):
+        self.runner = runner
+        self.proc: Optional[asyncio.subprocess.Process] = None
+        self.host = "127.0.0.1"
+        self.port = 0
+        self.base_url = ""
+        self._lock: Optional[asyncio.Lock] = None
+        self._log_tasks: List[asyncio.Task] = []
+        self._logs: List[str] = []
+
+    def _ensure_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    @staticmethod
+    def _pick_port(host: str) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((host, 0))
+            return int(s.getsockname()[1])
+
+    def _serve_command(self) -> List[str]:
+        port_s = str(self.port)
+        cmd = [
+            tok.replace("{hostname}", self.host).replace("{host}", self.host).replace("{port}", port_s)
+            for tok in (self.runner.spec.command or ["opencode", "serve"])
+        ]
+        if not cmd:
+            cmd = ["opencode", "serve"]
+        has_port = any(tok == "--port" or tok.startswith("--port=") for tok in cmd)
+        has_host = any(tok == "--hostname" or tok.startswith("--hostname=") for tok in cmd)
+        if not has_host:
+            cmd.extend(["--hostname", self.host])
+        if not has_port:
+            cmd.extend(["--port", port_s])
+        return cmd
+
+    async def _drain_server_log(self, stream: Optional[asyncio.StreamReader], name: str) -> None:
+        if stream is None:
+            return
+        while True:
+            chunk = await stream.readline()
+            if not chunk:
+                return
+            text = chunk.decode("utf-8", "replace").rstrip()
+            if not text:
+                continue
+            self._logs.append(f"{name}: {strip_ansi(text)}")
+            if len(self._logs) > 80:
+                del self._logs[:-80]
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: Optional[Dict[str, Any]] = None,
+        body: Any = None,
+        timeout: float = 30.0,
+    ) -> Any:
+        if not self.base_url:
+            raise RuntimeError("opencode serve 尚未启动")
+        url = self.base_url + path
+        if query:
+            qs = urllib.parse.urlencode({k: v for k, v in query.items() if v is not None})
+            if qs:
+                url += "?" + qs
+        data = None
+        headers: Dict[str, str] = {}
+        if body is not None:
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                raw = resp.read()
+                if not raw:
+                    return None
+                text = raw.decode("utf-8", "replace")
+                ctype = resp.headers.get("Content-Type", "")
+                if "json" in ctype:
+                    return json.loads(text) if text.strip() else None
+                return text
+        except urllib.error.HTTPError as e:
+            raw = e.read() or b""
+            detail = raw.decode("utf-8", "replace").strip()
+            raise RuntimeError(f"opencode serve HTTP {e.code}: {detail or e.reason}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"opencode serve 连接失败: {e.reason}") from e
+
+    async def _request_json_async(self, *args: Any, **kwargs: Any) -> Any:
+        loop = asyncio.get_event_loop()
+        fn = functools.partial(self._request_json, *args, **kwargs)
+        return await loop.run_in_executor(None, fn)
+
+    async def ensure_started(self, cwd: str) -> None:
+        async with self._ensure_lock():
+            if self.proc is not None and self.proc.returncode is None:
+                return
+            self.host = "127.0.0.1"
+            self.port = self._pick_port(self.host)
+            self.base_url = f"http://{self.host}:{self.port}"
+            cmd = self._serve_command()
+            env = dict(os.environ)
+            env.update(self.runner.spec.env or {})
+            # This server is private to the runner and bound to localhost; keeping it
+            # unauthenticated avoids needing a secondary token plumbing path.
+            env.pop("OPENCODE_SERVER_PASSWORD", None)
+            self.proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+                env=env,
+                limit=1024 * 1024,
+            )
+            self._log_tasks = [
+                asyncio.create_task(self._drain_server_log(self.proc.stdout, "stdout")),
+                asyncio.create_task(self._drain_server_log(self.proc.stderr, "stderr")),
+            ]
+            try:
+                await self._wait_ready()
+            except Exception:
+                await self.close()
+                raise
+            self.runner.log(f"opencode serve 已启动: {self.base_url}")
+
+    async def _wait_ready(self) -> None:
+        deadline = time.monotonic() + 45.0
+        last_err = ""
+        while time.monotonic() < deadline:
+            proc = self.proc
+            if proc is not None and proc.returncode is not None:
+                logs = "\n".join(self._logs[-20:])
+                raise RuntimeError(f"opencode serve 启动失败(exit={proc.returncode}): {logs}")
+            try:
+                await self._request_json_async("GET", "/global/health", timeout=2.0)
+                return
+            except Exception as e:  # noqa: BLE001
+                last_err = str(e)
+            await asyncio.sleep(0.2)
+        logs = "\n".join(self._logs[-20:])
+        raise RuntimeError(f"opencode serve 启动超时: {last_err}; logs={logs}")
+
+    @staticmethod
+    def _model_ref(model: str) -> Dict[str, str]:
+        provider, sep, model_id = (model or "").partition("/")
+        if not sep or not provider or not model_id:
+            raise RuntimeError(f"opencode serve 模式要求模型名为 provider/model,实际为: {model!r}")
+        return {"providerID": provider, "modelID": model_id}
+
+    def _agent_name(self) -> str:
+        return str((self.runner.spec.env or {}).get("OPENCODE_AGENT") or os.environ.get("OPENCODE_AGENT") or "build")
+
+    async def _create_session(self, cwd: str, label: str) -> str:
+        title = (label or "pvh agent")[:120]
+        obj = await self._request_json_async(
+            "POST",
+            "/session",
+            query={"directory": cwd},
+            body={"title": title},
+        )
+        if not isinstance(obj, dict) or not obj.get("id"):
+            raise RuntimeError(f"opencode serve 创建 session 失败: {obj!r}")
+        return str(obj["id"])
+
+    async def _send_prompt(self, session_id: str, cwd: str, prompt: str, model: str) -> str:
+        message_id = "msg_pvh_" + uuid.uuid4().hex
+        part_id = "prt_pvh_" + uuid.uuid4().hex
+        body = {
+            "messageID": message_id,
+            "model": self._model_ref(model),
+            "agent": self._agent_name(),
+            "parts": [{"id": part_id, "type": "text", "text": prompt}],
+        }
+        await self._request_json_async(
+            "POST",
+            f"/session/{urllib.parse.quote(session_id, safe='')}/prompt_async",
+            query={"directory": cwd},
+            body=body,
+        )
+        return message_id
+
+    async def _abort(self, session_id: str, cwd: str) -> None:
+        try:
+            await self._request_json_async(
+                "POST",
+                f"/session/{urllib.parse.quote(session_id, safe='')}/abort",
+                query={"directory": cwd},
+                timeout=5.0,
+            )
+        except Exception:
+            pass
+
+    async def _session_status(self, cwd: str) -> Dict[str, Any]:
+        obj = await self._request_json_async("GET", "/session/status", query={"directory": cwd}, timeout=5.0)
+        return obj if isinstance(obj, dict) else {}
+
+    async def _wait_idle(self, session_id: str, cwd: str, timeout_s: float) -> None:
+        deadline = time.monotonic() + max(1.0, timeout_s)
+        grace_until = time.monotonic() + 1.0
+        seen_active = False
+        while True:
+            if time.monotonic() >= deadline:
+                await self._abort(session_id, cwd)
+                raise RuntimeError(f"timed out after {int(timeout_s)}s")
+            status = await self._session_status(cwd)
+            rec = status.get(session_id) if isinstance(status, dict) else None
+            typ = str(rec.get("type") or "") if isinstance(rec, dict) else ""
+            if rec and typ not in ("", "idle"):
+                seen_active = True
+            if (not rec or typ in ("", "idle")) and (seen_active or time.monotonic() >= grace_until):
+                return
+            await asyncio.sleep(0.5)
+
+    async def _messages(self, session_id: str, cwd: str) -> List[Dict[str, Any]]:
+        obj = await self._request_json_async(
+            "GET",
+            f"/session/{urllib.parse.quote(session_id, safe='')}/message",
+            query={"directory": cwd},
+        )
+        return obj if isinstance(obj, list) else []
+
+    async def _session(self, session_id: str, cwd: str) -> Dict[str, Any]:
+        obj = await self._request_json_async(
+            "GET",
+            f"/session/{urllib.parse.quote(session_id, safe='')}",
+            query={"directory": cwd},
+        )
+        return obj if isinstance(obj, dict) else {}
+
+    @staticmethod
+    def _messages_jsonl(session_id: str, messages: List[Dict[str, Any]], session: Dict[str, Any]) -> str:
+        events: List[Dict[str, Any]] = []
+        if session:
+            events.append({"type": "session.updated", "sessionID": session_id, **session})
+        for item in messages:
+            if not isinstance(item, dict):
+                continue
+            info = item.get("info") if isinstance(item.get("info"), dict) else item.get("message")
+            if isinstance(info, dict):
+                events.append({"type": "message.updated", "sessionID": session_id, "message": info})
+            parts = item.get("parts") if isinstance(item.get("parts"), list) else []
+            for part in parts:
+                if isinstance(part, dict):
+                    events.append({"type": "message.part.updated", "sessionID": session_id, "part": part})
+        return "\n".join(json.dumps(ev, ensure_ascii=False) for ev in events if ev) + ("\n" if events else "")
+
+    async def invoke(
+        self,
+        prompt: str,
+        model: str,
+        cwd: str,
+        timeout_s: float,
+        on_output: Optional[Callable[[str, str], None]] = None,
+        label: str = "",
+    ) -> Tuple[str, Optional[Dict[str, int]]]:
+        await self.ensure_started(cwd)
+        session_id = await self._create_session(cwd, label)
+        try:
+            await self._send_prompt(session_id, cwd, prompt, model)
+            await self._wait_idle(session_id, cwd, timeout_s)
+            messages = await self._messages(session_id, cwd)
+            session = await self._session(session_id, cwd)
+        except asyncio.CancelledError:
+            await self._abort(session_id, cwd)
+            raise
+        jsonl = self._messages_jsonl(session_id, messages, session)
+        if on_output and jsonl:
+            try:
+                on_output("stdout", jsonl)
+            except Exception:
+                pass
+        oc = _extract_opencode_text(jsonl)
+        usage = _extract_usage(session)
+        if oc is not None:
+            text, oc_usage, _sid = oc
+            usage = oc_usage or usage
+            if text.strip():
+                return strip_ansi(text), usage
+        logs = "\n".join(self._logs[-20:])
+        raise BackendOutputError(
+            "opencode serve session 未产生最终 assistant 文本",
+            strip_ansi((jsonl or "") + ("\n# opencode serve logs\n" + logs if logs else "")),
+        )
+
+    async def close(self) -> None:
+        proc = self.proc
+        self.proc = None
+        if proc is None:
+            return
+        try:
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+        finally:
+            for task in self._log_tasks:
+                if not task.done():
+                    task.cancel()
+            if self._log_tasks:
+                await asyncio.gather(*self._log_tasks, return_exceptions=True)
+            self._log_tasks = []
+
+
 class DynamicSemaphore:
     """容量可在运行中调整的 asyncio 信号量(用于动态增减并发)。
 
@@ -948,6 +1272,13 @@ class AgentRunner:
         self._capacity_wait_s = 0.05
         self._live_prompt_files: set = set()  # 正在被子进程使用的 prompt 文件,滚动清理时必须保护
         self._artifact_seq = 0  # 临时产物单调序号:写进文件名,让滚动清理按"创建序"确定性排序(mtime 同刻度也不抖)
+        self._opencode_serve: Optional[_OpencodeServeClient] = None
+
+    async def aclose(self) -> None:
+        """释放 AgentRunner 持有的长驻后端资源。"""
+        if self._opencode_serve is not None:
+            await self._opencode_serve.close()
+            self._opencode_serve = None
 
     def _prune_recent(self, directory: str, primary_suffix: str, keep: int,
                       sidecar_suffixes: Tuple[str, ...] = (), protect: Optional[set] = None) -> None:
@@ -1322,7 +1653,25 @@ class AgentRunner:
     async def _invoke(self, prompt: str, model: str, cwd: str,
                       timeout_s: Optional[float] = None,
                       direct_prompt: bool = False,
-                      on_output: Optional[Callable[[str, str], None]] = None) -> Tuple[str, Optional[Dict[str, int]]]:
+                      on_output: Optional[Callable[[str, str], None]] = None,
+                      label: str = "") -> Tuple[str, Optional[Dict[str, int]]]:
+        if self.cfg.backend == "opencode" and self.spec.prompt_mode == "serve":
+            if timeout_s is None:
+                timeout_s = max(1, self.cfg.retry.timeout_ms / 1000.0)
+            if self._opencode_serve is None:
+                self._opencode_serve = _OpencodeServeClient(self)
+            try:
+                return await self._opencode_serve.invoke(
+                    prompt,
+                    model,
+                    cwd,
+                    timeout_s,
+                    on_output=on_output,
+                    label=label or model,
+                )
+            finally:
+                self._reap_opencode_artifacts()
+
         prompt_file = ""
         uses_prompt = any("{prompt}" in tok for tok in self.spec.command)
         uses_prompt_file = self.spec.prompt_mode == "file" or any(
@@ -1523,6 +1872,7 @@ class AgentRunner:
                         timeout_s=timeout_s,
                         direct_prompt=(self.cfg.backend == "opencode"),
                         on_output=timing.observe,
+                        label="health",
                     )
                     finished = time.monotonic()
                     latency = int((finished - t0) * 1000)
@@ -1723,7 +2073,7 @@ class AgentRunner:
                 emit_agent("output", model=model, attempt=attempt_no, stream=stream, chunk=chunk)
 
             try:
-                text, usage = await self._invoke(prompt, model, run_cwd, on_output=on_output)
+                text, usage = await self._invoke(prompt, model, run_cwd, on_output=on_output, label=tag)
                 self._record_usage(prompt, text, role=role, label=tag, model=model,
                                    attempt=attempt_no, backend_usage=usage)
                 self._note_call(model, True)

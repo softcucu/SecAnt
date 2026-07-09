@@ -36,7 +36,7 @@ pip install -r requirements.txt          # CLI(run)仅需 PyYAML;Web 控制台(s
 | 后端 | 非交互调用 | 模型名格式 |
 |---|---|---|
 | `claude`   | `claude -p --output-format json ...`(提示词走 stdin) | `claude-opus-4-8` / `claude-sonnet-4-6` |
-| `opencode` | `opencode run --format json --model provider/model <prompt>` | `anthropic/claude-sonnet-4-6`、`openai/gpt-5` |
+| `opencode` | `opencode serve`(长驻 server;每个 agent 新建 session) | `anthropic/claude-sonnet-4-6`、`openai/gpt-5` |
 | `codex`    | `codex exec --model <m> <prompt>`                     | `gpt-5-codex` / `o3` |
 
 > claude/codex 默认以"绕过审批/全自动"模式运行(`--dangerously-skip-permissions` /
@@ -127,11 +127,11 @@ methods_dir: proto_vuln_hunt/methods  # 默认即项目自带方法库,无需配
 backends:                             # (可选)自定义任意 CLI 的调用方式
   claude:
     command: ["claude","-p","--output-format","json","--model","{model}","--dangerously-skip-permissions"]
-    prompt_mode: stdin                # stdin | arg | file
+    prompt_mode: stdin                # stdin | arg | file | serve(opencode)
     parse: claude_json                # claude_json | text
   opencode:
-    command: ["opencode","run","--format","json","--model","{model}","{prompt}"]
-    prompt_mode: arg
+    command: ["opencode","serve","--hostname","{hostname}","--port","{port}"]
+    prompt_mode: serve
     parse: text
 ```
 
@@ -143,10 +143,9 @@ backends:                             # (可选)自定义任意 CLI 的调用方
 
 **自定义后端**:`command` 是 token 列表,运行时把 `{model}` 替换为当前角色模型、`{prompt}` 替换为提示词
 (仅 `prompt_mode: arg` 时需要)、`{prompt_file}` 替换为提示词临时文件路径(仅 `prompt_mode: file` 时需要);
-`stdin` 模式则把提示词从标准输入喂入。`parse` 决定如何从 stdout 取回 agent 文本(`claude_json` 取 JSON
-的 `.result`,`text` 直接用 stdout)。opencode 默认把提示词作为 `run` 的单个 positional message argv 传入,
-不经过 shell,因此换行/空格会原样保留;不要在自定义 opencode command 里用 `bash -c "...{prompt}..."` 之类的
-shell 插值方式,否则换行会被 shell 当作命令分隔。
+`stdin` 模式则把提示词从标准输入喂入。`prompt_mode: serve` 为 opencode 专用,会启动一个长驻
+`opencode serve` 并为每个 agent 创建新 session。`parse` 决定如何从 stdout 取回 agent 文本
+(`claude_json` 取 JSON 的 `.result`,`text` 直接用 stdout)。
 
 ---
 
@@ -165,15 +164,14 @@ shell 插值方式,否则换行会被 shell 当作命令分隔。
 │   └── warnings.json    # 规范化告警
 ├── attack-surface.json  # 攻击面(初始+动态)+ 覆盖台账 + progress,每轮整体快照(状态持续演变)
 ├── findings/<id>.json   # 每条确认漏洞一个文件(确认即写;含全文/votes/poc,人工反馈可追加更新)
-├── risks/<id>.json      # 每条风险一个文件(登记即写、写一次即终态)
 ├── events.jsonl         # append-only 事件日志(SSE 重放 / 服务重启回看)
 └── exports/             # 按需渲染的 MD/SARIF(Web「导出全部」或 CLI --export 时生成)
 ```
 
-**拆分判据**:会演变的(攻击树/覆盖)用单文件快照;漏洞/风险用多文件、各自独立寻址、确认即流式落盘;运行机制态单独放 `checkpoint.json`,这样高频刷新不再带着漏洞全文反复重写。
+**拆分判据**:会演变的(攻击树/覆盖)用单文件快照;漏洞用多文件、各自独立寻址、确认即流式落盘;运行机制态单独放 `checkpoint.json`,这样高频刷新不再带着漏洞全文反复重写。即时风险种子只进入 recheck 队列当场消费,不再单独存档。
 
 **导出**(从结构化态按需渲染):`THREAT-ANALYSIS.md` / `ATTACK-SURFACE.md`(含覆盖台账)/
-`RISKS.md` / `findings/<CLASS>-NNN.md`(frontmatter + 7 段式)/ `INDEX.md` / `REPORT.sarif`(2.1.0)。
+`findings/<CLASS>-NNN.md`(frontmatter + 7 段式)/ `INDEX.md` / `REPORT.sarif`(2.1.0)。
 Web 端可逐条下载或一键导出全部;CLI `run` 默认导出到 out_dir(`--no-export` 关闭)。
 
 REST/SSE 接口(`serve` 时):`/api/runs`(GET/POST)、`/api/runs/{id}`、`/stop`、`/resume`、

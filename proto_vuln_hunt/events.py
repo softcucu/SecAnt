@@ -25,7 +25,7 @@ FINDING_REJECTED = "finding_rejected"    # {candidate fields..., votes, rejectio
 CANDIDATE_FAILED = "candidate_failed"    # {key, title, reason, attempts}
 CANDIDATE_DECIDED = "candidate_decided"  # {candidate fields..., status=suppressed_unproven|needs_manual_review, votes}
 SURFACE_ADDED = "surface_added"    # {name, why, files, lens_hint, round, from}
-RISK_ADDED = "risk_added"          # {area, note, file, severity_hint, lens, round}
+RISK_ADDED = "risk_added"          # 旧事件名;即时风险种子不再作为独立风险登记发送
 RECHECK_ENQUEUED = "recheck_enqueued"  # {kind: variant|risk, id?, pattern?, area?, severity_hint?, lens_hint?}
 RECHECK_DONE = "recheck_done"      # {kind, id?, label, new_candidates}
 RISK_SEVERITY_CHANGED = "risk_severity_changed"  # {id, severity_hint, old, action: enqueued|dequeued|none}

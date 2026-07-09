@@ -1,6 +1,6 @@
 """从结构化 run 态按需渲染 Markdown / SARIF(不在 run 过程中写盘)。
 
-输入是 RunStore.load_full_state() 聚合出的 state(其 threatAnalysis / history / auditLedger / surfaceLog / riskNotes / confirmed)
+输入是 RunStore.load_full_state() 聚合出的 state(其 threatAnalysis / history / auditLedger / surfaceLog / confirmed)
 加一个 meta(target / scope / threat_model / methods / backend)。供 Web 导出端点与 CLI `--export` 复用。
 """
 from __future__ import annotations
@@ -106,7 +106,7 @@ def render_attack_surface_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str
     ord_map = {"completed-findings": 0, "in-progress": 1, "completed-clean": 2, "pending": 3}
     led = sorted(ledger, key=lambda r: ord_map.get(r.get("status"), 9))
     if led:
-        rows = ["| 状态 | 工作项 | 类型 | 审计轮数(passes) | 覆盖 lens | 候选数 | 新攻击面 | 风险登记 | 末轮 |",
+        rows = ["| 状态 | 工作项 | 类型 | 审计轮数(passes) | 覆盖 lens | 候选数 | 新攻击面 | 即时复查种子 | 末轮 |",
                 "|---|---|---|---|---|---|---|---|---|"]
         for r in led:
             rows.append(f"| {LEDGER_STATUS.get(r.get('status'), r.get('status'))} | {r.get('name') or ''} | {r.get('kind') or ''} | "
@@ -126,28 +126,6 @@ def render_attack_surface_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str
         f"## B. 审计中动态新增的攻击面\n{dyn_table}\n\n"
         f"## C. 审计覆盖台账(每个工作项的结果,含\"审过但未发现漏洞\")\n{led_table}\n\n"
         "---\n*由 proto-vuln-hunt(python) 从结构化态导出。*\n"
-    )
-
-
-# ──────────────────────── RISKS.md ────────────────────────
-def render_risks_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
-    sn = _scope_note(meta)
-    rows_data = sorted(state.get("riskNotes") or [], key=lambda r: SEV_RANK.get(r.get("severity_hint"), 9))
-    if rows_data:
-        rows = ["| 风险高低 | 主题 | 位置 | 说明 | lens | 轮次 | 排查 |", "|---|---|---|---|---|---|---|"]
-        _rc_label = {"none": "—", "queued": "排队中", "running": "排查中", "done": "已排查", "failed": "排查失败"}
-        for r in rows_data:
-            rc = _rc_label.get(r.get("recheck_status") or "none", r.get("recheck_status") or "—")
-            rows.append(f"| {r.get('severity_hint') or 'info'} | {r.get('area') or ''} | {r.get('file') or '—'} | "
-                        f"{_nl(r.get('note'))} | {r.get('lens') or ''} | r{r.get('round') or '?'} | {rc} |")
-        table = "\n".join(rows)
-    else:
-        table = "(本次审计未登记潜在风险)"
-    return (
-        f"# 潜在安全风险登记 — {meta.get('target')}{sn}\n\n"
-        "> 这些是审计中发现、**可疑但未确认为漏洞**的隐患/可加固点(未经对抗验证确认)。\n"
-        f"**威胁模型**: {meta.get('threat_model')}　|　共 {len(rows_data)} 条\n\n"
-        f"{table}\n\n---\n*由 proto-vuln-hunt(python) 从结构化态导出。*\n"
     )
 
 
@@ -352,7 +330,6 @@ def export_all(out_dir: str, state: Dict[str, Any], meta: Dict[str, Any]) -> Dic
 
     w("THREAT-ANALYSIS.md", render_threat_analysis_md(state, meta))
     w("ATTACK-SURFACE.md", render_attack_surface_md(state, meta))
-    w("RISKS.md", render_risks_md(state, meta))
     w("INDEX.md", render_index_md(state, meta))
     w("REPORT.sarif", json.dumps(build_sarif(state, meta), ensure_ascii=False, indent=2))
     for finding in finalize_findings(state.get("confirmed") or []):

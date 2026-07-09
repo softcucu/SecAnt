@@ -3,9 +3,9 @@
 
 结构化为主:运行期**只写结构化态**(经 RunStore 按关注点分文件落盘:checkpoint.json /
 history.json / threat-analysis/graph.json /
-attack-surface.json / findings/<id>.json / risks/<id>.json / usage.jsonl)并发结构化事件(经 EventBus → SSE + events.jsonl);
-不再在运行期写 THREAT-ANALYSIS/ATTACK-SURFACE/RISKS/findings/INDEX/SARIF 这些 Markdown——它们改由 exporters.py
-从结构化态**按需渲染**(Web 导出端点 / CLI `--export`)。漏洞/风险确认即各写一个文件(流式落盘)。
+attack-surface.json / findings/<id>.json / usage.jsonl)并发结构化事件(经 EventBus → SSE + events.jsonl);
+不再在运行期写 THREAT-ANALYSIS/ATTACK-SURFACE/findings/INDEX/SARIF 这些 Markdown——它们改由 exporters.py
+从结构化态**按需渲染**(Web 导出端点 / CLI `--export`)。漏洞确认即各写一个文件(流式落盘)。
 """
 from __future__ import annotations
 
@@ -59,9 +59,8 @@ class Pipeline:
         self.history_keys = set()                    # 历史模式去重(按 pattern 文本)
         self.history_done = set()                    # 已分析过的 git 提交 hash(续跑跳过)
         self._history_task: Optional[asyncio.Task] = None
-        # ── 专用优先排查通道(历史变体 + 风险点复查) ──
+        # ── 专用优先排查通道(历史变体 + 即时风险种子复查) ──
         self.pq: List[Dict[str, Any]] = []           # 优先排查队列(kind ∈ {variant, risk};variant 优先)
-        self.risk_by_id: Dict[str, Dict[str, Any]] = {}  # rid -> 风险记录(便于人工调级时联动入队/出队)
         self._recheck_inflight = 0                   # 正在排查 + 已 pop 待起的项数(收敛判据)
         self._restored_checkpoint = False
         self.build_hint: str = ""
@@ -83,8 +82,8 @@ class Pipeline:
         self._active_roles: Dict[str, int] = {}
         self._scheduler_wake: Optional[asyncio.Event] = None
         self.surface_log: List[Dict[str, Any]] = []
-        self.risk_notes: List[Dict[str, Any]] = []
-        self.risk_keys = set()
+        self.risk_notes: List[Dict[str, Any]] = []   # 兼容旧测试 / 旧状态;新流程不再持久化风险登记
+        self.risk_keys = set()                       # 本轮即时风险种子去重
         self.ledger_arr: List[Dict[str, Any]] = []
         self.ledger_map: Dict[str, Dict[str, Any]] = {}
         self.risk_seq = 0
@@ -246,7 +245,7 @@ class Pipeline:
         r = self.ledger_map.get(k)
         if not r:
             r = {"key": k, "kind": item.get("kind"),
-                 "name": item.get("name") or item.get("objective") or item.get("pattern") or "",
+                 "name": item.get("name") or item.get("objective") or item.get("pattern") or item.get("area") or "",
                  "region": item.get("region") or (item.get("name") if item.get("kind") == "region" else ""),
                  "category": item.get("category") or "", "priority": item.get("priority") or "",
                  "source": item.get("source") or "",
@@ -254,6 +253,15 @@ class Pipeline:
                  "lastRound": 0, "status": "pending"}
             self.ledger_map[k] = r
             self.ledger_arr.append(r)
+        if item.get("kind") == "risk":
+            r["name"] = item.get("area") or r.get("name") or ""
+            r["risk_area"] = item.get("area") or r.get("risk_area") or ""
+            r["risk_note"] = item.get("note") or r.get("risk_note") or ""
+            r["file"] = item.get("file") or r.get("file") or ""
+            r["severity_hint"] = item.get("severity_hint") or r.get("severity_hint") or "info"
+            r["callee"] = item.get("callee") or r.get("callee") or ""
+            r["required_validation"] = item.get("required_validation") or r.get("required_validation") or ""
+            r["good_validation_ref"] = item.get("good_validation_ref") or r.get("good_validation_ref") or ""
         return r
 
     # ──────────────────────── 断点(按关注点分文件)────────────────────────
@@ -264,6 +272,7 @@ class Pipeline:
             "round": rnd, "seq": self.seq, "risk_seq": self.risk_seq,
             "processedKeys": list(self.processed_keys),
             "seenSurface": list(self.seen_surface),
+            "riskKeys": list(self.risk_keys),
             "completedItems": list(self.completed_items),
             "historyDone": list(self.history_done),
             "pendingQueue": self._checkpoint_queue(),
@@ -291,7 +300,7 @@ class Pipeline:
             "rounds": rnd, "confirmed": confirmed_real, "finding_entries": len(self.confirmed),
             "candidates": len(self.dedup_keys),
             "quality_issues": quality_issues,
-            "by_severity": by_sev, "risks": len(self.risk_notes), "surfaces": len(self.surface_log),
+            "by_severity": by_sev, "risks": 0, "surfaces": len(self.surface_log),
             "agents_spawned": self.runner.agent_count, "elapsed_s": round(time.time() - self._started, 1),
             "token_usage": dict(self.runner.usage_totals),
             "pending_findings": self._active_pending_candidate_count(),
@@ -313,10 +322,6 @@ class Pipeline:
 
     def _failed_recheck_keys(self) -> set:
         keys = set()
-        for r in self.risk_notes:
-            rid = r.get("id")
-            if rid and r.get("recheck_status") == "failed":
-                keys.add(f"risk:{rid}")
         for rec in self.ledger_arr:
             if rec.get("status") == "abandoned" and rec.get("kind") in ("risk", "variant"):
                 k = rec.get("key")
@@ -347,7 +352,7 @@ class Pipeline:
             self.log(f"⚠ history 写入失败(忽略继续): {str(e)[:120]}")
 
     def checkpoint(self, rnd: int) -> None:
-        """每个检查点:刷机制态 + 攻击面/覆盖快照 + 汇总(漏洞/风险已各自即时落盘)。"""
+        """每个检查点:刷机制态 + 攻击面/覆盖快照 + 汇总(漏洞已即时落盘)。"""
         try:
             self.store.save_checkpoint(self.build_checkpoint(rnd))
             self.store.save_attack_surface(self.build_attack_surface(rnd))
@@ -522,75 +527,50 @@ class Pipeline:
                 return self.queue.pop(idx)
         return None
 
-    # 风险点 severity_hint 排序(用于判断是否够格自动入排查队列)
-    _RISK_SEV_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
-
-    def _risk_sev_ok(self, sev: Optional[str]) -> bool:
-        """severity_hint 是否达到自动入排查队列的阈值(cfg.recheck.risk_min_severity)。"""
-        th = self.cfg.recheck.risk_min_severity
-        return self._RISK_SEV_ORDER.get(sev or "info", 0) >= self._RISK_SEV_ORDER.get(th, 2)
-
     def _enqueue_risk(self, note: Dict[str, Any]) -> None:
-        """把一条风险点放进优先排查队列(置 recheck_status=queued)。调用方负责落盘。"""
-        note["recheck_status"] = "queued"
+        """把一条即时风险种子放进优先排查队列;不登记、不落盘。"""
         self.pq.append({"kind": "risk", "id": note["id"], "area": note.get("area"),
                         "note": note.get("note"), "file": note.get("file"),
-                        "severity_hint": note.get("severity_hint"), "lens": note.get("lens")})
+                        "severity_hint": note.get("severity_hint"), "lens": note.get("lens"),
+                        "callee": note.get("callee"), "required_validation": note.get("required_validation"),
+                        "good_validation_ref": note.get("good_validation_ref"),
+                        "round": note.get("round")})
         self._notify_scheduler()
         self.emit(EV.RECHECK_ENQUEUED, {"kind": "risk", "id": note["id"], "area": note.get("area"),
                                         "severity_hint": note.get("severity_hint")})
 
     def record_risk(self, n: Dict[str, Any], lens: str, rnd: int, from_recheck: bool = False) -> bool:
+        """消费 finder 的 risk_notes:直接派发一次性 recheck agent。
+
+        risk_notes 不再代表“潜在风险登记”,也不写 risks/<id>.json / RISKS.md。
+        复查 agent 自身产出的 risk_notes 不再回灌,避免自激循环。
+        """
+        if from_recheck or not self.cfg.recheck.enabled:
+            return False
         area = (n.get("area") or "").strip()
         if not area:
             return False
-        key = f"{area.lower()}::{(n.get('file') or '').strip()}"
+        key = "::".join([
+            area.lower(),
+            (n.get("file") or "").strip(),
+            (n.get("callee") or "").strip(),
+            (n.get("required_validation") or "").strip().lower(),
+        ])
         if key in self.risk_keys:
             return False
         self.risk_keys.add(key)
         self.risk_seq += 1
         note = {"id": f"RISK-{pad3(self.risk_seq)}", "area": area, "note": n.get("note") or "",
                 "file": n.get("file") or "", "severity_hint": n.get("severity_hint") or "info",
-                "lens": lens, "round": rnd, "recheck_status": "none"}
-        self.risk_notes.append(note)
-        self.risk_by_id[note["id"]] = note
-        # 达阈值且非复查自身产出的风险点 → 自动进专用优先排查队列(防自激:复查产出的不再回灌)。
-        enq = self.cfg.recheck.enabled and not from_recheck and self._risk_sev_ok(note["severity_hint"])
-        if enq:
-            note["recheck_status"] = "queued"
-        self.store.save_risk(note)            # 写一次即落盘:risks/<id>.json
-        self.emit(EV.RISK_ADDED, note)
-        if enq:
-            self.pq.append({"kind": "risk", "id": note["id"], "area": note.get("area"),
-                            "note": note.get("note"), "file": note.get("file"),
-                            "severity_hint": note.get("severity_hint"), "lens": note.get("lens")})
-            self._notify_scheduler()
-            self.emit(EV.RECHECK_ENQUEUED, {"kind": "risk", "id": note["id"], "area": note.get("area"),
-                                            "severity_hint": note.get("severity_hint")})
+                "lens": lens, "round": rnd,
+                "callee": n.get("callee") or "", "required_validation": n.get("required_validation") or "",
+                "good_validation_ref": n.get("good_validation_ref") or ""}
+        self._enqueue_risk(note)
         return True
 
     def adjust_risk_severity(self, rid: str, sev: str) -> bool:
-        """人工调整某条风险点的级别,并联动入队 / 出队(供 Web 接口在运行中调用)。
-        升到 ≥ 阈值且尚未排查过 → 入排查队列;降到 < 阈值且仍排队未跑 → 出队。"""
-        note = self.risk_by_id.get(rid)
-        if not note:
-            return False
-        old = note.get("severity_hint")
-        note["severity_hint"] = sev
-        status = note.get("recheck_status") or "none"
-        action = "none"
-        if self._risk_sev_ok(sev):
-            if status == "none":
-                self._enqueue_risk(note)
-                action = "enqueued"
-        else:
-            if status == "queued":
-                self.pq = [it for it in self.pq if not (it.get("kind") == "risk" and it.get("id") == rid)]
-                note["recheck_status"] = "none"
-                action = "dequeued"
-        self.store.save_risk(note)
-        self.emit(EV.RISK_SEVERITY_CHANGED, {"id": rid, "severity_hint": sev, "old": old, "action": action})
-        return True
+        """兼容旧 Web 接口。风险点已改为即时消费,不存在可调级的存档记录。"""
+        return False
 
     # ──────────────────────── 运行中动态调参 ────────────────────────
     def reconfigure(self, patch: Dict[str, Any]) -> Dict[str, Any]:
@@ -1532,6 +1512,7 @@ class Pipeline:
                 self.dedup_keys.add(k)
                 self.processed_keys.add(k)
             self.seen_surface.update(ckpt.get("seenSurface") or [])
+            self.risk_keys.update(ckpt.get("riskKeys") or [])
             self.completed_items.update(ckpt.get("completedItems") or [])
             self.queue = ckpt.get("pendingQueue") or []
             self.pq = ckpt.get("pendingPriorityQueue") or []
@@ -1540,19 +1521,6 @@ class Pipeline:
             self.ledger_arr = asf.get("ledger") or []
             for r in self.ledger_arr:
                 self.ledger_map[r["key"]] = r
-            self.risk_notes = self.store.load_risks()              # 扫 risks/<id>.json 恢复
-            pq_risk_ids = {it.get("id") for it in self.pq if it.get("kind") == "risk"}
-            for r in self.risk_notes:
-                self.risk_keys.add(f"{(r.get('area') or '').strip().lower()}::{(r.get('file') or '').strip()}")
-                rid = r.get("id")
-                if rid:
-                    self.risk_by_id[rid] = r
-                # 中断时正在排查 / 排队 / 上次失败但未落进 pq 的风险点 → 重新入队补排
-                st = r.get("recheck_status")
-                if rid and st in ("queued", "running", "failed") and rid not in pq_risk_ids and self._risk_sev_ok(r.get("severity_hint")):
-                    self.completed_items.discard(f"risk:{rid}")
-                    self._enqueue_risk(r)
-                    self.store.save_risk(r)
             for f in (ckpt.get("pendingFindings") or []):
                 fk = finding_key(f)
                 self.pending_findings[fk] = f
@@ -1787,9 +1755,9 @@ class Pipeline:
             rec["status"] = "completed-findings" if rec.get("candidates", 0) > 0 else "completed-clean"
         dry_streak = 0 if (new_findings or new_surfaces) else 1
         self.log(f"轮 {self.round}: 本项新候选 {new_findings}, 新攻击面 {new_surfaces}, 队列剩 {len(self.queue)}, "
-                 f"风险登记 {len(self.risk_notes)}")
+                 f"优先复查队列 {len(self.pq)}")
         self.emit(EV.ROUND_DONE, {"round": self.round, "new_findings": new_findings, "new_surfaces": new_surfaces,
-                                  "queue_len": len(self.queue), "dry_streak": dry_streak, "risks": len(self.risk_notes)})
+                                  "queue_len": len(self.queue), "dry_streak": dry_streak, "risks": 0})
         self.emit(EV.METRICS, self._summary_snapshot(self.round))
         self.checkpoint(self.round)
         self.emit_coverage()
@@ -1966,7 +1934,7 @@ class Pipeline:
         quality_issues = sum(1 for c in self.confirmed if is_quality_issue_finding(c))
         confirmed_real = max(0, len(self.confirmed) - quality_issues)
         self.log(f"流水线排空完成:确认 {confirmed_real} 条漏洞,质量问题 {quality_issues} 条,候选去重池 {len(self.dedup_keys)} 条,"
-                 f"潜在风险 {len(self.risk_notes)} 条,动态攻击面 {len(self.surface_log)} 个。")
+                 f"动态攻击面 {len(self.surface_log)} 个。")
         return stop_reason
 
     async def _run_finder(self, item: Dict[str, Any], lens_key: str, idx: int, rec: Dict[str, Any]) -> None:
@@ -2011,7 +1979,7 @@ class Pipeline:
 
     def _consume(self, res: Any, item: Dict[str, Any], rec: Dict[str, Any],
                  lens_key: str, from_recheck: bool = False, audit_model: Optional[str] = None) -> None:
-        """消化一次审计 / 复查 agent 的结果:findings→验证流水线、new_surfaces→主队列、risk_notes→登记。
+        """消化一次审计 / 复查 agent 的结果:findings→验证流水线、new_surfaces→主队列、risk_notes→即时复查。
         from_recheck=True 时,产出的 risk_notes 不再二次回灌优先队列(防自激)。
         audit_model:产出该批 finding 的模型,归因到候选(随候选流转到验证/确认/报告)。"""
         res = self._finder_result(res)
@@ -2092,25 +2060,28 @@ class Pipeline:
             "lens_hint": (hist or {}).get("lens_hint") or (rec.get("lenses") or ["memory"])[0],
         }
 
+    def _risk_item_for_ledger(self, rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        rid = str(rec.get("key") or "").replace("risk:", "", 1).strip() or str(rec.get("id") or "").strip()
+        area = (rec.get("risk_area") or rec.get("name") or "").strip()
+        if not rid or not area:
+            return None
+        return {
+            "kind": "risk", "id": rid, "area": area,
+            "note": rec.get("risk_note") or "", "file": rec.get("file") or "",
+            "severity_hint": rec.get("severity_hint") or "info",
+            "lens": (rec.get("lenses") or ["memory"])[0],
+            "callee": rec.get("callee") or "",
+            "required_validation": rec.get("required_validation") or "",
+            "good_validation_ref": rec.get("good_validation_ref") or "",
+        }
+
     def _enqueue_failed_rechecks(self) -> int:
         enqueued = 0
         pq_keys = {item_key(it) for it in self.pq}
-        for r in self.risk_notes:
-            rid = r.get("id")
-            if not rid or r.get("recheck_status") != "failed" or not self._risk_sev_ok(r.get("severity_hint")):
-                continue
-            key = f"risk:{rid}"
-            if key in pq_keys:
-                continue
-            self.completed_items.discard(key)
-            self._enqueue_risk(r)
-            self.store.save_risk(r)
-            pq_keys.add(key)
-            enqueued += 1
         for rec in self.ledger_arr:
-            if rec.get("kind") != "variant" or rec.get("status") != "abandoned":
+            if rec.get("kind") not in ("risk", "variant") or rec.get("status") != "abandoned":
                 continue
-            item = self._variant_item_for_ledger(rec)
+            item = self._variant_item_for_ledger(rec) if rec.get("kind") == "variant" else self._risk_item_for_ledger(rec)
             if not item:
                 continue
             key = item_key(item)
@@ -2118,7 +2089,10 @@ class Pipeline:
                 continue
             self.completed_items.discard(key)
             rec["status"] = "pending"
-            self._enqueue_variant(item)
+            if item.get("kind") == "risk":
+                self._enqueue_risk(item)
+            else:
+                self._enqueue_variant(item)
             pq_keys.add(key)
             enqueued += 1
         return enqueued
@@ -2162,9 +2136,6 @@ class Pipeline:
         """
         if self.stop_requested():
             rec["status"] = "incomplete"
-            if kind == "risk" and rid in self.risk_by_id:
-                self.risk_by_id[rid]["recheck_status"] = "queued"
-                self.store.save_risk(self.risk_by_id[rid])
             self.pq.append(item)
             self._notify_scheduler()
             return
@@ -2178,9 +2149,6 @@ class Pipeline:
         attempts = self._mark_retry_after_failure(item)
         if attempts <= max(0, self.cfg.recheck.max_retries):
             rec["status"] = "incomplete"
-            if kind == "risk" and rid in self.risk_by_id:
-                self.risk_by_id[rid]["recheck_status"] = "queued"
-                self.store.save_risk(self.risk_by_id[rid])
             self.pq.append(item)
             self._notify_scheduler()
             self.emit(EV.RECHECK_ENQUEUED, {"kind": kind, "id": rid, "pattern": item.get("pattern"),
@@ -2201,9 +2169,6 @@ class Pipeline:
         self._clear_retry_after_failure(item)
         self.completed_items.add(item_key(item))
         rec["status"] = "abandoned"
-        if kind == "risk" and rid in self.risk_by_id:
-            self.risk_by_id[rid]["recheck_status"] = "failed"
-            self.store.save_risk(self.risk_by_id[rid])
         self.emit(EV.RECHECK_DONE, {"kind": kind, "id": rid, "pattern": item.get("pattern"),
                                     "label": label, "abandoned": True, "attempts": attempts,
                                     "reason": reason})
@@ -2224,9 +2189,6 @@ class Pipeline:
         item["pass"] = item.get("pass", 0) + 1
         item["newThisRound"] = 0
         item["newSurfacesThisRound"] = 0
-        if kind == "risk" and rid in self.risk_by_id:
-            self.risk_by_id[rid]["recheck_status"] = "running"
-            self.store.save_risk(self.risk_by_id[rid])
         if kind == "variant":
             lens_key = item.get("lens_hint") if item.get("lens_hint") in self.cfg.lenses else "memory"
             prompt = self.pb.audit(item, lens_key, 0, S.FINDINGS_SCHEMA)
@@ -2252,9 +2214,6 @@ class Pipeline:
             self._consume(res, item, rec, lens_key, from_recheck=True, audit_model=meta.get("model"))
         self.completed_items.add(item_key(item))
         rec["status"] = "completed-findings" if rec.get("candidates", 0) > 0 else "completed-clean"
-        if kind == "risk" and rid in self.risk_by_id:
-            self.risk_by_id[rid]["recheck_status"] = "done"
-            self.store.save_risk(self.risk_by_id[rid])
         self.checkpoint(self.round)
         self.emit_coverage()
         self.emit(EV.RECHECK_DONE, {"kind": kind, "id": rid, "pattern": item.get("pattern"), "label": label,
@@ -2280,7 +2239,7 @@ class Pipeline:
             "confirmed": confirmed_real, "finding_entries": len(final),
             "quality_issues": quality_issues, "status": status, **incomplete_counts,
         }
-        # 收尾:刷机制态 + 攻击面/覆盖快照(漏洞/风险已各自即时落盘),并写最终汇总+状态
+        # 收尾:刷机制态 + 攻击面/覆盖快照(漏洞已即时落盘),并写最终汇总+状态
         self.store.save_checkpoint(self.build_checkpoint(self.round))
         self.store.save_attack_surface(self.build_attack_surface(self.round))
         self.store.update_summary(summary, status=status)
@@ -2290,7 +2249,7 @@ class Pipeline:
             "target": self.cfg.target, "scope": self.cfg.scope or "(whole repo)",
             "threat_model": self.cfg.threat_model, "backend": self.cfg.backend,
             "methods_used": self.cfg.methods_ok(), "methods_dir": self.cfg.methods_abs,
-            "dynamic_surfaces": len(self.surface_log), "risk_notes": len(self.risk_notes),
+            "dynamic_surfaces": len(self.surface_log), "risk_notes": 0,
             "resumed_from_round": self.start_round, "rounds": self.round,
             "converged": converged, "stop_reason": stop_reason, "candidates": len(self.dedup_keys),
             "attack_methods_total": sum(1 for r in self.ledger_arr if r.get("kind") == "attack_method"),
@@ -2372,4 +2331,9 @@ class Pipeline:
             raise
         finally:
             # 收尾:移除全 run 复用的 PoC worktree(成功/失败/停止都执行)
+            close_runner = getattr(self.runner, "aclose", None)
+            if close_runner:
+                ret = close_runner()
+                if asyncio.iscoroutine(ret):
+                    await ret
             self._cleanup_poc_worktree()

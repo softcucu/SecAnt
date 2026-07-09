@@ -88,18 +88,17 @@ history:
   # paths: "src lib"            # 可选:限定 git log 路径(留空则用 scope;空格分隔多个)
   poll_interval_s: 3            # 审计循环等待历史变体灌入的轮询间隔(秒)
 
-# ── 专用优先排查通道(历史变体 + 风险点复查) ──
-# 把「历史问题模式的同类变体排查」与「已登记风险点的复查」抽到一条独立的**优先队列**,
+# ── 专用优先排查通道(历史变体 + 即时风险种子复查) ──
+# 把「历史问题模式的同类变体排查」与「即时风险种子复查」抽到一条独立的**优先队列**,
 # 由专用 agent(role=recheck)处理,优先级最高:只要队列里有项,空出的 agent 名额就先来处理它
 # (懒占全局并发名额——有活才占、用完即还;队列空时不占用主池)。
-# 风险点复查的对象:被调函数/危险原语(B)的安全依赖调用方传入已校验的参数,当前路径安全但
+# 即时风险种子复查的对象:被调函数/危险原语(B)的安全依赖调用方传入已校验的参数,当前路径安全但
 # 全仓其它调用 B 的地方未必都做了等价校验——即变体排查的种子。
-# 风险点产出后:severity_hint ≥ risk_min_severity 的自动入队;低于阈值的只登记进 RISKS.md,
-# 人工在 Web 调高级别后会自动入队补排(调低则在未开排前出队)。
+# 种子产出后会当场进入 recheck 队列;不再写 risks/<id>.json,也不再导出 RISKS.md。
 recheck:
   enabled: true                 # 总开关
   concurrency: 1                # 该角色并发上限(默认 1:逐条串行排查)
-  risk_min_severity: medium     # 风险点自动入排查队列的最低 severity_hint(high/medium/low/info)
+  risk_min_severity: medium     # 兼容旧配置;即时风险种子不再按 severity_hint 过滤
   poll_interval_s: 3            # 优先队列空时的轮询等待间隔(秒)
   max_retries: 2                # 单个排查项连续失败的重排上限;超过即放弃该项(不再回灌优先队列)。
                                 # 防止某条复查的后端调用持续失败时无限重排,拖住整条管线的收敛、
@@ -146,7 +145,8 @@ retry:
 
 # ── 后端调用方式(可选;不写则用内置默认模板) ──
 # command 是 token 列表;运行时替换:{model}=当前角色模型,{prompt}=提示词(仅 arg 模式),{prompt_file}=提示词文件路径(仅 file 模式)。
-# prompt_mode: stdin(提示词从标准输入喂入) | arg(提示词作为命令行参数,用 {prompt} 占位) | file(提示词写文件,命令用 {prompt_file})。
+# prompt_mode: stdin(提示词从标准输入喂入) | arg(提示词作为命令行参数,用 {prompt} 占位) |
+#              file(提示词写文件,命令用 {prompt_file}) | serve(opencode 长驻 server)。
 # parse: claude_json(把 stdout 当 JSON 取 .result) | text(stdout 即文本)。
 # env: 给该后端注入的环境变量(可选)。
 backends:
@@ -155,11 +155,10 @@ backends:
     prompt_mode: stdin
     parse: claude_json
   opencode:
-    # --format json:opencode 以结构化事件流(每行一个 JSON 事件)输出,子进程跑完后才能确定性拿到完整最终文本,
-    # 避免默认 --format default(流式/TUI 渲染)在管道里只抓到部分中间输出。它只约束输出封装,不约束模型正文为 JSON。
-    # {prompt} 会作为单个 positional message argv 传给 opencode run;不经过 shell,换行不会被分行截断。
-    command: ["opencode", "run", "--format", "json", "--model", "{model}", "{prompt}"]
-    prompt_mode: arg
+    # 默认启动一个长驻 opencode serve;每个 agent 调用都会在该 server 内新建一个 session。
+    # {hostname}/{port} 由本工具运行时填入。模型仍按 provider/model 写在 models: 里。
+    command: ["opencode", "serve", "--hostname", "{hostname}", "--port", "{port}"]
+    prompt_mode: serve
     parse: text
   codex:
     command: ["codex", "exec", "--model", "{model}", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "{prompt}"]

@@ -13,7 +13,7 @@ const FINDING_FEEDBACK_OPTIONS = [
 ];
 const FINDING_SOURCE_OPTIONS = [
   ["history", "历史问题排查"],
-  ["risk", "潜在风险点审计"],
+  ["risk", "即时复查审计"],
   ["coverage", "攻击面覆盖审计"],
 ];
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -458,7 +458,6 @@ function viewDashboard(runId) {
       el("div", { class: "stat" }, el("div", { class: "n" }, fmtPct(manualConfirmed, suspectedCount)), el("div", { class: "l" }, "准确率")),
       ...SEVS.map(s => el("div", { class: "stat" }, el("div", { class: "n", style: "color:var(--" + (s === "critical" ? "crit" : s === "high" ? "high" : s === "medium" ? "med" : s === "low" ? "low" : "info") + ")" }, String(bySev[s] || 0)), el("div", { class: "l" }, s))),
       el("div", { class: "stat" }, el("div", { class: "n" }, String(S.candidates)), el("div", { class: "l" }, "候选")),
-      el("div", { class: "stat" }, el("div", { class: "n" }, String(S.risks.size)), el("div", { class: "l" }, "风险登记")),
       el("div", { class: "stat" }, el("div", { class: "n" }, String(agentCount)), el("div", { class: "l" }, "agent 调用")),
       el("div", { class: "stat" }, el("div", { class: "n" }, fmtTok(S.usage.input_tokens)), el("div", { class: "l" }, "输入 token")),
       el("div", { class: "stat" }, el("div", { class: "n" }, fmtTok(S.usage.output_tokens)), el("div", { class: "l" }, "输出 token")),
@@ -466,7 +465,7 @@ function viewDashboard(runId) {
     header.append(stats);
   }
 
-  const FULL_TABS = [["threat", "威胁分析"], ["findings", "漏洞"], ["candidates", "候选"], ["nonissues", "非问题"], ["agents", "实时Agent"], ["health", "模型"], ["coverage", "攻击面覆盖"], ["history", "历史问题"], ["risks", "潜在风险点"], ["usage", "历史任务"], ["activity", "活动"], ["exports", "导出"]];
+  const FULL_TABS = [["threat", "威胁分析"], ["findings", "漏洞"], ["candidates", "候选"], ["nonissues", "非问题"], ["agents", "实时Agent"], ["health", "模型"], ["coverage", "攻击面覆盖"], ["history", "历史问题"], ["usage", "历史任务"], ["activity", "活动"], ["exports", "导出"]];
   function visibleTabs() {
     return FULL_TABS;
   }
@@ -1845,7 +1844,7 @@ function viewDashboard(runId) {
       const st = el("table", {}, el("thead", {}, el("tr", {},
         el("th", {}, "状态"), el("th", {}, "动态新增攻击面"), el("th", {}, "来自"),
         el("th", {}, "发现轮"), el("th", {}, "pass"), el("th", {}, "候选"),
-        el("th", {}, "风险"), el("th", {}, "lens"), el("th", {}, "为何可疑"))));
+        el("th", {}, "复查种子"), el("th", {}, "lens"), el("th", {}, "为何可疑"))));
       const stb = el("tbody");
       for (const s of c.surfaces) {
         const r = surfaceRecs.get(s.name) || {};
@@ -1895,7 +1894,7 @@ function viewDashboard(runId) {
   function renderRisks() {
     if (!candidatesLoaded) fetchCandidates();
     const all = [...S.risks.values()].sort((a, b) => SEVS.indexOf(a.severity_hint) - SEVS.indexOf(b.severity_hint));
-    if (!all.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无风险登记。")); return; }
+    if (!all.length) { tabBody.append(el("div", { class: "panel empty" }, "暂无即时复查种子。")); return; }
     tabBody.append(dynamicStatusChips(riskStatusFilter, all, riskRecheckOf, RISK_STATUS_ORDER, RISK_STATUS_LABEL,
       v => { riskStatusFilter = v; pageState.risks = 1; renderTab(); }));
     const list = riskStatusFilter === "all" ? all : all.filter(r => riskRecheckOf(r) === riskStatusFilter);

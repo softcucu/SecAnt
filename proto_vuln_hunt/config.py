@@ -42,6 +42,7 @@ TASK_MODEL_ROLES = ["threat", "history", "recheck", "audit", "verify", "report",
 #   {model}   → 当前角色解析出的模型名
 #   {prompt}      → 提示词(仅 prompt_mode == "arg" 时需要;stdin/file 模式不建议使用)
 #   {prompt_file} → 提示词临时文件路径(仅 prompt_mode == "file" 时需要)
+#   {hostname}/{port} → opencode serve 监听地址(仅 prompt_mode == "serve" 时需要)
 # 替换为实际值。其余 token 原样保留。
 # parse:
 #   claude_json → 把 stdout 当作单个 JSON 解析,取其中的 result 字段作为 agent 文本;
@@ -60,18 +61,14 @@ DEFAULT_BACKENDS: Dict[str, Dict[str, Any]] = {
     },
     "opencode": {
         # 模型格式需为 provider/model(如 anthropic/claude-sonnet-4-6)。
-        # 提示词作为 opencode run 的单个 positional message argv 传入;执行时不经过 shell,
-        # 因此换行/空格会原样保留,不会被 shell 分行截断。
-        # --format json:让 opencode 以"每行一个 JSON 事件"的结构化事件流输出(而非默认给人看的流式/TUI 渲染),
-        # 这样子进程跑完后能确定性地拿到 assistant 的**完整最终文本**,避免管道里只抓到部分中间输出。
-        # 注意:它只约束 opencode 的输出封装,不约束模型正文必须是 JSON;正文仍由 extract_json 进一步解析。
+        # 默认使用一个长驻 `opencode serve` 进程;每个 agent 调用在该 server 内创建一个全新的 session,
+        # 避免为成千上万个 agent 反复启动 opencode 进程和重复冷启动项目状态。
         "command": [
-            "opencode", "run",
-            "--format", "json",
-            "--model", "{model}",
-            "{prompt}",
+            "opencode", "serve",
+            "--hostname", "{hostname}",
+            "--port", "{port}",
         ],
-        "prompt_mode": "arg",
+        "prompt_mode": "serve",
         "parse": "text",
     },
     "codex": {
@@ -92,7 +89,7 @@ DEFAULT_BACKENDS: Dict[str, Dict[str, Any]] = {
 class BackendSpec:
     name: str
     command: List[str]
-    prompt_mode: str = "stdin"   # stdin | arg | file
+    prompt_mode: str = "stdin"   # stdin | arg | file | serve(opencode)
     parse: str = "text"          # text | claude_json
     env: Dict[str, str] = field(default_factory=dict)
 
@@ -149,16 +146,16 @@ class HistorySpec:
 
 @dataclass
 class RecheckSpec:
-    """专用「优先排查」通道:把历史问题变体排查 + 已登记风险点复查抽到一条独立优先队列,
+    """专用「优先排查」通道:把历史问题变体排查 + 即时风险种子复查抽到一条独立优先队列,
     由专用 agent(role=recheck)处理。优先级最高——只要队列里有项,空出的 agent 名额就先来处理它
     (懒占全局并发名额:有活才占、用完即还,队列空时不占用主池)。
 
-    风险点复查的典型对象:被调函数/危险原语(B)的安全依赖调用方传入已校验的参数,当前路径安全但
-    全仓其它调用 B 的地方未必都做了等价校验——即变体排查的种子。
+    即时风险种子的典型对象:被调函数/危险原语(B)的安全依赖调用方传入已校验的参数,当前路径安全但
+    全仓其它调用 B 的地方未必都做了等价校验。risk_min_severity 仅保留旧配置兼容,新种子不再按等级过滤。
     """
     enabled: bool = True
     concurrency: int = 1            # 该角色并发上限(默认 1:逐条串行排查)
-    risk_min_severity: str = "medium"  # 风险点自动入排查队列的最低 severity_hint(high/medium/low/info)
+    risk_min_severity: str = "medium"  # 兼容旧配置;即时风险种子不再按 severity_hint 过滤
     poll_interval_s: int = 3        # 优先队列空时的轮询等待间隔(秒)
     max_retries: int = 2            # 单个排查项连续失败的重排上限;超过即放弃该项(不再回灌优先队列)。
                                     # 防止某条复查的后端调用持续失败时无限重排,拖住整条管线的收敛、

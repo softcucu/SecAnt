@@ -7,6 +7,7 @@ import unittest
 
 from proto_vuln_hunt.backends import (
     AgentRunner,
+    _OpencodeServeClient,
     _drain_process,
     _extract_usage,
     _extract_opencode_text,
@@ -44,6 +45,71 @@ def _jsonl(*events):
 
 
 class OpencodeEventParsingTests(unittest.TestCase):
+    def test_default_opencode_backend_uses_serve_mode(self):
+        spec = Config(backend="opencode").backend_spec()
+
+        self.assertEqual(spec.prompt_mode, "serve")
+        self.assertIn("serve", spec.command)
+
+    def test_opencode_serve_messages_convert_to_jsonl_events(self):
+        messages = [
+            {
+                "info": {
+                    "id": "msg_user",
+                    "sessionID": "ses_1",
+                    "role": "user",
+                    "agent": "build",
+                    "model": {"providerID": "openai", "modelID": "gpt-5"},
+                },
+                "parts": [
+                    {
+                        "id": "prt_user",
+                        "sessionID": "ses_1",
+                        "messageID": "msg_user",
+                        "type": "text",
+                        "text": "prompt",
+                    }
+                ],
+            },
+            {
+                "info": {
+                    "id": "msg_assistant",
+                    "sessionID": "ses_1",
+                    "role": "assistant",
+                    "agent": "build",
+                    "model": {"providerID": "openai", "modelID": "gpt-5"},
+                },
+                "parts": [
+                    {
+                        "id": "prt_assistant",
+                        "sessionID": "ses_1",
+                        "messageID": "msg_assistant",
+                        "type": "text",
+                        "text": "```json\n{\"answer\":2}\n```",
+                    }
+                ],
+            },
+        ]
+
+        stdout = _OpencodeServeClient._messages_jsonl(
+            "ses_1",
+            messages,
+            {"tokens": {"input": 10, "output": 4}},
+        )
+        parsed = _extract_opencode_text(stdout)
+
+        self.assertIsNotNone(parsed)
+        text, usage, session_id = parsed
+        self.assertEqual(text, "```json\n{\"answer\":2}\n```")
+        self.assertEqual(session_id, "ses_1")
+        self.assertEqual(usage, {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14})
+
+    def test_opencode_serve_model_ref_splits_only_first_slash(self):
+        self.assertEqual(
+            _OpencodeServeClient._model_ref("requesty/xai/grok-4"),
+            {"providerID": "requesty", "modelID": "xai/grok-4"},
+        )
+
     def test_merges_text_messages_after_tool_loop(self):
         stdout = _jsonl(
             {

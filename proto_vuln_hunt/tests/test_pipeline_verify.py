@@ -356,7 +356,7 @@ class TestAdversarialVerify(_PipelineTestBase):
 
 class TestFinalFailedSweep(_PipelineTestBase):
     def test_enqueue_reinjects_failed_items_once(self):
-        """final sweep:把 verify_failed 候选 + failed risk 复查重新入队,且每次 invocation 只执行一次。"""
+        """final sweep:把 verify_failed 候选 + abandoned risk 复查重新入队,且每次 invocation 只执行一次。"""
         p = self.make_pipeline(verify_votes=3)
 
         f = _finding(severity="high")
@@ -365,10 +365,10 @@ class TestFinalFailedSweep(_PipelineTestBase):
         f["verify_attempts"] = 3
         p.pending_findings[k] = f
 
-        risk = {"id": "R1", "area": "auth", "file": "b.c", "severity_hint": "high",
-                "lens": "authn", "recheck_status": "failed"}
-        p.risk_notes.append(risk)
-        p.risk_by_id["R1"] = risk
+        risk = {"kind": "risk", "id": "R1", "area": "auth", "file": "b.c", "severity_hint": "high",
+                "lens": "authn", "note": "n"}
+        rec = p.ledger_rec(risk)
+        rec["status"] = "abandoned"
         p.completed_items.add("risk:R1")   # 之前被放弃时标过完成
 
         n = p._enqueue_final_failed_sweep()
@@ -384,17 +384,17 @@ class TestFinalFailedSweep(_PipelineTestBase):
         # 同一 invocation 内再调用 → 不再重复入队(防失败项无限循环)
         self.assertEqual(p._enqueue_final_failed_sweep(), 0)
 
-    def test_low_severity_risk_not_swept(self):
-        """低于 risk_min_severity 的 low/info 风险即便 failed 也不入最终补跑。"""
+    def test_low_severity_risk_is_swept_because_threshold_no_longer_applies(self):
+        """即时风险种子不再按 risk_min_severity 过滤,失败后 final sweep 会补跑一次。"""
         p = self.make_pipeline(verify_votes=3)
-        risk = {"id": "R2", "area": "x", "severity_hint": "low", "recheck_status": "failed"}
-        p.risk_notes.append(risk)
-        p.risk_by_id["R2"] = risk
+        risk = {"kind": "risk", "id": "R2", "area": "x", "severity_hint": "low", "note": "n"}
+        rec = p.ledger_rec(risk)
+        rec["status"] = "abandoned"
+        p.completed_items.add("risk:R2")
 
-        self.assertEqual(p._enqueue_final_failed_sweep(), 0)
-        self.assertFalse(p.pq)
-        # low/info 风险也不计入“复查失败”阻塞完成统计
-        self.assertEqual(p._failed_recheck_count(), 1)  # 仍登记为 failed(只是不补跑)
+        self.assertEqual(p._enqueue_final_failed_sweep(), 1)
+        self.assertTrue(any(it.get("kind") == "risk" and it.get("id") == "R2" for it in p.pq))
+        self.assertNotIn("risk:R2", p.completed_items)
 
 
 class TestIncompleteCounts(_PipelineTestBase):
@@ -415,7 +415,7 @@ class TestIncompleteCounts(_PipelineTestBase):
 
     def test_failed_recheck_counts_risk_and_variant(self):
         p = self.make_pipeline()
-        p.risk_notes.append({"id": "R1", "recheck_status": "failed", "severity_hint": "high"})
+        p.ledger_arr.append({"key": "risk:R1", "kind": "risk", "status": "abandoned"})
         p.ledger_arr.append({"key": "variant:foo", "kind": "variant", "status": "abandoned"})
         self.assertEqual(p._failed_recheck_count(), 2)
 

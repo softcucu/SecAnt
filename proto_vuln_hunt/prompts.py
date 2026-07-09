@@ -281,11 +281,11 @@ class PromptBuilder:
             "- 每条 finding 必须给出 source→sink 传播路径与可控性判断;命中历史模式则填 variant_of。\n"
             "- **宁缺毋滥**:没有可信外部输入路径、或已被上游夹紧的,不要报。\n"
             "- 若发现新的值得另派 agent 深挖的攻击面/可疑数据流,放进 new_surfaces。\n"
-            "- **潜在风险登记**:本轮没坐实成漏洞、但值得人工另行核实的**线索**放进 risk_notes(area/note/可选 file/severity_hint),汇总进 RISKS.md,不要硬凑成 finding。"
-            "**最典型、最该登记的一类**是「校验只在调用方、被调点本身不自洽」的跨调用点隐患:你在审 A 函数时发现 A 调 B,A 做了充分校验、这条路径没问题;"
+            "- **即时复查种子**:本轮没坐实成漏洞、但发现「A 调 B,A 做了充分校验所以当前路径安全;B 自身不校验,其它调用 B 的地方未必满足同样前提」时,"
+            "放进 risk_notes(area/note/file/severity_hint,尽量补 callee/required_validation/good_validation_ref)。系统会立刻派 recheck agent 消费,不会生成风险报告/存档,不要硬凑成 finding。"
+            "**最典型的一类**是「校验只在调用方、被调点本身不自洽」的跨调用点隐患:你在审 A 函数时发现 A 调 B,A 做了充分校验、这条路径没问题;"
             "但 B(或某个危险原语/共享 helper)的安全**依赖调用方传入已校验的参数**,而**全仓其它调用 B 的地方未必都做了等价校验**。"
-            "此时登记为风险点,note 写明:B 的位置、B 安全所依赖的前提(invariant)、以及\"还有哪些调用方、是否都满足该前提\"这个待核实问题——这是变体排查的种子。"
-            "其它如长度校验分散、错误路径未统一释放、缺乏深度限制等同理。\n"
+            "此时 note 写明:B 的位置、B 被调用前必须满足的前提/校验、A 中已做对的校验代码位置与逻辑;good_validation_ref 填 A 的 path:line + 一句话正例。\n"
             "- **聚焦、限时**:挑最相关的约 8~12 个函数/代码段精读即可,不要遍历整个大仓;够了就收尾返回。\n"
             f"- **本 finder 的独特调查角度(#{idx + 1},与同 lens 的其它并行 finder 互补,不要重复别人的角度)**:{self.finder_angle(idx)}{self.file_partition(item, idx)}\n"
             "(只查这一个 lens;其他 lens 与未覆盖代码由别的 agent / 后续轮次覆盖。)"
@@ -294,22 +294,23 @@ class PromptBuilder:
 
     # ── 风险点复查(专用优先排查角色) ──
     def recheck_risk(self, item: Dict[str, Any], schema) -> str:
+        callee = item.get("callee") or item.get("area") or "B"
+        required = item.get("required_validation") or item.get("note") or "(从风险说明中提取)"
+        good_ref = item.get("good_validation_ref") or "(风险说明中的 A 调用点/正例校验)"
         return (
             f"你在对 C/C++ 源码做白盒**定向人工审计**。目标:{self.target}{self.scope_note}(威胁模型:{self.threat})\n"
-            f"审计对象:**潜在风险点复查**「{item.get('area')}」\n"
+            f"审计对象:**即时风险种子复查**「{item.get('area')}」\n"
+            f"被调点 B:{callee}\n"
             f"相关文件:{item.get('file') or '(自行定位)'}\n"
-            f"风险说明:{item.get('note')}\n\n"
-            "这条风险点的典型形态是「校验只在调用方、被调点本身不自洽」——某个被调函数 / 危险原语 / 共享 helper(记为 B)的安全"
-            "**依赖调用方传入已校验的参数**,B 自身并不重新校验;已知某条调用路径(调用方做了充分校验)是安全的,"
-            "但**全仓其它调用 B 的地方未必都做了等价校验**。\n"
-            "请据风险说明先定位 B,然后:\n"
-            "- 用 rg / semgrep / tree-sitter 脚本 / CodeQL(免编译)把**全仓所有调用 B 的站点**枚举出来(广度优先,别漏);\n"
-            "- 逐一精读每个调用点:核实 B 保持安全所依赖的前提 / 不变量(长度已夹紧、指针非空、已认证等)在该调用点是否真的成立;\n"
-            "- 对**不满足前提**的调用点,回溯 source→sink 并判可控性 / 可达性;坐实为漏洞的报成 finding;\n"
-            "- **正面对照(必填)**:坐实的 finding 里,从你枚举到的调用点中挑**一处对同一 B 把校验做对了**的站点,"
-            "填进该 finding 的 `good_validation_ref`(path:line + 一句话:它正确地校验/夹紧了什么不变量),"
-            "用来对比说明本漏洞点缺了哪一步;\n"
-            "- 仍可疑但未坐实的继续放进 risk_notes(写清新的待核实点);新的可疑数据流 / 入口放进 new_surfaces。\n"
+            f"B 被调用前必须满足的校验/不变量:{required}\n"
+            f"已知正例 A 中的校验:{good_ref}\n"
+            f"补充说明:{item.get('note') or ''}\n\n"
+            "提示词模板:\n"
+            "1. 先定位 B,用 rg / semgrep / tree-sitter 脚本 / CodeQL(免编译)枚举全仓所有直接调用 B 的站点。\n"
+            "2. 逐一判断调用 B 前是否满足上述校验/不变量;接受语义等价的校验方式,不要只按文本匹配 A 的代码。\n"
+            "3. 若 C 调 B 前没有直接校验,继续向上枚举并精读所有可达调用 C 的站点;只有能证明所有到达 B 的路径都在上游完成等价校验,才判安全。\n"
+            "4. 对存在未校验路径且输入可控/可达的调用链,回溯 source→sink,坐实后输出 finding;finding 的 good_validation_ref 填 A 正例或另一处等价正例(path:line + 一句话)。\n"
+            "5. 不要输出 risk_notes;未坐实为漏洞就不报。若发现新的独立入口/攻击面,放进 new_surfaces。\n"
             f"{PROTO_EXTRA}\n\n"
             "要求:看真实代码、回溯数据流,不要臆测;**宁缺毋滥**——没有可信外部输入路径、或已被上游夹紧的不要报。\n"
             "(这是有的放矢的定向变体排查,不是全仓盲扫。)"
@@ -573,7 +574,7 @@ class PromptBuilder:
         votes_brief = self._votes_brief(rec)
         poc_brief = self._poc_brief(poc)
         # 按发现来源附加两类对照小节:历史问题排查命中 → 类似哪个历史问题;
-        # 潜在风险点排查命中 → 哪一处其他代码把校验做对了(正面对照)。
+        # 即时风险种子复查命中 → 哪一处其他代码把校验做对了(正面对照)。
         extras = ""
         variant_of = (rec.get("variant_of") or "").strip()
         if variant_of:
@@ -584,7 +585,7 @@ class PromptBuilder:
         good_ref = (rec.get("good_validation_ref") or "").strip()
         if good_ref:
             extras += (
-                f"⑪ **正面对照:其他调用点的正确校验** —— 本漏洞由潜在风险点排查命中,贴出**哪一处其他代码把校验做对了**"
+                f"⑪ **正面对照:其他调用点的正确校验** —— 本漏洞由即时风险种子复查命中,贴出**哪一处其他代码把校验做对了**"
                 f"({good_ref}):它正确地校验 / 夹紧了哪个不变量,对比说明本漏洞点缺了这一步、应照其补齐;\n"
             )
         return (

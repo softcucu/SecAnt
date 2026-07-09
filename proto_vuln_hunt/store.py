@@ -7,12 +7,12 @@
   attack-surface.json  —— 攻击面(初始+动态)+ 覆盖台账 + progress,每轮整体快照(状态持续演变)
   candidates/<hash>.json —— 每条候选/非问题的当前状态(候选、已确认、已否决、验证失败)
   findings/<id>.json   —— 每条确认漏洞一个文件,确认即写;人工反馈可追加更新
-  risks/<id>.json      —— 每条风险一个文件,登记即写、写一次即终态
   usage.jsonl          —— 每次 agent 调用的 token 使用记录(真实 usage 或轻量估算)
   events.jsonl         —— append-only 事件日志(SSE 重放 / 服务重启回看)
   exports/             —— 按需生成的 MD / SARIF(由 exporters.py 渲染)
 
-判据:会演变的(攻击面/覆盖)单文件快照;漏洞/风险多文件独立寻址;威胁分析与历史模式独立存储。
+判据:会演变的(攻击面/覆盖)单文件快照;漏洞多文件独立寻址;威胁分析与历史模式独立存储。
+即时风险种子只进入 recheck 队列当场消费,不再单独存档。
 Web 的 run 放在 runs_root/<run_id>/;CLI 仍可用 <out_dir>/ 当 run 目录(resume 行为不变)。
 """
 from __future__ import annotations
@@ -328,7 +328,7 @@ class RunStore:
             "threatAnalysis": self.load_threat_analysis(),
             "surfaceLog": asf.get("surfaces", []),
             "auditLedger": asf.get("ledger", []),
-            "riskNotes": self.load_risks(),
+            "riskNotes": [],
             "confirmed": self.load_findings(),
             "usage": self.load_usage(),
             "summary": m.get("summary", {}),
