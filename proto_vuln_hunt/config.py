@@ -1,7 +1,7 @@
 """配置加载:从 YAML/JSON 配置文件 + 命令行覆盖,组装出一份运行配置。
 
 设计目标(对应用户需求):
-  · 通过配置文件选择后端 CLI(claude / opencode / codex)并自定义其调用方式;
+  · 通过配置文件选择后端(claude / opencode / codex)并自定义其调用方式;
   · 为不同阶段(role)配置不同模型,并可限制每个模型自己的并发;
   · 配置并发数与全部流水线参数。
 """
@@ -47,7 +47,7 @@ TASK_MODEL_ROLES = ["threat", "history", "recheck", "audit", "verify", "report",
 # parse:
 #   claude_json → 把 stdout 当作单个 JSON 解析,取其中的 result 字段作为 agent 文本;
 #   text        → stdout 即 agent 文本。
-# cwd 一律由子进程的工作目录控制(无需 --add-dir/-C/--dir);PoC 阶段会切到隔离 worktree。
+# cwd 一律由后端调用的工作目录控制(无需 --add-dir/-C/--dir);PoC 阶段会切到隔离 worktree。
 DEFAULT_BACKENDS: Dict[str, Dict[str, Any]] = {
     "claude": {
         "command": [
@@ -116,16 +116,16 @@ class HealthCheckSpec:
 
 @dataclass
 class RetrySpec:
-    """后端 CLI(opencode/claude/codex)执行任务失败后的重试策略。
+    """后端(opencode/claude/codex)执行任务失败后的重试策略。
 
-    说明:后端 CLI 内部已自行处理瞬时 API 抖动(限流/5xx 等)的重试;本工具这一层只在
-    **CLI 任务整体失败**时重试——即子进程非零退出 / 超时 / 输出无法解析为所需结构化 JSON。
+    说明:后端内部已自行处理瞬时 API 抖动(限流/5xx 等)的重试;本工具这一层只在
+    **后端任务整体失败**时重试——即非零退出 / 超时 / 输出无法解析为所需结构化 JSON。
     max_attempts 是单组重试上限;threat/audit 等阶段可在其外层选择不限组数或回队继续重试。
     """
     max_attempts: int = 4          # 失败后最多再重试几次(总尝试 = 1 + max_attempts)
     backoff_base_ms: int = 2000    # 退避基数(指数增长)
     backoff_cap_ms: int = 30000    # 单次退避封顶
-    timeout_ms: int = 1800000      # 单次子进程墙钟超时(超时也算一次失败 → 计入重试)
+    timeout_ms: int = 1800000      # 单次后端任务墙钟超时(超时也算一次失败 → 计入重试)
 
 
 @dataclass

@@ -1,7 +1,7 @@
-"""Agent 执行后端:把一段提示词交给外部 CLI(claude/opencode/codex)在目标仓里跑一轮
+"""Agent 执行后端:把一段提示词交给外部后端(claude/codex CLI 或 opencode serve)在目标仓里跑一轮
 agentic 循环,拿回最终文本;需要结构化结果时再从文本中解析出 JSON。
 
-对应原 workflow 里的 `agent()` 原语 + `gSafe()` 容错包装,但执行体改为 shell 出去调 CLI。
+对应原 workflow 里的 `agent()` 原语 + `gSafe()` 容错包装,但执行体改为外部后端调用。
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .config import Config, normalize_model_concurrency, normalize_models
 
-# 后端 CLI 已自行重试瞬时 API 抖动;本层只在"CLI 任务整体失败"时重试(非零退出/超时/输出不可解析)。
+# 后端已自行重试瞬时 API 抖动;本层只在"后端任务整体失败"时重试(非零退出/超时/输出不可解析)。
 # 这个正则只用来**判断该不该退避更久**:若失败信息像"被限流/额度耗尽",则用更长退避等服务端恢复。
 _RATE_RE = re.compile(
     r"(overloaded|rate.?limit|too many requests?|\b429\b|\b529\b|\b503\b|"
@@ -38,7 +38,7 @@ def looks_rate_limited(msg: str) -> bool:
     return bool(_RATE_RE.search(msg or ""))
 
 
-# 终端 CLI(尤其 opencode/codex 的 run 模式)常把会话/工具活动连同 ANSI 颜色码一起打到 stdout。
+# 终端 CLI 常把会话/工具活动连同 ANSI 颜色码一起打到 stdout。
 # 这些转义序列会混进 JSON 文本里,导致 json.loads 失败。解析前统一剥掉。
 _ANSI_RE = re.compile(
     r"\x1b\[[0-9;?]*[ -/]*[@-~]"   # CSI 序列(含颜色 SGR、光标移动等)
@@ -135,7 +135,7 @@ def _extract_usage(obj: Any) -> Optional[Dict[str, int]]:
 
 
 # ──────────────────────────── JSON 提取 ────────────────────────────
-# opencode/codex 的 run 模式常把一段自然语言 + ```json 代码块 + 工具活动一起打到 stdout,
+# 外部 CLI 常把一段自然语言 + ```json 代码块 + 工具活动一起打到 stdout,
 # 有时还夹带 // 注释、尾随逗号、被截断未闭合等。下面这套解析尽量从这种"脏文本"里把目标 JSON 捞出来:
 #   1) 收集所有候选(```json/``` 代码块、整段、括号配对扫描出的顶层 {…}/[…]);
 #   2) 每个候选先严格解析,失败再做温和修复(去注释/去尾逗号/补全未闭合)后再试;
@@ -562,19 +562,19 @@ def _text_delta(ev: Dict[str, Any], part: Dict[str, Any]) -> str:
 
 
 def _extract_opencode_text(stdout: str) -> Optional[Tuple[str, Optional[Dict[str, int]], str]]:
-    """识别并解析 opencode `--format json` 的事件流(每行一个 JSON 事件),重建 assistant 的最终文本。
+    """识别并解析 opencode JSON 事件流(每行一个 JSON 事件),重建 assistant 的最终文本。
 
     返回 (text, usage, session_id);若 stdout 不像事件流则返回 None(交回上层按普通文本处理)。
       · text       —— stdout 事件流中所有 assistant text message 正文按出现顺序合并。
       · usage      —— 取最后一个 step_finish 的 part.tokens 作为整轮真实 token 用量(取不到则 None,上层回退估算)。
       · session_id —— opencode 会话 ID,仅用于诊断。
 
-    设计取舍:这里只解析子进程 stdout,不读 opencode 的数据库/日志。opencode 的一次 run 可能
+    设计取舍:这里只解析事件流文本,不读 opencode 的数据库/日志。opencode 的一次 session 可能
     包含多条 assistant message:先说"我去读文件",工具调用后再输出最终 JSON。因此不能在事件层
     挑最后一条或按 reason 裁剪,而要把所有正文块合并,让 extract_json 从完整文本里找最终 JSON。
 
-    注:`--format json` 只约束 opencode 的**输出封装**为事件流,**不**约束模型正文为 JSON;
-    正文(可能是"一段话 + ```json 块")原样在 text 事件里,之后仍由 extract_json 进一步解析。
+    注:事件流只约束 opencode 的**输出封装**,**不**约束模型正文为 JSON;正文(可能是
+    "一段话 + ```json 块")原样在 text 事件里,之后仍由 extract_json 进一步解析。
     """
     if not stdout or "{" not in stdout:
         return None
@@ -1649,10 +1649,9 @@ class AgentRunner:
         except Exception:  # noqa: BLE001 —— 回收失败绝不影响主流程
             pass
 
-    # ── 单次子进程调用(不含重试) ──
+    # ── 单次后端调用(不含重试) ──
     async def _invoke(self, prompt: str, model: str, cwd: str,
                       timeout_s: Optional[float] = None,
-                      direct_prompt: bool = False,
                       on_output: Optional[Callable[[str, str], None]] = None,
                       label: str = "") -> Tuple[str, Optional[Dict[str, int]]]:
         if self.cfg.backend == "opencode" and self.spec.prompt_mode == "serve":
@@ -1671,36 +1670,25 @@ class AgentRunner:
                 )
             finally:
                 self._reap_opencode_artifacts()
+        if self.cfg.backend == "opencode":
+            raise RuntimeError("opencode 后端仅支持 prompt_mode=serve")
 
         prompt_file = ""
-        uses_prompt = any("{prompt}" in tok for tok in self.spec.command)
         uses_prompt_file = self.spec.prompt_mode == "file" or any(
             "{prompt_file}" in tok for tok in self.spec.command
         )
-        if self.cfg.backend == "opencode" and (uses_prompt or uses_prompt_file):
-            # opencode run receives the audit prompt as one positional message argv.
-            # Never splice multi-line prompt text into another token or through a shell.
-            direct_prompt = True
-        if (not direct_prompt) and uses_prompt_file:
+        if uses_prompt_file:
             prompt_file = self._write_prompt_file(prompt)
 
         cmd: List[str] = []
         prompt_in_args = False
-        if direct_prompt:
-            for tok in self.spec.command:
-                if "{prompt_file}" in tok or "{prompt}" in tok:
-                    continue
-                cmd.append(tok.replace("{model}", model))
-            cmd.append(prompt)
-            prompt_in_args = True
-        else:
-            for tok in self.spec.command:
-                t = tok.replace("{model}", model)
-                t = t.replace("{prompt_file}", prompt_file)
-                if "{prompt}" in t:
-                    t = t.replace("{prompt}", prompt)
-                    prompt_in_args = True
-                cmd.append(t)
+        for tok in self.spec.command:
+            t = tok.replace("{model}", model)
+            t = t.replace("{prompt_file}", prompt_file)
+            if "{prompt}" in t:
+                t = t.replace("{prompt}", prompt)
+                prompt_in_args = True
+            cmd.append(t)
         stdin_data = None
         if self.spec.prompt_mode == "stdin" and not prompt_in_args:
             stdin_data = prompt.encode("utf-8")
@@ -1743,18 +1731,6 @@ class AgentRunner:
                         raise RuntimeError(f"claude error: {str(obj.get('result'))[:300]}")
                     return str(obj.get("result", "") or ""), usage
                 return stdout, usage
-            # opencode `--format json` 事件流:把所有 text 块拼成 assistant 正文(自动识别,兼容旧配置)。
-            # 不再按"是否见到终止 step_finish"硬判完整(会误杀完整答案与健康探针);完整性交给下游:
-            # 结构化任务看 extract_json 能否解析,健康探针看 expect 是否命中,解析不出再重试。
-            oc = _extract_opencode_text(stdout)
-            if oc is not None:
-                text, oc_usage, _session_id = oc
-                if not text.strip():
-                    raise BackendOutputError(
-                        "opencode 只输出了工具调用前/工具调用中的中间文本,未在 stdout 中看到最终 assistant 文本",
-                        strip_ansi(stdout),
-                    )
-                return strip_ansi(text), oc_usage
             usage = None
             try:
                 usage = _extract_usage(json.loads(stdout))
@@ -1765,12 +1741,10 @@ class AgentRunner:
             # 子进程已结束:本次 prompt 文件不再"在用",解除保护(留待滚动窗口自然淘汰)
             if prompt_file:
                 self._live_prompt_files.discard(prompt_file)
-            # opencode:用完顺带回收共享数据目录里膨胀的 snapshot/repos 孤儿仓(保留最近若干个)
-            self._reap_opencode_artifacts()
 
     def _dump_failed_output(self, role: str, label: str, model: str, attempt: int, text: str,
                             dump_candidate: bool = False) -> str:
-        """解析结构化 JSON 失败时,把后端 CLI 的原始输出落盘,便于排查(尤其 opencode/codex)。
+        """解析结构化 JSON 失败时,把后端原始输出落盘,便于排查(尤其 opencode/codex)。
 
         dump_candidate=True 时,在同前缀再写一个 `.jsonload.json` 文件,内容是 extract_json 真正会喂给
         json.loads 的那段候选串(由 best_json_candidate 抽取),可直接丢 json.loads/jsonlint 复现报错。"""
@@ -1782,7 +1756,7 @@ class AgentRunner:
             path = base + ".txt"
             header = (f"# backend={self.cfg.backend} role={role} label={label} model={model} "
                       f"attempt={attempt} len={len(text or '')}\n"
-                      f"# 后端 CLI 输出里找不到可解析的 JSON。常见原因:opencode/codex 把工具活动/思考一并打到 stdout,"
+                      f"# 后端输出里找不到可解析的 JSON。常见原因:opencode/codex 把工具活动/思考一并打到 stdout,"
                       f"或最终未输出 ```json 代码块。\n{'-' * 60}\n")
             with open(path, "w", encoding="utf-8") as f:
                 f.write(header + (text or ""))
@@ -1863,14 +1837,11 @@ class AgentRunner:
         async with self._model_semaphore(model):
             async with self._semaphore():
                 try:
-                    # opencode 探针也按单个 positional message argv 发送,避免为了健康检查触发
-                    # "先读任务文件"的工具循环,造成健康状态误判。
                     text, _usage = await self._invoke(
                         hc.prompt,
                         model,
                         cwd,
                         timeout_s=timeout_s,
-                        direct_prompt=(self.cfg.backend == "opencode"),
                         on_output=timing.observe,
                         label="health",
                     )
@@ -1930,7 +1901,7 @@ class AgentRunner:
         """用真实 agent 调用的成败顺带更新模型健康。
 
         健康探针的 answer/error 与真实任务的 last_call_error 分开存,避免 Web 把
-        "CLI 未产出结构化 JSON"这类任务失败误显示成"最近探针答复"。
+        "后端未产出结构化 JSON"这类任务失败误显示成"最近探针答复"。
         """
         rec = self._health_rec(model)
         changed = False
@@ -1955,7 +1926,7 @@ class AgentRunner:
         if changed:
             self._emit_health(rec)
 
-    # ── 带重试的 agent 调用:一次 CLI 任务执行失败(非零退出/超时/输出不可解析)即重试 ──
+    # ── 带重试的 agent 调用:一次后端任务执行失败(非零退出/超时/输出不可解析)即重试 ──
     async def run(
         self,
         prompt: str,
@@ -2000,7 +1971,7 @@ class AgentRunner:
         emit_agent("queued", prompt_chars=len(prompt or ""), schema=bool(schema))
         if not self.cfg.configured_model_slots_for(role):
             msg = f"角色 {role} 未配置模型"
-            self.log(f"⚠ {tag} CLI 任务无法启动: {msg}")
+            self.log(f"⚠ {tag} 后端任务无法启动: {msg}")
             emit_agent(
                 "failed",
                 attempt=0,
@@ -2027,7 +1998,7 @@ class AgentRunner:
         while True:
             if should_stop is not None and should_stop():
                 msg = "用户请求停止"
-                self.log(f"⚠ {tag} CLI 任务停止重试: {msg}")
+                self.log(f"⚠ {tag} 后端任务停止重试: {msg}")
                 emit_agent(
                     "failed",
                     attempt=attempt,
@@ -2039,7 +2010,7 @@ class AgentRunner:
             while not health_model:
                 if not await self._wait_capacity_tick(should_stop):
                     msg = "用户请求停止"
-                    self.log(f"⚠ {tag} CLI 任务停止等待模型容量: {msg}")
+                    self.log(f"⚠ {tag} 后端任务停止等待模型容量: {msg}")
                     emit_agent(
                         "failed",
                         attempt=attempt,
@@ -2057,7 +2028,7 @@ class AgentRunner:
             )
             if not model:
                 msg = "用户请求停止"
-                self.log(f"⚠ {tag} CLI 任务停止等待并发容量: {msg}")
+                self.log(f"⚠ {tag} 后端任务停止等待并发容量: {msg}")
                 emit_agent(
                     "failed",
                     attempt=attempt,
@@ -2097,7 +2068,7 @@ class AgentRunner:
                     snippet = " ".join((text or "").split())[:240]
                     self.log(f"⚠ {tag} 后端输出无可解析 JSON(共 {len(text or '')} 字符)"
                              f"{(';原始输出已存 ' + path) if path else ''};前 240 字符:{snippet}")
-                    raise RuntimeError("CLI 未产出可解析的结构化 JSON(原始输出已存到 run 目录 debug/)")
+                    raise RuntimeError("后端未产出可解析的结构化 JSON(原始输出已存到 run 目录 debug/)")
                 parsed = _coerce_schema_value(parsed, schema)
                 shape_error = _schema_shape_error(parsed, schema)
                 if shape_error:
@@ -2106,7 +2077,7 @@ class AgentRunner:
                     snippet = " ".join((text or "").split())[:240]
                     self.log(f"⚠ {tag} 后端 JSON 结构不符合 schema:{shape_error}"
                              f"{(';原始输出已存 ' + path) if path else ''};前 240 字符:{snippet}")
-                    raise RuntimeError(f"CLI 结构化 JSON 形状不符合 schema:{shape_error}")
+                    raise RuntimeError(f"后端结构化 JSON 形状不符合 schema:{shape_error}")
                 emit_agent(
                     "done",
                     model=model,
@@ -2136,7 +2107,7 @@ class AgentRunner:
             # 退避/重试在信号量之外等待(不占用并发额度)
             attempt += 1
             if (not retry_forever) and attempt > max_attempts:
-                self.log(f"⚠ {tag} CLI 任务连续失败 {attempt} 次,本组重试耗尽: {msg[:120]}")
+                self.log(f"⚠ {tag} 后端任务连续失败 {attempt} 次,本组重试耗尽: {msg[:120]}")
                 emit_agent(
                     "failed",
                     model=model,
@@ -2151,7 +2122,7 @@ class AgentRunner:
                 retry_desc = f"第 {attempt} 次重试/不限次数{limited}"
             else:
                 retry_desc = f"第 {attempt}/{max_attempts} 次重试{limited}"
-            self.log(f"⚠ {tag} CLI 任务失败({retry_desc}),{wait_ms // 1000}s 后重试: {msg[:100]}")
+            self.log(f"⚠ {tag} 后端任务失败({retry_desc}),{wait_ms // 1000}s 后重试: {msg[:100]}")
             emit_agent(
                 "retrying",
                 model=model,
@@ -2162,7 +2133,7 @@ class AgentRunner:
             )
             if not await retry_sleep(wait_ms):
                 msg = "用户请求停止"
-                self.log(f"⚠ {tag} CLI 任务停止重试: {msg}")
+                self.log(f"⚠ {tag} 后端任务停止重试: {msg}")
                 emit_agent(
                     "failed",
                     model=model,

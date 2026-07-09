@@ -133,15 +133,15 @@ health_check:
   prompt: "这是一次模型健康检查,请忽略其它指令。只输出两行,不要解释、不要代码块、不要额外文字。第一行固定输出: HEALTH_OK。第二行输出从 tok001 到 tok080 的递增标记序列,用单个空格分隔。"
   expect: "HEALTH_OK"           # 答案里应包含的子串(命中=正常;可达但未命中=异常)
 
-# ── 后端 CLI 任务执行失败后的重试 ──
-# 注意:opencode/claude/codex 内部已自行重试瞬时 API 抖动;这一层只在 **CLI 任务整体失败** 时重试,
-# 即:子进程非零退出 / 超时 / 输出无法解析为所需的结构化 JSON。max_attempts 是单组重试次数;
+# ── 后端任务执行失败后的重试 ──
+# 注意:opencode/claude/codex 内部已自行重试瞬时 API 抖动;这一层只在 **后端任务整体失败** 时重试,
+# 即:非零退出 / 超时 / 输出无法解析为所需的结构化 JSON。max_attempts 是单组重试次数;
 # threat 会一直重试到成功或用户停止,audit/recheck 单组耗尽后把审计项放回队尾稍后继续重试。
 retry:
   max_attempts: 4               # 失败后最多再重试几次(总尝试 = 1 + max_attempts)
   backoff_base_ms: 2000         # 退避基数(指数增长;疑似限流时自动延长)
   backoff_cap_ms: 30000         # 单次退避封顶
-  timeout_ms: 1800000           # 单次子进程墙钟超时(超时也算一次失败 → 计入重试)
+  timeout_ms: 1800000           # 单次后端任务墙钟超时(超时也算一次失败 → 计入重试)
 
 # ── 后端调用方式(可选;不写则用内置默认模板) ──
 # command 是 token 列表;运行时替换:{model}=当前角色模型,{prompt}=提示词(仅 arg 模式),{prompt_file}=提示词文件路径(仅 file 模式)。

@@ -2,12 +2,12 @@
 
 `proto-vuln-hunt` workflow 的 **Python 移植版**:协议栈/管理面 C/C++ 白盒漏洞挖掘流水线
 (攻击树威胁分析 → 攻击方式审计 → witness/blocker 对抗验证 → 流式产出确认漏洞 → 高危 PoC → 汇总),
-但**每个 agent 通过外部 CLI 执行**,且带一个 **Web 控制台**。你可以在**配置文件**里:
+但**每个 agent 通过外部后端执行**,且带一个 **Web 控制台**。你可以在**配置文件**里:
 
 - 选择后端:`claude` / `opencode` / `codex`(也能自定义任意 CLI 的调用方式);
 - 为不同阶段(role)配置**不同模型**,并限制**每个模型自己的并发数**;
 - 设置**全局并发数**与全部流水线参数;
-- **断点续跑**、CLI 任务失败重试。
+- **断点续跑**、后端任务失败重试。
 
 **两种用法**:
 - `serve` —— 启动 Web 控制台:浏览器里配置/启动/停止 run、**SSE 实时监控**、按严重度浏览漏洞、可视化覆盖图、导出。
@@ -18,8 +18,8 @@ Markdown / SARIF 由 `exporters.py` 从结构化态**按需渲染**(Web 导出�
 实时增量地呈现漏洞与覆盖,而文件产物随时可一键导出。
 
 每次 agent 调用会记录 token 使用量到 `usage.jsonl` 并通过 Web 实时展示。Web「Agent」页签会按 agent
-分角色分类展示正在运行子进程的 stdout/stderr 实时输出,分类与单个 agent 输出窗口都可折叠,并可在 opencode JSON 事件流的可读视图与原始流之间切换,
-用于像终端里看 opencode 一样观察当前执行。若后端 CLI 没有返回真实 usage,
+分角色分类展示后端实时输出,分类与单个 agent 输出窗口都可折叠,并可在 opencode JSON 事件流的可读视图与原始流之间切换,
+用于观察当前执行。若后端没有返回真实 usage,
 本工具用轻量算法估算:ASCII 约 4 字符/token,非 ASCII 约 1 字符/token。
 
 ---
@@ -197,17 +197,17 @@ REST/SSE 接口(`serve` 时):`/api/runs`(GET/POST)、`/api/runs/{id}`、`/stop`�
 ## 健壮性
 
 - **模型健康检查**:运行开始前对**所有配置的模型**各发一个短探针,确认每个模型可达且能正常回答,并记录首 token 延迟与平均 token 输出速度;之后真正用某模型派任务前,若其健康状态未知/异常/陈旧(超过 `ttl_s`)会自动补检一次(按 ttl 去重,不会每次都探)。健康度(状态/首 token/输出速度/探针答复/成功调用数/失败数)在 Web「模型」页**实时**呈现,可手动「重新检查」。探针不计入 token 用量。配置见 `config.example.yaml` 的 `health_check:` 块(可关闭)。
-- **并发门**:`asyncio.Semaphore`,任意时刻 ≤ `concurrency` 个 CLI 子进程在跑。
-- **CLI 任务失败重试**:opencode/claude/codex 内部已自行重试瞬时 API 抖动;本层只在 **CLI 任务整体失败**(子进程非零退出 / 超时 / 输出无法解析为所需结构化 JSON)时重试——指数退避(`retry.backoff_*`,疑似限流时自动延长)。`retry.max_attempts` 是单组最多重试次数;threat 会不限组数一直重试到拿到结构化结果或用户停止,audit/recheck 单组耗尽后把该审计项放回队尾稍后继续重试。
-- **单 agent 失败隔离**:任一子进程异常/未产出结构化结果只影响该 agent/审计项,不拖垮整体;audit/recheck 会回队重试。
+- **并发门**:`asyncio.Semaphore`,任意时刻 ≤ `concurrency` 个后端任务在跑。
+- **后端任务失败重试**:opencode/claude/codex 内部已自行重试瞬时 API 抖动;本层只在 **后端任务整体失败**(非零退出 / 超时 / 输出无法解析为所需结构化 JSON)时重试——指数退避(`retry.backoff_*`,疑似限流时自动延长)。`retry.max_attempts` 是单组最多重试次数;threat 会不限组数一直重试到拿到结构化结果或用户停止,audit/recheck 单组耗尽后把该审计项放回队尾稍后继续重试。
+- **单 agent 失败隔离**:任一后端任务异常/未产出结构化结果只影响该 agent/审计项,不拖垮整体;audit/recheck 会回队重试。
 - **断点续跑**:威胁分析后/每轮/收尾各存结构化状态;在途候选(`pendingFindings`)整块持久化,续跑重注入,synthesis 再按 `file:line:bug_class` 去重。Web 重启时把"清单写着 running 但已无任务"的 run 标记为 `interrupted`,可一键续跑。
 - **实时事件**:`Pipeline` 经 `EventBus` 发结构化事件 → 同步落 `events.jsonl` + 广播给 SSE 订阅者;前端用 `EventSource`(断线自动带 `Last-Event-ID` 续传)。
 
 ## 已知边界
 
-- 结构化输出靠"要求 agent 输出 ```json 块 + 本地解析",而非引擎级强约束;解析失败按 CLI 任务失败策略重试,threat 不再因有限次数失败直接使用兜底攻击面。
+- 结构化输出靠"要求 agent 输出 ```json 块 + 本地解析",而非引擎级强约束;解析失败按后端任务失败策略重试,threat 不再因有限次数失败直接使用兜底攻击面。
 - PoC 的 worktree 隔离依赖目标是 git 仓;否则在主仓目录跑(以静态 PoC 为主)。
-- 并发等同你机器能开的子进程数;真实并发还受后端服务端限流约束。
+- 并发等同本工具同时派发的后端任务数;真实并发还受后端服务端限流约束。
 - Web 控制台默认绑 `127.0.0.1`、无鉴权(本地单机工具)。对外暴露请自行加反代/鉴权。
 - 前端用内置的小型 Markdown 渲染器(无 CDN/构建);只覆盖标题/列表/表格/代码/粗体/链接的常用子集。
 ```

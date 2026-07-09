@@ -696,12 +696,7 @@ class ProcessDrainTests(unittest.IsolatedAsyncioTestCase):
             with open(counter, encoding="utf-8") as f:
                 self.assertEqual(f.read(), "3")
 
-    async def test_legacy_opencode_prompt_file_config_sends_prompt_as_message(self):
-        script = (
-            "import json,sys;"
-            "print(json.dumps({'type':'text','part':{'id':'p','messageID':'m','type':'text','text':sys.argv[-1]}}))"
-        )
-        prompt = "PROMPT BODY\nsecond line with spaces\n最后一行"
+    async def test_opencode_non_serve_prompt_mode_is_rejected(self):
         with tempfile.TemporaryDirectory() as d:
             cfg = Config(
                 target=d,
@@ -710,12 +705,7 @@ class ProcessDrainTests(unittest.IsolatedAsyncioTestCase):
                 backends={
                     "opencode": BackendSpec(
                         name="opencode",
-                        command=[
-                            sys.executable,
-                            "-c",
-                            script,
-                            "请读取并执行这个审计任务文件:{prompt_file}。",
-                        ],
+                        command=[sys.executable, "-c", "print('old opencode mode')"],
                         prompt_mode="file",
                         parse="text",
                     )
@@ -723,43 +713,8 @@ class ProcessDrainTests(unittest.IsolatedAsyncioTestCase):
             )
             runner = AgentRunner(cfg, logger=lambda *_args, **_kwargs: None)
 
-            text, _usage = await runner._invoke(prompt, "unused-model", d, timeout_s=5)
-
-        self.assertEqual(text, prompt)
-
-    async def test_opencode_arg_prompt_keeps_multiline_prompt_in_single_argv(self):
-        script = (
-            "import json,sys;"
-            "payload=json.dumps({'argv':sys.argv[1:]},ensure_ascii=False);"
-            "print(json.dumps({'type':'text','part':{'id':'p','messageID':'m','type':'text','text':payload}},ensure_ascii=False))"
-        )
-        prompt = "line1\nline2 with spaces\n$(printf should-not-run) && echo no"
-        with tempfile.TemporaryDirectory() as d:
-            cfg = Config(
-                target=d,
-                out_dir=os.path.join(d, "out"),
-                backend="opencode",
-                backends={
-                    "opencode": BackendSpec(
-                        name="opencode",
-                        command=[
-                            sys.executable,
-                            "-c",
-                            script,
-                            "--model",
-                            "{model}",
-                            "{prompt}",
-                        ],
-                        prompt_mode="arg",
-                        parse="text",
-                    )
-                },
-            )
-            runner = AgentRunner(cfg, logger=lambda *_args, **_kwargs: None)
-
-            text, _usage = await runner._invoke(prompt, "unused-model", d, timeout_s=5)
-
-        self.assertEqual(json.loads(text), {"argv": ["--model", "unused-model", prompt]})
+            with self.assertRaisesRegex(RuntimeError, "prompt_mode=serve"):
+                await runner._invoke("prompt", "unused-model", d, timeout_s=5)
 
 
 class RetryModelSelectionTests(unittest.IsolatedAsyncioTestCase):
@@ -921,13 +876,13 @@ class HealthStateTests(unittest.TestCase):
         rec = runner._health_rec("unit-model")
         rec.update({"status": "ok", "checks": 1, "ok_checks": 1, "answer": "2", "error": ""})
 
-        runner._note_call("unit-model", False, "CLI 未产出可解析的结构化 JSON")
+        runner._note_call("unit-model", False, "后端未产出可解析的结构化 JSON")
 
         rec = runner.health["unit-model"]
         self.assertEqual(rec["answer"], "2")
         self.assertEqual(rec["error"], "")
         self.assertEqual(rec["status"], "degraded")
-        self.assertEqual(rec["last_call_error"], "CLI 未产出可解析的结构化 JSON")
+        self.assertEqual(rec["last_call_error"], "后端未产出可解析的结构化 JSON")
 
         runner._note_call("unit-model", True)
 

@@ -1,5 +1,5 @@
 """编排器:攻击树威胁分析 → 统一优先级调度(history / audit / recheck / 验证流水线) →
-流式产出确认漏洞 →(高危)PoC → 汇总。断点续跑 + 并发门 + CLI 任务失败重试。
+流式产出确认漏洞 →(高危)PoC → 汇总。断点续跑 + 并发门 + 后端任务失败重试。
 
 结构化为主:运行期**只写结构化态**(经 RunStore 按关注点分文件落盘:checkpoint.json /
 history.json / threat-analysis/graph.json /
@@ -1743,7 +1743,7 @@ class Pipeline:
             rec["status"] = "incomplete"
             if item.get("pass", 0) >= self.cfg.max_rounds:
                 self._retrying_past_max_rounds = True
-            self.log("本轮有 1 个审计项因 CLI/结构化输出连续失败被放回队尾,稍后继续重试")
+            self.log("本轮有 1 个审计项因后端/结构化输出连续失败被放回队尾,稍后继续重试")
         elif new_findings > 0 and item["pass"] < self.cfg.max_rounds:
             self._clear_retry_after_failure(item)
             self._refresh_enqueue_order(item)
