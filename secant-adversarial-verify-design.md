@@ -1,6 +1,6 @@
 # SecAnt Witness / Blocker 对抗验证方案
 
-本文档描述当前 SecAnt / proto-vuln-hunt 的漏洞候选验证方案。验证阶段已从“正反举证 + 多 judge 多数票”升级为“witness vs blocker 交叉验证 + 终局裁判定向补查”。
+本文档描述当前 SecAnt / proto-vuln-hunt 的漏洞候选验证方案。验证阶段采用同一验证会话中的回合制正反辩论:反方先发,正方回应,再各补一轮,最后由第三个 verify 模型裁决。
 
 核心目标不再是让多个 agent 对“真假”投票，而是回答一个可复核问题:
 
@@ -11,29 +11,47 @@
 
 ## 1. 总体流程
 
-每条候选 finding 默认经过 5 个 verify agent:
+每条候选 finding 默认经过 5 个 verify turn:
 
 ```text
 audit/recheck 产出候选
   |
-  +-> witness builder        正方:构造合法触发 witness
+  +-> O1 opponent opening      反方先发:提出 blocker / 不可满足证明 / 关键质疑 claim
   |
-  +-> blocker builder        反方:构造 blocker / 不可满足证明
+  +-> P1 proponent response    正方回应 O1 claim,构造或修正合法 witness
   |
-  +-> witness judge          裁判:质询 witness 是否满足合法域、状态、代码约束
+  +-> O2 opponent rebuttal     反方回应 P1 witness,判断 blocker 是否仍成立
   |
-  +-> blocker judge          裁判:质询 blocker 是否全局、决定性、支配相关路径
+  +-> P2 proponent closing     正方回应 O2 剩余 claim,给出最终 witness/让步/未闭合点
   |
-  +-> final adjudicator      终局裁判:定向补查 1-2 个关键缺口,输出工程决策
+  +-> A1 final adjudicator     第三个 verify 模型读取同一会话辩论,输出工程决策
 ```
 
 `verify_votes` 仍保留为兼容配置字段，但当前不再控制裁决票数量。
 
-## 2. 五类 Agent 职责
+opencode 后端会把 O1/P1/O2/P2/A1 追加到同一个 session;A1 前先压缩上下文。其它后端按相同顺序独立调用,用结构化 turn JSON 传递上下文。
 
-### 2.1 Witness Builder
+## 2. 五类 Turn 职责
 
-正方必须构造最小合法触发 witness。它需要说明:
+### 2.1 O1 Opponent Opening
+
+反方先发,优先寻找能打掉 finding 的 blocker、不可满足证明或关键 claim。它需要找:
+
+- 输入域/协议/配置/类型宽度让坏条件不可满足。
+- guard / clamp / auth / state / lock / refcount 是否支配所有相关路径。
+- sink 语义是否并不危险,或影响/输出通道不成立。
+
+blocker 必须标注作用域:
+
+```text
+global | path_local | branch_local | config_local | partial | unknown | none
+```
+
+只有覆盖所有相关合法输入或所有相关路径时才允许写 `global`。
+
+### 2.2 P1 Proponent Response
+
+正方必须逐条回应 O1 指定 claim,并构造最小合法触发 witness。它需要说明:
 
 - 攻击者能力与前置条件。
 - 输入合法域:协议字段宽度、格式语法、配置上限、枚举范围。
@@ -44,54 +62,22 @@ audit/recheck 产出候选
 
 给不出完整 witness 时必须 `witness_complete=false`，并写明缺口。
 
-### 2.2 Blocker Builder
+### 2.3 O2 Opponent Rebuttal
 
-反方必须构造 blocker 或不可满足证明。它需要找:
+反方必须回应 P1 的 witness、claim response 和新增 claim。重点核对:
 
-- 输入域/协议/配置/类型宽度让坏条件不可满足。
-- guard / clamp / auth / state / lock / refcount 是否支配所有相关路径。
-- sink 语义是否并不危险，或影响/输出通道不成立。
+- P1 是否真的解决了 O1 claim。
+- witness 是否违反输入合法域、状态约束或代码约束。
+- blocker 是否仍为 global,还是降级为 partial/unknown/none。
+- 若不能证伪,必须在 concessions 中承认 blocker 不足。
 
-blocker 必须标注作用域:
+### 2.4 P2 Proponent Closing
 
-```text
-global | path_local | branch_local | config_local | partial | unknown | none
-```
+正方必须回应 O2 剩余 claim。它可以修正 witness,也可以承认关键 claim 无法闭合。P2 是正方最终立场,后续 A1 优先读取 P2 的 witness/concessions/unresolved_claims。
 
-只有 `global` 且被复核为决定性时才能直接否决。
+### 2.5 A1 Final Adjudicator
 
-### 2.3 Witness Judge
-
-只质询 witness，不重新审计整仓。重点核对:
-
-- witness 中的输入/状态是否真的合法。
-- witness 是否经过当前代码路径可达。
-- witness 是否真的触发坏条件。
-- 引用的 `path:line` 是否支撑结论。
-
-输出:
-
-```text
-accepted | weakened | rejected | inconclusive
-```
-
-### 2.4 Blocker Judge
-
-只质询 blocker。重点核对:
-
-- blocker 是否支配所有相关路径。
-- blocker 是否覆盖所有合法输入/状态。
-- blocker 是否只是局部分支、局部配置或只打掉某个 witness。
-
-输出:
-
-```text
-global_decisive | partial | invalid | unknown_scope
-```
-
-### 2.5 Final Adjudicator
-
-终局裁判读取前四阶段结果，做一次限时定向补查，只查最影响最终决策的 1-2 个事实，然后必须输出工程决策。
+终局裁判读取同一 session 的前四轮辩论,围绕 claim ledger 收敛到工程决策。它可以继续 Read/rg 必要代码,但新增证据必须说明解决了哪个 claim 或引入了哪个关键冲突。
 
 它同时输出两层结论:
 
@@ -127,18 +113,18 @@ operational_decision: confirmed | rejected | suppressed_unproven | needs_manual_
 验证记录仍保存在 `votes[]`，但阶段名变为:
 
 ```text
-witness | blocker | witness_judge | blocker_judge | final_adjudicator
+opponent_opening | proponent_response | opponent_rebuttal | proponent_closing | final_adjudicator
 ```
 
-Web、候选 JSON、finding JSON 和 Markdown 导出都会展示 witness、blocker、裁判质询、终局补查事实和最终工程决策。
+Web、候选 JSON、finding JSON 和 Markdown 导出都会展示 witness、blocker、claim 回应/新增/让步/未闭合项、终局补查事实和最终工程决策。
 
 ## 6. 实现位置
 
 | 模块 | 职责 |
 |---|---|
-| `proto_vuln_hunt/schemas.py` | witness / blocker / review / final adjudication schema |
-| `proto_vuln_hunt/prompts.py` | 五阶段验证 prompt 与专项证明义务 |
-| `proto_vuln_hunt/pipeline.py` | 编排五阶段验证、终态保存、risk/manual/suppressed 流转 |
+| `proto_vuln_hunt/schemas.py` | witness / blocker / claim 字段 / final adjudication schema |
+| `proto_vuln_hunt/prompts.py` | O1/P1/O2/P2/A1 验证 prompt 与专项证明义务 |
+| `proto_vuln_hunt/pipeline.py` | 编排五轮同 session 辩论验证、终态保存、risk/manual/suppressed 流转 |
 | `proto_vuln_hunt/exporters.py` | Markdown 导出验证记录 |
 | `proto_vuln_hunt/web/static/app.js` | Web 展示新状态与验证详情 |
 | `proto_vuln_hunt/tests/test_pipeline_verify.py` | 单元测试覆盖确认、否决、编码质量问题、人工复核与失败重试 |

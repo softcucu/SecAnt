@@ -1,7 +1,7 @@
 # proto-vuln-hunt (python)
 
 `proto-vuln-hunt` workflow 的 **Python 移植版**:协议栈/管理面 C/C++ 白盒漏洞挖掘流水线
-(攻击树威胁分析 → 攻击方式审计 → witness/blocker 对抗验证 → 流式产出确认漏洞 → 高危 PoC → 汇总),
+(攻击树威胁分析 → 攻击方式审计 → 同 session claim 辩论验证 → 流式产出确认漏洞 → 高危 PoC → 汇总),
 但**每个 agent 通过外部后端执行**,且带一个 **Web 控制台**。你可以在**配置文件**里:
 
 - 选择后端:`claude` / `opencode` / `codex`(也能自定义任意 CLI 的调用方式);
@@ -36,7 +36,7 @@ pip install -r requirements.txt          # CLI(run)仅需 PyYAML;Web 控制台(s
 | 后端 | 非交互调用 | 模型名格式 |
 |---|---|---|
 | `claude`   | `claude -p --output-format json ...`(提示词走 stdin) | `claude-opus-4-8` / `claude-sonnet-4-6` |
-| `opencode` | `opencode serve`(长驻 server;普通 agent 新建 session,审计后威胁增量续用审计 session 并先压缩) | `anthropic/claude-sonnet-4-6`、`openai/gpt-5` |
+| `opencode` | `opencode serve`(长驻 server;普通 agent 新建 session,验证辩论同 session 续接,审计后威胁增量续用审计 session 并先压缩) | `anthropic/claude-sonnet-4-6`、`openai/gpt-5` |
 | `codex`    | `codex exec --model <m> <prompt>`                     | `gpt-5-codex` / `o3` |
 
 > claude/codex 默认以"绕过审批/全自动"模式运行(`--dangerously-skip-permissions` /
@@ -97,7 +97,7 @@ models:                               # 按 role 显式配模型;不支持 model
   history: claude-sonnet-4-6          # git 历史问题模式挖掘(每条提交一个 agent,与 high audit finder 同级调度)
   recheck: claude-sonnet-4-6
   audit:   [claude-sonnet-4-6, claude-opus-4-8]
-  verify:  claude-sonnet-4-6
+  verify:  [claude-sonnet-4-6, claude-opus-4-8, claude-sonnet-4-6]  # O/P/A:反方、正方、终局裁判
   report:  claude-sonnet-4-6
   poc:     claude-sonnet-4-6
 
@@ -146,7 +146,7 @@ backends:                             # (可选)自定义任意 CLI 的调用方
 **自定义后端**:`command` 是 token 列表,运行时把 `{model}` 替换为当前角色模型、`{prompt}` 替换为提示词
 (仅 `prompt_mode: arg` 时需要)、`{prompt_file}` 替换为提示词临时文件路径(仅 `prompt_mode: file` 时需要);
 `stdin` 模式则把提示词从标准输入喂入。`prompt_mode: serve` 为 opencode 专用,会启动一个长驻
-`opencode serve`;普通 agent 创建新 session,审计完成后的威胁增量问话会先压缩并续用对应审计 session。
+`opencode serve`;普通 agent 创建新 session,验证辩论会在同一 session 中顺序追加 O1/P1/O2/P2/A1,审计完成后的威胁增量问话会先压缩并续用对应审计 session。
 `parse` 决定如何从 stdout 取回 agent 文本
 (`claude_json` 取 JSON 的 `.result`,`text` 直接用 stdout)。
 
@@ -190,7 +190,7 @@ REST/SSE 接口(`serve` 时):`/api/runs`(GET/POST)、`/api/runs/{id}`、`/stop`�
 2. **Unified Scheduler** — 威胁分析输出的每个 `surface × method` 会变成一个 `attack_method` 审计项;history commit 分析从启动起就在统一优先级队列里,与 high audit finder 同级;recheck 最高优先级;候选验证/报告流水线高于普通审计。相同优先级按入队时间 FIFO。若队首任务所需模型容量不可用,调度器会扫描后续任务并先启动有可用模型的任务,避免模型空闲。
 3. **History Feedback** — history 提炼出的「历史问题模式」随挖随补,回灌 Web「历史问题」页签与 recheck 同类变体排查队列。
 4. **Audit + Threat Delta** — 工作队列 loop-until-dry:每个攻击树叶子 method × N finder;普通审计 prompt 只聚焦当前审计项。每个审计项完成后,系统单独询问一次威胁分析增量,将新关键资产/攻击面/攻击方式去重后合入 `threat-analysis/graph.json`,新增 method 再作为普通攻击树审计项入队;每个审计项完成即存断点。
-5. **Verify** — 逐发现运行 witness/blocker 交叉验证:正方构造合法触发 witness,反方构造 blocker/不可满足证明,两个裁判分别质询 witness 与 blocker,终局裁判做定向补查并输出 confirmed/rejected/suppressed_unproven/needs_manual_review。
+5. **Verify** — 逐发现创建一个验证会话,反方 O1 先提出 blocker/不可满足证明/关键 claim,正方 P1 回应并构造 witness,反方 O2 继续质询,正方 P2 收束;第三个 verify 模型 A1 在同一会话中裁决 confirmed/rejected/suppressed_unproven/needs_manual_review。opencode 后端会复用同一 session,终局前先压缩上下文;其它后端按顺序调用并用结构化轮次传递上下文。
 6. **Report** — 每条存活漏洞立即生成 7 段式正文,作为结构化记录进 state + 发 `finding_confirmed` 事件(SSE 流式呈现)。
 7. **PoC**(可选) — 由 `poc_components` 插拔式组件驱动;内置 `minimal_poc` 组件会在隔离 git worktree 副本里做最小化 PoC 验证(非 git/编不动则降级静态 PoC)。没有 PoC 组件时跳过该阶段。
 7. **Synthesis** — 去重 + 写汇总到 `run.json`/`state.json` + 发 `run_done`(MD/SARIF 留待导出时渲染)。

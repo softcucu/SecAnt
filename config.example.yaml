@@ -21,7 +21,10 @@ models:
   audit:                         # 攻击方式审计 finder 可用多模型轮换,分散容量/视角
     - claude-sonnet-4-6
     - claude-opus-4-8
-  verify: claude-sonnet-4-6     # 对抗验证
+  verify:                       # 对抗验证 O/P/A:反方、正方、终局裁判;少于 3 个模型时会复用可用模型
+    - claude-sonnet-4-6
+    - claude-opus-4-8
+    - claude-sonnet-4-6
   report: claude-sonnet-4-6     # 确认漏洞报告正文
   poc: claude-sonnet-4-6        # 内置 minimal_poc 组件启用时需要;无 PoC 组件时不需要
 
@@ -158,6 +161,7 @@ backends:
     parse: claude_json
   opencode:
     # 默认启动一个长驻 opencode serve;普通 agent 调用会新建 session。
+    # 验证辩论会在同一 session 中顺序追加 O1/P1/O2/P2/A1,终局前压缩上下文。
     # 审计完成后的威胁增量问话会先压缩并续用对应审计 session,保留审计上下文且避免上下文过长。
     # {hostname}/{port} 由本工具运行时填入。模型仍按 provider/model 写在 models: 里。
     command: ["opencode", "serve", "--hostname", "{hostname}", "--port", "{port}"]

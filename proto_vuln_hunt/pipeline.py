@@ -1123,6 +1123,24 @@ class Pipeline:
             out["validation_reason"] = ";".join(errs)
         return out
 
+    def _verify_debate_models(self) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        configured = [m for m in self.cfg.models_for("verify") if m]
+        if not configured:
+            return None, None, None
+        available = [m for m in configured if self.cfg.model_available_at(m)]
+        models = available or configured
+        opponent = models[0]
+        proponent = next((m for m in models[1:] if m != opponent), models[min(1, len(models) - 1)])
+        adjudicator = models[2] if len(models) >= 3 else models[0]
+        return opponent, proponent, adjudicator
+
+    @staticmethod
+    def _tag_debate_turn(raw: Optional[Dict[str, Any]], *, side: str, turn: str) -> Dict[str, Any]:
+        out = dict(raw) if isinstance(raw, dict) else {}
+        out.setdefault("side", side)
+        out.setdefault("turn", turn)
+        return out
+
     @staticmethod
     def _reset_candidate_for_retry(f: Dict[str, Any]) -> None:
         f["verify_status"] = "pending"
@@ -1170,78 +1188,93 @@ class Pipeline:
             self.dedup_keys.add(k)
 
             title = (f.get("title") or "")[:24]
-            witness_meta: Dict[str, Any] = {}
-            raw_witness = await self.runner.run(
-                self.pb.verify_witness(f, S.VERIFY_WITNESS_SCHEMA),
-                role="verify", label=f"verify-witness:{title}",
-                schema=S.VERIFY_WITNESS_SCHEMA, meta=witness_meta,
-            )
-            witness_errors = self._validate_witness(raw_witness)
-            witness_obj = raw_witness if isinstance(raw_witness, dict) else {}
-            witness_vote = self._mark_vote(raw_witness, phase="witness", focus="正方 witness",
-                                           model=witness_meta.get("model") or "",
-                                           validation_errors=witness_errors)
-            witness_vote["decision"] = "confirm" if witness_obj.get("witness_complete") else "inconclusive"
-            witness_vote["is_real"] = bool(witness_obj.get("witness_complete"))
+            opponent_model, proponent_model, adjudicator_model = self._verify_debate_models()
+            session_id = ""
+            turns: List[Dict[str, Any]] = []
 
-            blocker_meta: Dict[str, Any] = {}
-            raw_blocker = await self.runner.run(
-                self.pb.verify_blocker(f, witness_vote, S.VERIFY_BLOCKER_SCHEMA),
-                role="verify", label=f"verify-blocker:{title}",
-                schema=S.VERIFY_BLOCKER_SCHEMA, meta=blocker_meta,
+            o1_meta: Dict[str, Any] = {}
+            raw_o1 = await self.runner.run(
+                self.pb.verify_opponent_opening(f, S.VERIFY_BLOCKER_SCHEMA),
+                role="verify", label=f"verify-o1:{title}",
+                schema=S.VERIFY_BLOCKER_SCHEMA, meta=o1_meta,
+                model_override=opponent_model,
             )
-            blocker_errors = self._validate_blocker(raw_blocker)
-            blocker_obj = raw_blocker if isinstance(raw_blocker, dict) else {}
-            blocker_vote = self._mark_vote(raw_blocker, phase="blocker", focus="反方 blocker",
-                                           model=blocker_meta.get("model") or "",
-                                           validation_errors=blocker_errors)
-            blocker_vote["decision"] = "reject" if blocker_obj.get("blocker_found") else "inconclusive"
-            blocker_vote["is_real"] = False
-            votes = [witness_vote, blocker_vote]
+            session_id = str(o1_meta.get("session_id") or "")
+            o1_obj = raw_o1 if isinstance(raw_o1, dict) else {}
+            o1_vote = self._mark_vote(self._tag_debate_turn(o1_obj, side="opponent", turn="O1"),
+                                      phase="opponent_opening", focus="反方 O1",
+                                      model=o1_meta.get("model") or "",
+                                      validation_errors=self._validate_blocker(raw_o1))
+            o1_vote["decision"] = "reject" if o1_obj.get("blocker_found") else "inconclusive"
+            o1_vote["is_real"] = False
+            turns.append(o1_vote)
 
-            witness_judge_meta: Dict[str, Any] = {}
-            blocker_judge_meta: Dict[str, Any] = {}
-            raw_witness_review, raw_blocker_review = await asyncio.gather(
-                self.runner.run(
-                    self.pb.verify_witness_judge(f, witness_vote, blocker_vote, S.WITNESS_REVIEW_SCHEMA),
-                    role="verify", label=f"verify-witness-judge:{title}",
-                    schema=S.WITNESS_REVIEW_SCHEMA, meta=witness_judge_meta,
-                ),
-                self.runner.run(
-                    self.pb.verify_blocker_judge(f, witness_vote, blocker_vote, S.BLOCKER_REVIEW_SCHEMA),
-                    role="verify", label=f"verify-blocker-judge:{title}",
-                    schema=S.BLOCKER_REVIEW_SCHEMA, meta=blocker_judge_meta,
-                ),
+            p1_meta: Dict[str, Any] = {}
+            raw_p1 = await self.runner.run(
+                self.pb.verify_proponent_response(f, turns, S.VERIFY_WITNESS_SCHEMA),
+                role="verify", label=f"verify-p1:{title}",
+                schema=S.VERIFY_WITNESS_SCHEMA, meta=p1_meta,
+                session_id=session_id or None,
+                model_override=proponent_model,
             )
-            witness_review_errors = self._validate_witness_review(raw_witness_review)
-            witness_review_obj = raw_witness_review if isinstance(raw_witness_review, dict) else {}
-            witness_review_vote = self._mark_vote(raw_witness_review, phase="witness_judge",
-                                                  focus="质询 witness",
-                                                  model=witness_judge_meta.get("model") or "",
-                                                  validation_errors=witness_review_errors)
-            wv = witness_review_obj.get("witness_verdict")
-            witness_review_vote["decision"] = "confirm" if wv in ("accepted", "weakened") else ("reject" if wv == "rejected" else "inconclusive")
-            witness_review_vote["is_real"] = wv in ("accepted", "weakened")
+            if not session_id:
+                session_id = str(p1_meta.get("session_id") or "")
+            p1_obj = raw_p1 if isinstance(raw_p1, dict) else {}
+            p1_vote = self._mark_vote(self._tag_debate_turn(p1_obj, side="proponent", turn="P1"),
+                                      phase="proponent_response", focus="正方 P1",
+                                      model=p1_meta.get("model") or "",
+                                      validation_errors=self._validate_witness(raw_p1))
+            p1_vote["decision"] = "confirm" if p1_obj.get("witness_complete") else "inconclusive"
+            p1_vote["is_real"] = bool(p1_obj.get("witness_complete"))
+            turns.append(p1_vote)
 
-            blocker_review_errors = self._validate_blocker_review(raw_blocker_review)
-            blocker_review_obj = raw_blocker_review if isinstance(raw_blocker_review, dict) else {}
-            blocker_review_vote = self._mark_vote(raw_blocker_review, phase="blocker_judge",
-                                                  focus="质询 blocker",
-                                                  model=blocker_judge_meta.get("model") or "",
-                                                  validation_errors=blocker_review_errors)
-            bv = blocker_review_obj.get("blocker_verdict")
-            blocker_review_vote["decision"] = "reject" if bv == "global_decisive" else "inconclusive"
-            blocker_review_vote["is_real"] = False
-            votes.extend([witness_review_vote, blocker_review_vote])
+            o2_meta: Dict[str, Any] = {}
+            raw_o2 = await self.runner.run(
+                self.pb.verify_opponent_response(f, turns, S.VERIFY_BLOCKER_SCHEMA),
+                role="verify", label=f"verify-o2:{title}",
+                schema=S.VERIFY_BLOCKER_SCHEMA, meta=o2_meta,
+                session_id=session_id or None,
+                model_override=opponent_model,
+            )
+            if not session_id:
+                session_id = str(o2_meta.get("session_id") or "")
+            o2_obj = raw_o2 if isinstance(raw_o2, dict) else {}
+            o2_vote = self._mark_vote(self._tag_debate_turn(o2_obj, side="opponent", turn="O2"),
+                                      phase="opponent_rebuttal", focus="反方 O2",
+                                      model=o2_meta.get("model") or "",
+                                      validation_errors=self._validate_blocker(raw_o2))
+            o2_vote["decision"] = "reject" if o2_obj.get("blocker_found") else "inconclusive"
+            o2_vote["is_real"] = False
+            turns.append(o2_vote)
+
+            p2_meta: Dict[str, Any] = {}
+            raw_p2 = await self.runner.run(
+                self.pb.verify_proponent_response(f, turns, S.VERIFY_WITNESS_SCHEMA),
+                role="verify", label=f"verify-p2:{title}",
+                schema=S.VERIFY_WITNESS_SCHEMA, meta=p2_meta,
+                session_id=session_id or None,
+                model_override=proponent_model,
+            )
+            if not session_id:
+                session_id = str(p2_meta.get("session_id") or "")
+            p2_obj = raw_p2 if isinstance(raw_p2, dict) else {}
+            p2_vote = self._mark_vote(self._tag_debate_turn(p2_obj, side="proponent", turn="P2"),
+                                      phase="proponent_closing", focus="正方 P2",
+                                      model=p2_meta.get("model") or "",
+                                      validation_errors=self._validate_witness(raw_p2))
+            p2_vote["decision"] = "confirm" if p2_obj.get("witness_complete") else "inconclusive"
+            p2_vote["is_real"] = bool(p2_obj.get("witness_complete"))
+            turns.append(p2_vote)
+            votes = list(turns)
 
             final_meta: Dict[str, Any] = {}
             raw_final = await self.runner.run(
-                self.pb.verify_final_adjudicator(
-                    f, witness_vote, blocker_vote, witness_review_vote, blocker_review_vote,
-                    S.FINAL_ADJUDICATION_SCHEMA,
-                ),
+                self.pb.verify_debate_final_adjudicator(f, turns, S.FINAL_ADJUDICATION_SCHEMA),
                 role="verify", label=f"verify-final:{title}",
                 schema=S.FINAL_ADJUDICATION_SCHEMA, meta=final_meta,
+                session_id=session_id or None,
+                compact_before_prompt=bool(session_id),
+                model_override=adjudicator_model,
             )
             final_errors = self._validate_final_adjudication(raw_final)
             final_obj = raw_final if isinstance(raw_final, dict) else {}
@@ -1287,10 +1320,12 @@ class Pipeline:
                 return
 
             corrected = (final_vote.get("corrected_severity")
-                         or witness_vote.get("corrected_severity")
+                         or p2_vote.get("corrected_severity")
+                         or p1_vote.get("corrected_severity")
                          or f.get("severity"))
             corrected = most_severe([corrected]) or f.get("severity")
-            exploit = (final_vote.get("exploitability") or witness_vote.get("exploitability") or "")
+            exploit = (final_vote.get("exploitability") or p2_vote.get("exploitability")
+                       or p1_vote.get("exploitability") or "")
             self.seq += 1
             fid = f"{class_code(f.get('bug_class'))}-{pad3(self.seq)}"
             verify_models = sorted({v["model"] for v in votes if v.get("model")})

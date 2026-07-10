@@ -22,8 +22,13 @@ def _nl(s: Optional[str]) -> str:
 
 def _as_md(v: Any, empty: str = "(无)") -> str:
     """把"字符串或字符串列表"渲染为 Markdown:列表 → 逐条 bullet;字符串 → 原样。"""
+    def fmt(x: Any) -> str:
+        if isinstance(x, (dict, list)):
+            return json.dumps(x, ensure_ascii=False, sort_keys=True)
+        return str(x)
+
     if isinstance(v, (list, tuple)):
-        items = [f"- {_nl(str(x))}" for x in v if str(x).strip()]
+        items = [f"- {_nl(fmt(x))}" for x in v if fmt(x).strip()]
         return "\n".join(items) if items else empty
     return str(v) if v else empty
 
@@ -163,6 +168,18 @@ def _render_verify_votes_md(votes: List[Dict[str, Any]]) -> str:
             rows.append(f"- Witness 裁决: {v.get('witness_verdict')}\n")
         if v.get("blocker_verdict"):
             rows.append(f"- Blocker 裁决: {v.get('blocker_verdict')}\n")
+        if v.get("responded_claims"):
+            rows.append(f"- 回应的 Claim:\n{_as_md(v.get('responded_claims'))}\n")
+        if v.get("new_claims"):
+            rows.append(f"- 新增 Claim:\n{_as_md(v.get('new_claims'))}\n")
+        if v.get("concessions"):
+            rows.append(f"- 让步:\n{_as_md(v.get('concessions'))}\n")
+        if v.get("unresolved_claims"):
+            rows.append(f"- 未闭合 Claim:\n{_as_md(v.get('unresolved_claims'))}\n")
+        if v.get("accepted_claims"):
+            rows.append(f"- 采信 Claim:\n{_as_md(v.get('accepted_claims'))}\n")
+        if v.get("rejected_claims"):
+            rows.append(f"- 不采信 Claim:\n{_as_md(v.get('rejected_claims'))}\n")
         if v.get("reviewed_checks"):
             rows.append(f"- 已复核事实:\n{_as_md(v.get('reviewed_checks'))}\n")
         if v.get("failed_checks"):

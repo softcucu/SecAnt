@@ -516,6 +516,83 @@ class PromptBuilder:
             "通用证明义务:在攻击者能力、输入合法域、程序状态、代码约束的交集下,必须存在可触发坏结果的 witness。"
         )
 
+    @staticmethod
+    def _debate_turns(turns: List[Dict[str, Any]]) -> str:
+        return json.dumps(turns or [], ensure_ascii=False)
+
+    def verify_opponent_opening(self, f: Dict[str, Any], schema) -> str:
+        return (
+            f"你是漏洞验证辩论的**反方 O1(不认可漏洞方)**。当前威胁模型:{self.threat}。\n"
+            "你先发言。目标不是泛泛说误报,而是提出最可能打掉该 finding 的 blocker、不可满足证明或关键质疑 claim。"
+            "可以 Read/rg 搜索任意必要代码;所有新增证据必须绑定到当前 finding 的真伪争点。\n\n"
+            f"{self.verify_methods()}Finding:\n{self._finding_brief(f)}\n"
+            f"专项证明义务:{self._proof_obligation(f)}\n\n"
+            "请输出 blocker 字段,并额外使用这些可选字段组织辩论:\n"
+            "- side 固定为 opponent, turn 固定为 O1;\n"
+            "- new_claims:提出 O1-C1/O1-C2... 形式的 claim,说明它如何影响 finding 真伪;\n"
+            "- blocker_found/blocker_scope:若声称能否决,必须说明 scope 是否 global;\n"
+            "- evidence_refs/blocking_checks:所有关键事实必须有 path:line。\n"
+            "只有 blocker 覆盖所有相关合法输入或所有相关路径时才写 global。"
+            + must_struct(schema)
+        )
+
+    def verify_proponent_response(self, f: Dict[str, Any], turns: List[Dict[str, Any]], schema) -> str:
+        turns_s = self._debate_turns(turns)
+        turn_name = "P1" if len(turns or []) <= 1 else "P2"
+        return (
+            f"你是漏洞验证辩论的**正方 {turn_name}(认可漏洞方)**。当前威胁模型:{self.threat}。\n"
+            "本轮必须回应上一轮反方指定 claim。可以 Read/rg 搜索任意必要代码;若发现会改变结论的新关键事实,"
+            "可以新增 claim,但必须说明它如何影响当前 finding 的真伪。\n\n"
+            f"{self.verify_methods()}Finding:\n{self._finding_brief(f)}\n"
+            f"专项证明义务:{self._proof_obligation(f)}\n"
+            f"已有辩论轮次 JSON:\n```json\n{turns_s}\n```\n\n"
+            "请逐条回应上一轮 opponent 的 new_claims/unresolved_claims:\n"
+            "- side 固定为 proponent, turn 固定为当前轮次;\n"
+            "- responded_claims:对上一轮每个关键 claim 给出 accepted/refuted/weakened/unresolved/conceded 和证据;\n"
+            "- 若认为漏洞成立,必须构造或修正 witness_complete=true 的合法 witness;\n"
+            "- 若无法闭合,写 witness_complete=false,并在 concessions/unresolved_claims/missing_evidence 中说明缺口;\n"
+            "- evidence_refs/path_nodes/sink_ref 必须使用 path:line。\n"
+            "不要只表达立场,必须把攻击者能力、输入合法域、程序状态、代码约束与 bad_result 闭合。"
+            + must_struct(schema)
+        )
+
+    def verify_opponent_response(self, f: Dict[str, Any], turns: List[Dict[str, Any]], schema) -> str:
+        turns_s = self._debate_turns(turns)
+        return (
+            f"你是漏洞验证辩论的**反方 O2(不认可漏洞方)**。当前威胁模型:{self.threat}。\n"
+            "本轮必须回应上一轮正方指定 claim 和 witness。可以 Read/rg 搜索任意必要代码;若发现会改变结论的新关键事实,"
+            "可以新增 claim,但必须说明它如何影响当前 finding 的真伪。\n\n"
+            f"{self.verify_methods()}Finding:\n{self._finding_brief(f)}\n"
+            f"专项证明义务:{self._proof_obligation(f)}\n"
+            f"已有辩论轮次 JSON:\n```json\n{turns_s}\n```\n\n"
+            "请逐条回应上一轮 proponent 的 responded_claims/new_claims/witness:\n"
+            "- side 固定为 opponent, turn 固定为 O2;\n"
+            "- responded_claims:说明正方哪些回应被代码证据接受、削弱或反驳;\n"
+            "- blocker_found/blocker_scope:重新判断 blocker 是否仍成立,scope 是否 global;\n"
+            "- 若不能证伪,在 concessions 中承认 blocker 不足;\n"
+            "- 若新增 claim,使用 O2-C1/O2-C2... 并给出 path:line 证据。\n"
+            "不要只攻击一个局部 witness 后直接全局否决;global 必须覆盖所有相关合法输入或路径。"
+            + must_struct(schema)
+        )
+
+    def verify_debate_final_adjudicator(self, f: Dict[str, Any], turns: List[Dict[str, Any]], schema) -> str:
+        turns_s = self._debate_turns(turns)
+        return (
+            f"你是漏洞验证辩论的**第三方终局裁判 A1**。当前威胁模型:{self.threat}。\n"
+            "你读取同一 session 中 O1/P1/O2/P2 的辩论,必须围绕 claim ledger 收敛到一个工程决策。"
+            "可以 Read/rg 搜索任意必要代码;新增证据必须说明它解决了哪个 claim 或引入了哪个关键冲突。\n\n"
+            f"{self.verify_methods()}Finding:\n{self._finding_brief(f)}\n"
+            f"专项证明义务:{self._proof_obligation(f)}\n"
+            f"辩论轮次 JSON:\n```json\n{turns_s}\n```\n\n"
+            "决策口径:\n"
+            "- confirmed: 正方最终 witness 完整,且反方没有留下 verified global blocker;\n"
+            "- rejected: 反方 blocker 被判定为 global/decisive,或正方承认关键 claim 不可满足;\n"
+            "- suppressed_unproven: witness 不完整,blocker 也不全局,证据不足以确认或否决;系统会作为编码质量问题保留到漏洞页;\n"
+            "- needs_manual_review: high/critical 潜在影响且正反都有强证据,但你无法消解关键冲突。\n"
+            "同时输出 accepted_claims/rejected_claims/unresolved_claims、epistemic_verdict 和 operational_decision。"
+            + must_struct(schema)
+        )
+
     # ── Witness / blocker 对抗性验证:正方构造合法触发 witness ──
     def verify_witness(self, f: Dict[str, Any], schema) -> str:
         return (

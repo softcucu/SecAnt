@@ -229,6 +229,20 @@ VERIFY_WITNESS_SCHEMA = {
     "type": "object",
     "required": ["witness_complete", "evidence_refs", "reasoning"],
     "properties": {
+        "side": {"type": "string", "description": "本轮角色,建议固定为 proponent"},
+        "turn": {"type": "string", "description": "本轮编号,如 P1/P2"},
+        "responded_claims": {
+            "type": "array",
+            "items": {"type": "object"},
+            "description": "逐条回应上一轮指定 claim:claim_id、status、response、evidence_refs",
+        },
+        "new_claims": {
+            "type": "array",
+            "items": {"type": "object"},
+            "description": "本轮新增的关键 claim:claim_id、claim、impact、evidence_refs",
+        },
+        "concessions": {"type": "array", "items": {"type": "string"}, "description": "正方承认无法闭合或被削弱的点"},
+        "unresolved_claims": {"type": "array", "items": {"type": "string"}, "description": "仍未闭合的 claim_id 或缺口"},
         "witness_complete": {"type": "boolean", "description": "正方是否构造出满足攻击者能力、输入合法域、程序状态、代码约束的触发 witness"},
         "witness": {"type": "string", "description": "最小合法触发见证:输入/状态/顺序/关键值;没有完整 witness 时留空"},
         "attack_preconditions": {"type": "array", "items": {"type": "string"}, "description": "攻击者能力与前置条件,path:line + 说明优先"},
@@ -252,6 +266,20 @@ VERIFY_BLOCKER_SCHEMA = {
     "type": "object",
     "required": ["blocker_found", "blocker_scope", "evidence_refs", "reasoning"],
     "properties": {
+        "side": {"type": "string", "description": "本轮角色,建议固定为 opponent"},
+        "turn": {"type": "string", "description": "本轮编号,如 O1/O2"},
+        "responded_claims": {
+            "type": "array",
+            "items": {"type": "object"},
+            "description": "逐条回应上一轮指定 claim:claim_id、status、response、evidence_refs",
+        },
+        "new_claims": {
+            "type": "array",
+            "items": {"type": "object"},
+            "description": "本轮新增的关键 claim:claim_id、claim、impact、evidence_refs",
+        },
+        "concessions": {"type": "array", "items": {"type": "string"}, "description": "反方承认无法证伪或 blocker 被削弱的点"},
+        "unresolved_claims": {"type": "array", "items": {"type": "string"}, "description": "仍未闭合的 claim_id 或缺口"},
         "blocker_found": {"type": "boolean", "description": "反方是否找到能打掉 finding 的 blocker 或不可满足证明"},
         "blocker_scope": {"type": "string", "enum": ["global", "path_local", "branch_local", "config_local", "partial", "unknown", "none"], "description": "blocker 覆盖范围;只有 global 才能直接否决"},
         "blocker_type": {"type": "string", "description": "例如 domain_bound/guard_dominance/state_gate/type_width/not_sink/not_visible"},
@@ -301,6 +329,9 @@ FINAL_ADJUDICATION_SCHEMA = {
     "properties": {
         "epistemic_verdict": {"type": "string", "enum": ["proven_real", "proven_false", "unresolved"], "description": "证据层结论"},
         "operational_decision": {"type": "string", "enum": ["confirmed", "rejected", "suppressed_unproven", "needs_manual_review"], "description": "流水线工程决策"},
+        "accepted_claims": {"type": "array", "items": {"type": "string"}, "description": "最终采信的关键 claim_id/事实"},
+        "rejected_claims": {"type": "array", "items": {"type": "string"}, "description": "最终不采信的关键 claim_id/事实"},
+        "unresolved_claims": {"type": "array", "items": {"type": "string"}, "description": "最终仍未闭合的关键 claim_id/缺口"},
         "deciding_facts_checked": {"type": "array", "items": {"type": "string"}, "description": "第 5 agent 定向补查的 1-2 个关键事实,path:line + 说明优先"},
         "final_reason": {"type": "string", "description": "最终工程决策理由"},
         "rejection_reason": {"type": "string", "description": "operational_decision=rejected 时的非问题原因"},

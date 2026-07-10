@@ -1,6 +1,6 @@
-"""process_finding witness/blocker 对抗验证 + final failed sweep 的单元测试。
+"""process_finding 同 session claim 辩论验证 + final failed sweep 的单元测试。
 
-不触碰真实后端 CLI:用 FakeRunner 直接喂 witness/blocker/裁判/终局裁判/报告正文,
+不触碰真实后端 CLI:用 FakeRunner 直接喂 O1/P1/O2/P2/A1/报告正文,
 用临时目录里的真实 RunStore 落盘(避免再去 stub 一堆 store 方法)。
 
 运行:  python3 -m unittest proto_vuln_hunt.tests.test_pipeline_verify
@@ -27,6 +27,11 @@ class FakeRunner:
 
     async def run(self, prompt, role=None, label=None, schema=None, fallback=None, **kwargs):
         self.calls.append({"role": role, "label": label, "schema": schema, "kwargs": kwargs})
+        meta = kwargs.get("meta")
+        if isinstance(meta, dict):
+            meta["model"] = kwargs.get("model_override") or "unit-verify"
+            if role == "verify":
+                meta["session_id"] = kwargs.get("session_id") or "verify-session-1"
         if role == "verify":
             return self.verify_responses.pop(0) if self.verify_responses else None
         if role == "report":
@@ -195,11 +200,10 @@ class _PipelineTestBase(unittest.IsolatedAsyncioTestCase):
         p = Pipeline(cfg, store=RunStore(self._tmp.name).ensure(),
                      emitter=lambda etype, data, persist=True: events.append((etype, data)))
         p.runner = FakeRunner()
-        p.pb.verify_witness = lambda *a, **k: "WITNESS_PROMPT"
-        p.pb.verify_blocker = lambda *a, **k: "BLOCKER_PROMPT"
-        p.pb.verify_witness_judge = lambda *a, **k: "WITNESS_JUDGE_PROMPT"
-        p.pb.verify_blocker_judge = lambda *a, **k: "BLOCKER_JUDGE_PROMPT"
-        p.pb.verify_final_adjudicator = lambda *a, **k: "FINAL_PROMPT"
+        p.pb.verify_opponent_opening = lambda *a, **k: "O1_PROMPT"
+        p.pb.verify_proponent_response = lambda *a, **k: "P_PROMPT"
+        p.pb.verify_opponent_response = lambda *a, **k: "O2_PROMPT"
+        p.pb.verify_debate_final_adjudicator = lambda *a, **k: "FINAL_PROMPT"
         p.pb.report_body = lambda *a, **k: "REPORT_PROMPT"
         p.events = events
         return p
@@ -217,7 +221,7 @@ class TestAdversarialVerify(_PipelineTestBase):
     async def test_verified_witness_and_invalid_blocker_confirms(self):
         """witness 被接受 + blocker 无效 + 终局 confirmed → 确认为漏洞。"""
         p = self.make_pipeline(verify_votes=3)
-        p.runner.verify_responses = [_witness(), _blocker(False), _witness_review("accepted"), _blocker_review("invalid"), _final("confirmed")]
+        p.runner.verify_responses = [_blocker(False), _witness(), _blocker(False), _witness(), _final("confirmed")]
         f = _finding()
         await p.process_finding(f)
 
@@ -230,7 +234,7 @@ class TestAdversarialVerify(_PipelineTestBase):
         self.assertEqual(cands[0]["status"], "confirmed")
         self.assertEqual(cands[0]["id"], "MEM-001")
         self.assertEqual(len(p.confirmed[0]["votes"]), 5)
-        self.assertTrue(any(v.get("phase") == "witness" for v in p.confirmed[0]["votes"]))
+        self.assertTrue(any(v.get("phase") == "proponent_closing" for v in p.confirmed[0]["votes"]))
 
     async def test_no_poc_components_skip_poc_for_high_finding(self):
         """enable_poc=true 但组件列表为空时,高危确认项不派 PoC agent。"""
@@ -239,7 +243,7 @@ class TestAdversarialVerify(_PipelineTestBase):
             poc_components=[],
             models={"threat": ["m"], "audit": ["m"], "verify": ["m"], "report": ["m"]},
         )
-        p.runner.verify_responses = [_witness(), _blocker(False), _witness_review("accepted"), _blocker_review("invalid"), _final("confirmed")]
+        p.runner.verify_responses = [_blocker(False), _witness(), _blocker(False), _witness(), _final("confirmed")]
         await p.process_finding(_finding())
 
         self.assertEqual(len(p.confirmed), 1)
@@ -247,14 +251,44 @@ class TestAdversarialVerify(_PipelineTestBase):
         self.assertNotIn("poc", [c["role"] for c in p.runner.calls])
         self.assertNotIn(EV.POC_DONE, self._event_types(p))
 
+    async def test_debate_uses_configured_models_and_one_session(self):
+        """O/P/A 按三个 verify 模型发言,后续轮次复用 O1 session,终局前压缩。"""
+        p = self.make_pipeline(
+            models={
+                "threat": ["threat-m"],
+                "audit": ["audit-m"],
+                "verify": ["opp-m", "prop-m", "judge-m"],
+                "report": ["report-m"],
+            },
+        )
+        p.runner.verify_responses = [_blocker(False), _witness(), _blocker(False), _witness(), _final("confirmed")]
+
+        await p.process_finding(_finding())
+
+        verify_calls = [c for c in p.runner.calls if c["role"] == "verify"]
+        self.assertEqual(
+            [c["kwargs"].get("model_override") for c in verify_calls],
+            ["opp-m", "prop-m", "opp-m", "prop-m", "judge-m"],
+        )
+        self.assertEqual(
+            [c["kwargs"].get("session_id") for c in verify_calls],
+            [None, "verify-session-1", "verify-session-1", "verify-session-1", "verify-session-1"],
+        )
+        self.assertFalse(verify_calls[1]["kwargs"].get("compact_before_prompt", False))
+        self.assertTrue(verify_calls[4]["kwargs"].get("compact_before_prompt"))
+        self.assertEqual(
+            [v.get("model") for v in p.confirmed[0]["votes"]],
+            ["opp-m", "prop-m", "opp-m", "prop-m", "judge-m"],
+        )
+
     async def test_global_blocker_rejects(self):
         """global blocker 被终局确认 → 标记 rejected,不入 confirmed。"""
         p = self.make_pipeline(verify_votes=3)
         p.runner.verify_responses = [
+            _blocker(True, "global"),
             _witness(False),
             _blocker(True, "global"),
-            _witness_review("rejected"),
-            _blocker_review("global_decisive"),
+            _witness(False),
             _final("rejected"),
         ]
         f = _finding(description="候选声称长度可控导致溢出", source_to_sink="recv len -> copy")
@@ -269,7 +303,7 @@ class TestAdversarialVerify(_PipelineTestBase):
         self.assertEqual(payload["description"], "候选声称长度可控导致溢出")
         self.assertEqual(payload["source_to_sink"], "recv len -> copy")
         self.assertEqual(len(payload["votes"]), 5)
-        self.assertEqual(payload["votes"][2]["phase"], "witness_judge")
+        self.assertEqual(payload["votes"][2]["phase"], "opponent_rebuttal")
         self.assertIn("入口已把长度夹紧", payload["rejection_reason"])
         cands = p.store.load_candidates()
         self.assertEqual(len(cands), 1)
@@ -279,10 +313,10 @@ class TestAdversarialVerify(_PipelineTestBase):
         """witness 不完整 + blocker 不决定性 + 终局压制 → 漏洞页质量问题条目。"""
         p = self.make_pipeline(verify_votes=3)
         p.runner.verify_responses = [
+            _blocker(True, "partial"),
             _witness(False),
             _blocker(True, "partial"),
-            _witness_review("inconclusive"),
-            _blocker_review("partial"),
+            _witness(False),
             _final("suppressed_unproven"),
         ]
         f = _finding()
@@ -311,10 +345,10 @@ class TestAdversarialVerify(_PipelineTestBase):
         """高危冲突无法闭合 → 漏洞页质量问题条目,候选保持 needs_manual_review。"""
         p = self.make_pipeline(verify_votes=3)
         p.runner.verify_responses = [
+            _blocker(True, "unknown"),
             _witness(),
             _blocker(True, "unknown"),
-            _witness_review("accepted"),
-            _blocker_review("unknown_scope"),
+            _witness(),
             _final("needs_manual_review"),
         ]
         f = _finding()
@@ -342,13 +376,13 @@ class TestAdversarialVerify(_PipelineTestBase):
         p.cfg.retry.max_attempts = 1   # 总共允许 1 次失败回队,第 2 次失败即终态
         f = _finding()
 
-        p.runner.verify_responses = [_witness(), _blocker(False), _witness_review("accepted"), _blocker_review("invalid"), None]
+        p.runner.verify_responses = [_blocker(False), _witness(), _blocker(False), _witness(), None]
         await p.process_finding(f)                        # 第 1 次:回队
         self.assertEqual(f["verify_status"], "pending")
         self.assertEqual(f["verify_attempts"], 1)
         self.assertNotIn(EV.CANDIDATE_FAILED, self._event_types(p))
 
-        p.runner.verify_responses = [_witness(), _blocker(False), _witness_review("accepted"), _blocker_review("invalid"), None]
+        p.runner.verify_responses = [_blocker(False), _witness(), _blocker(False), _witness(), None]
         await p.process_finding(f)                        # 第 2 次:超限 → verify_failed
         self.assertEqual(f["verify_status"], "verify_failed")
         self.assertEqual(f["verify_attempts"], 2)
@@ -361,7 +395,7 @@ class TestAdversarialVerify(_PipelineTestBase):
         """final sweep 模式:一次额外机会,失败即终态 verify_failed(不再回队重试)。"""
         p = self.make_pipeline(verify_votes=2)
         p._in_final_failed_sweep = True
-        p.runner.verify_responses = [_witness(), _blocker(False), _witness_review("accepted"), _blocker_review("invalid"), None]
+        p.runner.verify_responses = [_blocker(False), _witness(), _blocker(False), _witness(), None]
         f = _finding()
         await p.process_finding(f)
 

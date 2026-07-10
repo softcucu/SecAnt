@@ -1105,7 +1105,7 @@ function viewDashboard(runId) {
   function detailList(label, values) {
     const arr = Array.isArray(values) ? values.filter(Boolean) : (values ? [values] : []);
     if (!arr.length) return null;
-    return detailLine(label, arr.map(x => "- " + x).join("\n"), true);
+    return detailLine(label, arr.map(x => "- " + (typeof x === "object" ? JSON.stringify(x, null, 2) : x)).join("\n"), true);
   }
   function detailLine(label, value, asMd = false) {
     if (value === undefined || value === null || value === "") return null;
@@ -1119,7 +1119,8 @@ function viewDashboard(runId) {
     const isReal = decision === "confirm";
     const phaseLabel = {
       witness: "正方 witness", blocker: "反方 blocker", witness_judge: "质询 witness",
-      blocker_judge: "质询 blocker", final_adjudicator: "终局裁判"
+      blocker_judge: "质询 blocker", opponent_opening: "反方 O1", proponent_response: "正方 P1",
+      opponent_rebuttal: "反方 O2", proponent_closing: "正方 P2", final_adjudicator: "终局裁判"
     }[v.phase] || "";
     const op = v.operational_decision || "";
     const label = invalid ? "无效证据"
@@ -1148,6 +1149,12 @@ function viewDashboard(runId) {
       detailList("阻断点", v.blocking_checks),
       detailLine("Witness 裁决", v.witness_verdict),
       detailLine("Blocker 裁决", v.blocker_verdict),
+      detailList("回应的 Claim", v.responded_claims),
+      detailList("新增 Claim", v.new_claims),
+      detailList("让步", v.concessions),
+      detailList("未闭合 Claim", v.unresolved_claims),
+      detailList("采信 Claim", v.accepted_claims),
+      detailList("不采信 Claim", v.rejected_claims),
       detailList("已复核事实", v.reviewed_checks),
       detailList("失败/削弱点", v.failed_checks),
       detailList("终局补查事实", v.deciding_facts_checked),

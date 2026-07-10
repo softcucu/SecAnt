@@ -1465,6 +1465,18 @@ class AgentRunner:
             return fallback
         return ""
 
+    def _ready_specific_model(self, model: str) -> str:
+        """返回指定模型是否当前可派发。
+
+        用于需要固定模型身份的顺序对抗验证:仍尊重模型时间窗和 per-model 并发,
+        但不参与 role 轮询。
+        """
+        if not model or not self.cfg.model_available_at(model):
+            return ""
+        if self._sem_capacity(self._model_semaphore(model)) <= 0:
+            return ""
+        return model
+
     def role_has_capacity(self, role: str, *, use_global_gate: bool = True) -> bool:
         """供上层优先级调度器做非阻塞容量判断。
 
@@ -1498,6 +1510,7 @@ class AgentRunner:
         use_global_gate: bool,
         should_stop: Optional[Callable[[], bool]],
         avoid_model: Optional[str] = None,
+        model_override: Optional[str] = None,
     ) -> tuple[str, bool]:
         """同时取得全局名额和一个可用模型名额。
 
@@ -1517,7 +1530,10 @@ class AgentRunner:
                 await global_sem.acquire()
                 acquired_global = True
 
-            model = self._ready_model(role, advance=True, avoid_model=avoid_model)
+            if model_override:
+                model = self._ready_specific_model(model_override)
+            else:
+                model = self._ready_model(role, advance=True, avoid_model=avoid_model)
             if model:
                 await self._model_semaphore(model).acquire()
                 return model, acquired_global
@@ -1993,6 +2009,7 @@ class AgentRunner:
         meta: Optional[Dict[str, Any]] = None,
         session_id: Optional[str] = None,
         compact_before_prompt: bool = False,
+        model_override: Optional[str] = None,
     ) -> Any:
         """schema 非空 → 返回解析后的 dict/list;schema 为空 → 返回 agent 最终文本。
         meta(可选,传入一个 dict)在成功返回前回填 {"model", "attempt"},供上层把模型归因到结果。
@@ -2031,6 +2048,17 @@ class AgentRunner:
                 error=msg,
             )
             return fallback
+        forced_model = (model_override or "").strip()
+        if forced_model and forced_model not in self.cfg.models_for(role):
+            msg = f"指定模型 {forced_model} 未配置在角色 {role}"
+            self.log(f"⚠ {tag} 后端任务无法启动: {msg}")
+            emit_agent(
+                "failed",
+                attempt=0,
+                duration_ms=int((time.time() - agent_started) * 1000),
+                error=msg,
+            )
+            return fallback
 
         async def retry_sleep(wait_ms: int) -> bool:
             if should_stop is None:
@@ -2058,7 +2086,10 @@ class AgentRunner:
                     error=msg,
                 )
                 return fallback
-            health_model = self._ready_model(role, advance=False, avoid_model=last_failed_model)
+            if forced_model:
+                health_model = self._ready_specific_model(forced_model)
+            else:
+                health_model = self._ready_model(role, advance=False, avoid_model=last_failed_model)
             while not health_model:
                 if not await self._wait_capacity_tick(should_stop):
                     msg = "用户请求停止"
@@ -2070,13 +2101,17 @@ class AgentRunner:
                         error=msg,
                     )
                     return fallback
-                health_model = self._ready_model(role, advance=False, avoid_model=last_failed_model)
+                if forced_model:
+                    health_model = self._ready_specific_model(forced_model)
+                else:
+                    health_model = self._ready_model(role, advance=False, avoid_model=last_failed_model)
             await self.ensure_healthy(health_model)   # gate:调用前按需补一次健康探针(ttl 去重,不阻断)
             model, acquired_global = await self._acquire_run_capacity(
                 role,
                 use_global_gate=use_global_gate,
                 should_stop=should_stop,
                 avoid_model=last_failed_model,
+                model_override=forced_model,
             )
             if not model:
                 msg = "用户请求停止"

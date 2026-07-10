@@ -62,8 +62,9 @@ DEFAULT_BACKENDS: Dict[str, Dict[str, Any]] = {
     },
     "opencode": {
         # 模型格式需为 provider/model(如 anthropic/claude-sonnet-4-6)。
-        # 默认使用一个长驻 `opencode serve` 进程;普通 agent 调用在该 server 内创建一个全新的 session,
-        # 审计完成后的威胁增量问话会先压缩并续用对应审计 session。
+        # 默认使用一个长驻 `opencode serve` 进程;普通 agent 调用在该 server 内创建一个全新的 session。
+        # 验证辩论会在同一 session 中顺序追加 O1/P1/O2/P2/A1,终局前压缩上下文;
+        # 审计完成后的威胁增量问话也会先压缩并续用对应审计 session。
         # 避免为成千上万个 agent 反复启动 opencode 进程和重复冷启动项目状态。
         "command": [
             "opencode", "serve",
