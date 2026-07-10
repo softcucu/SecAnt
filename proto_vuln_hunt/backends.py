@@ -846,7 +846,9 @@ class _ProbeOutputTiming:
 class _OpencodeServeClient:
     """One long-lived `opencode serve` process for an AgentRunner.
 
-    Each agent call creates a fresh opencode session and submits one prompt to it.
+    Agent calls normally create a fresh opencode session and submit one prompt to
+    it.  Some follow-up tasks can continue a previous session; before doing so we
+    can ask opencode to summarize/compact that session to keep context bounded.
     The final session messages are converted back into opencode-like JSONL events,
     so the existing parser and Web output viewer keep working.
     """
@@ -1036,6 +1038,32 @@ class _OpencodeServeClient:
         )
         return message_id
 
+    async def _summarize_session(self, session_id: str, cwd: str, model: str) -> bool:
+        model_ref = self._model_ref(model)
+        try:
+            obj = await self._request_json_async(
+                "POST",
+                f"/session/{urllib.parse.quote(session_id, safe='')}/summarize",
+                query={"directory": cwd},
+                body={**model_ref, "auto": True},
+                timeout=120.0,
+            )
+            await self._wait_idle(session_id, cwd, 120.0)
+            return bool(obj) or obj is None
+        except Exception as first:
+            try:
+                await self._request_json_async(
+                    "POST",
+                    f"/api/session/{urllib.parse.quote(session_id, safe='')}/compact",
+                    query={"directory": cwd},
+                    timeout=120.0,
+                )
+                await self._wait_idle(session_id, cwd, 120.0)
+                return True
+            except Exception:
+                self.runner.log(f"⚠ opencode session 压缩失败,继续直接追加问话: {str(first)[:140]}")
+                return False
+
     async def _abort(self, session_id: str, cwd: str) -> None:
         try:
             await self._request_json_async(
@@ -1109,10 +1137,20 @@ class _OpencodeServeClient:
         timeout_s: float,
         on_output: Optional[Callable[[str, str], None]] = None,
         label: str = "",
-    ) -> Tuple[str, Optional[Dict[str, int]]]:
+        session_id: Optional[str] = None,
+        compact_before_prompt: bool = False,
+    ) -> Tuple[str, Optional[Dict[str, int]], Dict[str, Any]]:
         await self.ensure_started(cwd)
-        session_id = await self._create_session(cwd, label)
+        created = False
+        if session_id:
+            session_id = str(session_id)
+        else:
+            session_id = await self._create_session(cwd, label)
+            created = True
         try:
+            compacted = False
+            if compact_before_prompt and not created:
+                compacted = await self._summarize_session(session_id, cwd, model)
             await self._send_prompt(session_id, cwd, prompt, model)
             await self._wait_idle(session_id, cwd, timeout_s)
             messages = await self._messages(session_id, cwd)
@@ -1132,7 +1170,11 @@ class _OpencodeServeClient:
             text, oc_usage, _sid = oc
             usage = oc_usage or usage
             if text.strip():
-                return strip_ansi(text), usage
+                return strip_ansi(text), usage, {
+                    "session_id": session_id,
+                    "session_created": created,
+                    "session_compacted": compacted,
+                }
         logs = "\n".join(self._logs[-20:])
         raise BackendOutputError(
             "opencode serve session 未产生最终 assistant 文本",
@@ -1653,21 +1695,29 @@ class AgentRunner:
     async def _invoke(self, prompt: str, model: str, cwd: str,
                       timeout_s: Optional[float] = None,
                       on_output: Optional[Callable[[str, str], None]] = None,
-                      label: str = "") -> Tuple[str, Optional[Dict[str, int]]]:
+                      label: str = "",
+                      invocation_meta: Optional[Dict[str, Any]] = None,
+                      session_id: Optional[str] = None,
+                      compact_before_prompt: bool = False) -> Tuple[str, Optional[Dict[str, int]]]:
         if self.cfg.backend == "opencode" and self.spec.prompt_mode == "serve":
             if timeout_s is None:
                 timeout_s = max(1, self.cfg.retry.timeout_ms / 1000.0)
             if self._opencode_serve is None:
                 self._opencode_serve = _OpencodeServeClient(self)
             try:
-                return await self._opencode_serve.invoke(
+                text, usage, oc_meta = await self._opencode_serve.invoke(
                     prompt,
                     model,
                     cwd,
                     timeout_s,
                     on_output=on_output,
                     label=label or model,
+                    session_id=session_id,
+                    compact_before_prompt=compact_before_prompt,
                 )
+                if invocation_meta is not None:
+                    invocation_meta.update(oc_meta or {})
+                return text, usage
             finally:
                 self._reap_opencode_artifacts()
         if self.cfg.backend == "opencode":
@@ -1941,6 +1991,8 @@ class AgentRunner:
         retry_forever: bool = False,
         should_stop: Optional[Callable[[], bool]] = None,
         meta: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        compact_before_prompt: bool = False,
     ) -> Any:
         """schema 非空 → 返回解析后的 dict/list;schema 为空 → 返回 agent 最终文本。
         meta(可选,传入一个 dict)在成功返回前回填 {"model", "attempt"},供上层把模型归因到结果。
@@ -2044,13 +2096,20 @@ class AgentRunner:
                 emit_agent("output", model=model, attempt=attempt_no, stream=stream, chunk=chunk)
 
             try:
-                text, usage = await self._invoke(prompt, model, run_cwd, on_output=on_output, label=tag)
+                invocation_meta: Dict[str, Any] = {}
+                text, usage = await self._invoke(
+                    prompt, model, run_cwd, on_output=on_output, label=tag,
+                    invocation_meta=invocation_meta,
+                    session_id=session_id,
+                    compact_before_prompt=compact_before_prompt,
+                )
                 self._record_usage(prompt, text, role=role, label=tag, model=model,
                                    attempt=attempt_no, backend_usage=usage)
                 self._note_call(model, True)
                 if meta is not None:
                     meta["model"] = model
                     meta["attempt"] = attempt_no
+                    meta.update(invocation_meta)
                 if schema is None:
                     emit_agent(
                         "done",

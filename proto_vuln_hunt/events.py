@@ -14,19 +14,19 @@ from typing import Any, Callable, Dict, List, Optional
 RUN_STATUS = "run_status"          # {status}
 LOG = "log"                        # {level, message}
 THREAT_ANALYSIS_DONE = "threat_analysis_done"  # {assets, trees, surfaces, methods, audit_items, warnings}
-THREAT_NODE_UPSERTED = "threat_node_upserted"  # future incremental attack-tree node update
-HISTORY_ADDED = "history_added"    # {pattern, source, lens_hint, files, total}(git 历史挖掘随挖随补)
+THREAT_NODE_UPSERTED = "threat_node_upserted"  # incremental attack-tree merge from post-audit threat delta
+HISTORY_ADDED = "history_added"    # {pattern, source, files, total}(git 历史挖掘随挖随补)
 ROUND_START = "round_start"        # {round}
-ROUND_DONE = "round_done"          # {round, new_findings, new_surfaces, queue_len, dry_streak, risks}
-CANDIDATE_FOUND = "candidate_found"    # {key, title, bug_class, file, line, lens, severity, function, description, source_to_sink, ...}
+ROUND_DONE = "round_done"          # {round, new_findings, new_surfaces(legacy), queue_len, dry_streak, risks}
+CANDIDATE_FOUND = "candidate_found"    # {key, title, bug_class, file, line, audit_unit, severity, function, description, source_to_sink, ...}
 FINDING_CONFIRMED = "finding_confirmed"  # {finding ...}
 FINDING_ADDED = "finding_added"      # {finding ...; not necessarily proven_real, see finding_status/tags}
 FINDING_REJECTED = "finding_rejected"    # {candidate fields..., votes, rejection_reason}
 CANDIDATE_FAILED = "candidate_failed"    # {key, title, reason, attempts}
 CANDIDATE_DECIDED = "candidate_decided"  # {candidate fields..., status=suppressed_unproven|needs_manual_review, votes}
-SURFACE_ADDED = "surface_added"    # {name, why, files, lens_hint, round, from}
+SURFACE_ADDED = "surface_added"    # legacy event from older runs
 RISK_ADDED = "risk_added"          # 旧事件名;即时风险种子不再作为独立风险登记发送
-RECHECK_ENQUEUED = "recheck_enqueued"  # {kind: variant|risk, id?, pattern?, area?, severity_hint?, lens_hint?}
+RECHECK_ENQUEUED = "recheck_enqueued"  # {kind: variant|risk, id?, pattern?, area?, severity_hint?}
 RECHECK_DONE = "recheck_done"      # {kind, id?, label, new_candidates}
 RISK_SEVERITY_CHANGED = "risk_severity_changed"  # {id, severity_hint, old, action: enqueued|dequeued|none}
 POC_DONE = "poc_done"              # {id, compiled, triggered}

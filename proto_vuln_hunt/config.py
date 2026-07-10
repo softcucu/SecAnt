@@ -28,8 +28,6 @@ except Exception:  # pragma: no cover
 # 这是项目自带的副本,不依赖任何外部目录;用户仍可在配置里用 methods_dir 覆盖。
 BUNDLED_METHODS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "methods")
 
-# 审计 lens(9 类)
-ALL_LENSES = ["memory", "integer", "race", "injection", "authn", "crypto", "dos", "infoleak", "resource-realtime"]
 RUN_MODE_FULL = "full"
 RUN_MODES = [RUN_MODE_FULL]
 
@@ -64,7 +62,8 @@ DEFAULT_BACKENDS: Dict[str, Dict[str, Any]] = {
     },
     "opencode": {
         # 模型格式需为 provider/model(如 anthropic/claude-sonnet-4-6)。
-        # 默认使用一个长驻 `opencode serve` 进程;每个 agent 调用在该 server 内创建一个全新的 session,
+        # 默认使用一个长驻 `opencode serve` 进程;普通 agent 调用在该 server 内创建一个全新的 session,
+        # 审计完成后的威胁增量问话会先压缩并续用对应审计 session。
         # 避免为成千上万个 agent 反复启动 opencode 进程和重复冷启动项目状态。
         "command": [
             "opencode", "serve",
@@ -195,7 +194,7 @@ class Config:
     # 流水线参数(对齐 proto-vuln-hunt)
     run_mode: str = RUN_MODE_FULL
     history_import_from: str = ""           # 可选:从既有 run 目录或 history.json 导入历史问题模式,跳过 commit 分析
-    finders_per_lens: int = 2
+    finders_per_item: int = 2
     dry_rounds: int = 2
     max_rounds: int = 6
     verify_votes: int = 3
@@ -203,7 +202,6 @@ class Config:
     enable_poc: bool = True
     # PoC 组件列表。默认 minimal_poc 组件保留旧行为;设为 [] 时即使 enable_poc=true 也不会执行 PoC。
     poc_components: List[Dict[str, Any]] = field(default_factory=lambda: [dict(x) for x in DEFAULT_POC_COMPONENTS])
-    lenses: List[str] = field(default_factory=lambda: list(ALL_LENSES))
     # 方法库 / 断点(默认用项目自带的 methods/;可在配置里覆盖为自定义目录)
     methods_dir: str = BUNDLED_METHODS_DIR
     resume: bool = True
@@ -231,9 +229,8 @@ class Config:
         if not self.checkpoint_path:
             self.checkpoint_path = f"{self.out_dir}/checkpoint.json"
         self.threat_model = self.threat_model if self.threat_model in ("REMOTE", "LOCAL_UNPRIVILEGED", "BOTH") else "REMOTE"
-        self.lenses = [l for l in (self.lenses or []) if l in ALL_LENSES] or list(ALL_LENSES)
         self.concurrency = max(1, int(self.concurrency))
-        self.finders_per_lens = max(1, int(self.finders_per_lens))
+        self.finders_per_item = max(1, int(self.finders_per_item))
         self.dry_rounds = max(1, int(self.dry_rounds))
         self.max_rounds = max(1, int(self.max_rounds))
         self.verify_votes = max(1, int(self.verify_votes))

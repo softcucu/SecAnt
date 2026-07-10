@@ -65,7 +65,7 @@ artifact_retain: 10
 
 # ── 流水线参数(全部可选,下面是默认值) ──
 params:
-  finders_per_lens: 2           # 每个攻击面每个 lens 每轮派几个 finder
+  finders_per_item: 2           # 每个审计项每轮派几个 finder
   dry_rounds: 2                 # 连续几轮无新增即收敛
   max_rounds: 6                 # 审计循环硬上限
   verify_votes: 3               # witness/blocker 交叉验证的投票规模
@@ -76,7 +76,6 @@ params:
   poc_components:               # 插拔式 PoC 组件;设为 [] 表示不做 PoC 验证
     - type: minimal_poc         # 内置组件:隔离 worktree 中做最小化 PoC 验证
       min_severity: high        # 默认只对 high/critical 运行
-  lenses: [memory, integer, race, injection, authn, crypto, dos, infoleak, resource-realtime]
 
 # ── git 历史问题模式挖掘(统一调度队列中与 high audit finder 同级) ──
 # 遍历 git log 的提交,**每条提交派 1 个 agent**(role=history)读其改动,
@@ -158,7 +157,8 @@ backends:
     prompt_mode: stdin
     parse: claude_json
   opencode:
-    # 默认启动一个长驻 opencode serve;每个 agent 调用都会在该 server 内新建一个 session。
+    # 默认启动一个长驻 opencode serve;普通 agent 调用会新建 session。
+    # 审计完成后的威胁增量问话会先压缩并续用对应审计 session,保留审计上下文且避免上下文过长。
     # {hostname}/{port} 由本工具运行时填入。模型仍按 provider/model 写在 models: 里。
     command: ["opencode", "serve", "--hostname", "{hostname}", "--port", "{port}"]
     prompt_mode: serve

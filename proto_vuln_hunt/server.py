@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 from . import exporters
 from . import events as EV
 from .common import finalize_findings, slim_finding
-from .config import ALL_LENSES, DEFAULT_BACKENDS, ROLES, Config, load_config
+from .config import DEFAULT_BACKENDS, ROLES, Config, load_config
 from .events import EventBus
 from .store import (RunRegistry, RunStore, STATUS_INTERRUPTED, STATUS_QUEUED, STATUS_RUNNING)
 
@@ -25,8 +25,8 @@ _DASHBOARD_USAGE_LIMIT = 80
 
 # 允许从 Web 表单覆盖的 Config 字段(白名单,防注入任意字段)
 _RUN_FIELDS = {
-    "target", "scope", "backend", "concurrency", "history_import_from", "threat_model", "lenses",
-    "finders_per_lens", "max_rounds", "dry_rounds", "verify_votes",
+    "target", "scope", "backend", "concurrency", "history_import_from", "threat_model",
+    "finders_per_item", "max_rounds", "dry_rounds", "verify_votes",
     "enable_poc", "poc_components", "methods_dir", "models", "model_concurrency", "model_time_windows", "resume", "fresh",
 }
 
@@ -54,8 +54,6 @@ def _meta_from_manifest(m: Dict[str, Any]) -> Dict[str, Any]:
 def build_run_config(base: Config, payload: Dict[str, Any]) -> Config:
     """以服务端基础配置为模板,套用 Web 表单的白名单覆盖,生成一次 run 的 Config。"""
     overrides = {k: v for k, v in (payload or {}).items() if k in _RUN_FIELDS and v is not None}
-    if "lenses" in overrides:
-        overrides["lenses"] = [l for l in overrides["lenses"] if l in ALL_LENSES] or list(base.lenses)
     if "models" in overrides and not isinstance(overrides["models"], dict):
         overrides.pop("models")
     if "model_concurrency" in overrides and not isinstance(overrides["model_concurrency"], dict):
@@ -235,7 +233,7 @@ def _candidate_key(d: Dict[str, Any]) -> str:
 
 def _merge_candidate(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
     fields = [
-        "title", "bug_class", "file", "line", "lens", "severity", "function", "description",
+        "title", "bug_class", "file", "line", "audit_unit", "severity", "function", "description",
         "source_to_sink", "variant_of", "confidence", "audit_model", "good_validation_ref",
         "risk_id", "risk_area",
         "attack_context",
@@ -387,14 +385,14 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
     async def meta():
         return {
             "backends": sorted(set(list(DEFAULT_BACKENDS) + list(cfg.backends))),
-            "lenses": ALL_LENSES, "roles": ROLES,
+            "roles": ROLES,
             "defaults": {
                 "backend": cfg.backend, "concurrency": cfg.concurrency, "models": cfg.models,
                 "run_mode": cfg.run_mode, "history_import_from": cfg.history_import_from,
                 "model_concurrency": cfg.model_concurrency,
                 "model_time_windows": cfg.model_time_windows,
-                "threat_model": cfg.threat_model, "lenses": cfg.lenses,
-                "finders_per_lens": cfg.finders_per_lens, "max_rounds": cfg.max_rounds,
+                "threat_model": cfg.threat_model,
+                "finders_per_item": cfg.finders_per_item, "max_rounds": cfg.max_rounds,
                 "dry_rounds": cfg.dry_rounds, "verify_votes": cfg.verify_votes,
                 "enable_poc": cfg.enable_poc,
                 "poc_components": cfg.poc_components,
@@ -543,8 +541,6 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
     async def reconfigure_run(run_id: str, req: Request):
         _store_or_404(run_id)
         body = await req.json()
-        if "lenses" in body:  # 防御:本接口只接受模型/并发,其它字段忽略
-            body.pop("lenses", None)
         snapshot = manager.reconfigure(run_id, body or {})
         if snapshot is None:
             raise HTTPException(400, "无可应用的配置(仅支持 models / model_concurrency / model_time_windows / concurrency)")

@@ -100,6 +100,10 @@ THREAT_ANALYSIS_SCHEMA = {
     },
 }
 
+# 审计项完成后的威胁分析增量识别。结构沿用完整威胁分析 schema,但提示词要求只输出
+# 当前审计过程中新增且尚未在攻击树中存在的资产/攻击树/代码路径;没有新增时三个数组均为空。
+THREAT_DELTA_SCHEMA = THREAT_ANALYSIS_SCHEMA
+
 FINDINGS_SCHEMA = {
     "type": "object",
     "required": ["findings"],
@@ -121,20 +125,6 @@ FINDINGS_SCHEMA = {
                     "good_validation_ref": {"type": "string", "description": "若本 finding 由即时风险种子(某被调点/危险原语 B 的安全依赖调用方校验)复查命中:填全仓里**对同一 B 把校验做对了的另一处调用站点** path:line + 一句话说明,作为正面对照(说明正确的不变量该在哪、怎么校验)"},
                     "severity": {"type": "string", "enum": ["critical", "high", "medium", "low", "info"]},
                     "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
-                },
-            },
-        },
-        "new_surfaces": {
-            "type": "array",
-            "description": "审计中新发现、值得另派 agent 深挖的攻击面/可疑数据流",
-            "items": {
-                "type": "object",
-                "required": ["name", "why"],
-                "properties": {
-                    "name": {"type": "string"},
-                    "why": {"type": "string"},
-                    "files": {"type": "array", "items": {"type": "string"}},
-                    "lens_hint": {"type": "string", "enum": ["memory", "integer", "race", "injection", "authn", "crypto", "dos", "infoleak", "resource-realtime"]},
                 },
             },
         },
@@ -346,7 +336,6 @@ HISTORY_COMMIT_SCHEMA = {
     "properties": {
         "security_related": {"type": "boolean", "description": "该提交是否是一次安全修复(修复了某类安全缺陷)"},
         "pattern": {"type": "string", "description": "若相关:可复用于同类变体排查的问题模式(根因+缺陷类型+触发条件的抽象描述,不要只抄提交标题)"},
-        "lens_hint": {"type": "string", "enum": ["memory", "integer", "race", "injection", "authn", "crypto", "dos", "infoleak", "resource-realtime"]},
         "files": {"type": "array", "items": {"type": "string"}, "description": "该问题模式涉及/出现的文件"},
         "rationale": {"type": "string", "description": "判定理由 + 改动要点摘要"},
     },

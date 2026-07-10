@@ -251,7 +251,7 @@ class Pipeline:
                  "region": item.get("region") or (item.get("name") if item.get("kind") == "region" else ""),
                  "category": item.get("category") or "", "priority": item.get("priority") or "",
                  "source": item.get("source") or "",
-                 "lenses": [], "passes": 0, "candidates": 0, "surfaces": 0, "risks": 0,
+                 "audit_units": [], "passes": 0, "candidates": 0, "surfaces": 0, "risks": 0,
                  "lastRound": 0, "status": "pending"}
             self.ledger_map[k] = r
             self.ledger_arr.append(r)
@@ -302,7 +302,8 @@ class Pipeline:
             "rounds": rnd, "confirmed": confirmed_real, "finding_entries": len(self.confirmed),
             "candidates": len(self.dedup_keys),
             "quality_issues": quality_issues,
-            "by_severity": by_sev, "risks": 0, "surfaces": len(self.surface_log),
+            "by_severity": by_sev, "risks": 0,
+            "surfaces": int((self.threat_graph.get("stats") or {}).get("surfaces") or 0),
             "agents_spawned": self.runner.agent_count, "elapsed_s": round(time.time() - self._started, 1),
             "token_usage": dict(self.runner.usage_totals),
             "pending_findings": self._active_pending_candidate_count(),
@@ -373,7 +374,7 @@ class Pipeline:
 
     # ──────────────────────── 优先级调度队列 ────────────────────────
     _PRI_BY_AREA = {"high": 0, "medium": 1, "low": 2}
-    _INTERNAL_KINDS = {"_finder", "_finding", "_history_commit", "_recheck"}
+    _INTERNAL_KINDS = {"_finder", "_finding", "_history_commit", "_recheck", "_threat_delta"}
 
     @staticmethod
     def _runtime_clean_item(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -470,6 +471,8 @@ class Pipeline:
             return 0
         if kind == "_finding":
             return 5
+        if kind == "_threat_delta":
+            return 20 + self._area_rank(item)
         if kind in ("_finder", "_history_commit"):
             return 20 + self._area_rank(item)
         if kind in ("task", "surface", "attack_method"):
@@ -482,6 +485,8 @@ class Pipeline:
             return "recheck"
         if kind == "_finding":
             return "verify"
+        if kind == "_threat_delta":
+            return "threat"
         if kind == "_history_commit":
             return "history"
         if kind == "_finder":
@@ -533,7 +538,7 @@ class Pipeline:
         """把一条即时风险种子放进优先排查队列;不登记、不落盘。"""
         self.pq.append({"kind": "risk", "id": note["id"], "area": note.get("area"),
                         "note": note.get("note"), "file": note.get("file"),
-                        "severity_hint": note.get("severity_hint"), "lens": note.get("lens"),
+                        "severity_hint": note.get("severity_hint"),
                         "callee": note.get("callee"), "required_validation": note.get("required_validation"),
                         "good_validation_ref": note.get("good_validation_ref"),
                         "round": note.get("round")})
@@ -541,7 +546,7 @@ class Pipeline:
         self.emit(EV.RECHECK_ENQUEUED, {"kind": "risk", "id": note["id"], "area": note.get("area"),
                                         "severity_hint": note.get("severity_hint")})
 
-    def record_risk(self, n: Dict[str, Any], lens: str, rnd: int, from_recheck: bool = False) -> bool:
+    def record_risk(self, n: Dict[str, Any], rnd: int, from_recheck: bool = False) -> bool:
         """消费 finder 的 risk_notes:直接派发一次性 recheck agent。
 
         risk_notes 不再代表“潜在风险登记”,也不写 risks/<id>.json / RISKS.md。
@@ -564,7 +569,7 @@ class Pipeline:
         self.risk_seq += 1
         note = {"id": f"RISK-{pad3(self.risk_seq)}", "area": area, "note": n.get("note") or "",
                 "file": n.get("file") or "", "severity_hint": n.get("severity_hint") or "info",
-                "lens": lens, "round": rnd,
+                "round": rnd,
                 "callee": n.get("callee") or "", "required_validation": n.get("required_validation") or "",
                 "good_validation_ref": n.get("good_validation_ref") or ""}
         self._enqueue_risk(note)
@@ -666,7 +671,7 @@ class Pipeline:
             "models": cfg.models, "model_concurrency": cfg.model_concurrency,
             "model_time_windows": cfg.model_time_windows,
             "concurrency": cfg.concurrency, "threat_model": cfg.threat_model,
-            "lenses": cfg.lenses, "finders_per_lens": cfg.finders_per_lens,
+            "finders_per_item": cfg.finders_per_item,
             "max_rounds": cfg.max_rounds, "dry_rounds": cfg.dry_rounds,
             "verify_votes": cfg.verify_votes, "enable_poc": cfg.enable_poc,
             "poc_components": cfg.poc_components,
@@ -676,24 +681,12 @@ class Pipeline:
     def manifest_config(self) -> Dict[str, Any]:
         return self.manifest_config_for(self.cfg)
 
-    # ──────────────────────── lens 选择 ────────────────────────
-    def lenses_for(self, item: Dict[str, Any]) -> List[str]:
-        active = self.cfg.lenses
-        if item.get("kind") == "task":
-            hits = [l for l in (item.get("lens_hints") or []) if l in active]
-            return hits or active
-        if item.get("kind") == "variant" and item.get("lens_hint") in active:
-            return [item["lens_hint"]]
-        if item.get("kind") == "surface" and item.get("lens_hint") in active:
-            return [item["lens_hint"]]
-        return active
-
     # ──────────────────────── 逐发现流水线:验证→(PoC)→报告正文 ────────────────────────
     @staticmethod
     def _candidate_payload(f: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "key": finding_key(f), "title": f.get("title"), "bug_class": f.get("bug_class"),
-            "file": f.get("file"), "line": f.get("line"), "lens": f.get("lens"),
+            "file": f.get("file"), "line": f.get("line"), "audit_unit": f.get("audit_unit"),
             "severity": f.get("severity"), "function": f.get("function") or "",
             "description": f.get("description") or "", "source_to_sink": f.get("source_to_sink") or "",
             "variant_of": f.get("variant_of") or "", "confidence": f.get("confidence") or "",
@@ -792,7 +785,7 @@ class Pipeline:
         return [{
             "phase": v.get("phase") or "",
             "model": v.get("model") or "",
-            "verify_lens": v.get("verify_lens") or "",
+            "verify_focus": v.get("verify_focus") or "",
             "decision": self._vote_decision(v),
             "is_real": bool(v.get("is_real")),
             "validation_ok": v.get("validation_ok", True),
@@ -1117,11 +1110,11 @@ class Pipeline:
         return missing
 
     @staticmethod
-    def _mark_vote(v: Optional[Dict[str, Any]], *, phase: str, lens: str,
+    def _mark_vote(v: Optional[Dict[str, Any]], *, phase: str, focus: str,
                    model: str = "", validation_errors: Optional[List[str]] = None) -> Dict[str, Any]:
         out = dict(v) if isinstance(v, dict) else {}
         out["phase"] = phase
-        out["verify_lens"] = lens
+        out["verify_focus"] = focus
         if model:
             out["model"] = model
         errs = validation_errors or []
@@ -1185,7 +1178,7 @@ class Pipeline:
             )
             witness_errors = self._validate_witness(raw_witness)
             witness_obj = raw_witness if isinstance(raw_witness, dict) else {}
-            witness_vote = self._mark_vote(raw_witness, phase="witness", lens="正方 witness",
+            witness_vote = self._mark_vote(raw_witness, phase="witness", focus="正方 witness",
                                            model=witness_meta.get("model") or "",
                                            validation_errors=witness_errors)
             witness_vote["decision"] = "confirm" if witness_obj.get("witness_complete") else "inconclusive"
@@ -1199,7 +1192,7 @@ class Pipeline:
             )
             blocker_errors = self._validate_blocker(raw_blocker)
             blocker_obj = raw_blocker if isinstance(raw_blocker, dict) else {}
-            blocker_vote = self._mark_vote(raw_blocker, phase="blocker", lens="反方 blocker",
+            blocker_vote = self._mark_vote(raw_blocker, phase="blocker", focus="反方 blocker",
                                            model=blocker_meta.get("model") or "",
                                            validation_errors=blocker_errors)
             blocker_vote["decision"] = "reject" if blocker_obj.get("blocker_found") else "inconclusive"
@@ -1223,7 +1216,7 @@ class Pipeline:
             witness_review_errors = self._validate_witness_review(raw_witness_review)
             witness_review_obj = raw_witness_review if isinstance(raw_witness_review, dict) else {}
             witness_review_vote = self._mark_vote(raw_witness_review, phase="witness_judge",
-                                                  lens="质询 witness",
+                                                  focus="质询 witness",
                                                   model=witness_judge_meta.get("model") or "",
                                                   validation_errors=witness_review_errors)
             wv = witness_review_obj.get("witness_verdict")
@@ -1233,7 +1226,7 @@ class Pipeline:
             blocker_review_errors = self._validate_blocker_review(raw_blocker_review)
             blocker_review_obj = raw_blocker_review if isinstance(raw_blocker_review, dict) else {}
             blocker_review_vote = self._mark_vote(raw_blocker_review, phase="blocker_judge",
-                                                  lens="质询 blocker",
+                                                  focus="质询 blocker",
                                                   model=blocker_judge_meta.get("model") or "",
                                                   validation_errors=blocker_review_errors)
             bv = blocker_review_obj.get("blocker_verdict")
@@ -1252,7 +1245,7 @@ class Pipeline:
             )
             final_errors = self._validate_final_adjudication(raw_final)
             final_obj = raw_final if isinstance(raw_final, dict) else {}
-            final_vote = self._mark_vote(raw_final, phase="final_adjudicator", lens="终局裁判",
+            final_vote = self._mark_vote(raw_final, phase="final_adjudicator", focus="终局裁判",
                                          model=final_meta.get("model") or "",
                                          validation_errors=final_errors)
             decision = (final_obj.get("operational_decision") or "").strip()
@@ -1490,12 +1483,10 @@ class Pipeline:
         pattern = (raw.get("pattern") or "").strip()
         if not pattern:
             return None
-        lens = raw.get("lens_hint") if raw.get("lens_hint") in self.cfg.lenses else "memory"
         files = raw.get("files") if isinstance(raw.get("files"), list) else []
         return {
             "pattern": pattern,
             "source": (raw.get("source") or source_hint or "imported").strip(),
-            "lens_hint": lens,
             "files": [str(f) for f in files if str(f).strip()],
             "rationale": raw.get("rationale") or "",
         }
@@ -1514,7 +1505,7 @@ class Pipeline:
         self.emit(EV.HISTORY_ADDED, {**entry, "total": len(self.history), "imported": imported})
         self.persist_history()
         prefix = "导入历史模式" if imported else "历史模式"
-        self.log(f"🕮 {prefix} +1[{entry['lens_hint']}]:{pattern[:60]} ← {str(entry.get('source') or '')[:40]}")
+        self.log(f"🕮 {prefix} +1:{pattern[:60]} ← {str(entry.get('source') or '')[:40]}")
         return True
 
     def import_history_patterns(self) -> int:
@@ -1585,6 +1576,65 @@ class Pipeline:
             return True
         return False
 
+    def _sort_audit_items(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return sorted(items or [], key=lambda r: ({"high": 0, "medium": 1, "low": 2}).get(r.get("priority"), 3))
+
+    def _queue_contains_attack_item(self, item_id: str) -> bool:
+        for it in self.queue:
+            if it.get("kind") == "attack_method" and it.get("id") == item_id:
+                return True
+        for st in self._audit_passes.values():
+            item = st.get("item") or {}
+            if item.get("kind") == "attack_method" and item.get("id") == item_id:
+                return True
+        return False
+
+    def _apply_threat_analysis_raw(self, raw: Dict[str, Any], *, origin: str,
+                                   save_raw: bool = False) -> Dict[str, int]:
+        """合入初始/增量威胁分析结果,并将新增 method 作为普通 attack_method 审计项入队。"""
+        before_ids = {it.get("id") for it in (self.threat_graph.get("audit_items") or []) if it.get("id")}
+        if self.threat_graph.get("assets") or self.threat_graph.get("nodes"):
+            graph, added = TA.merge_delta(self.threat_graph, raw, origin=origin)
+        else:
+            graph = TA.normalize(raw)
+            stats = graph.get("stats") or {}
+            added = {
+                "assets": int(stats.get("assets") or 0),
+                "risks": sum(len(a.get("risks") or []) for a in (graph.get("assets") or [])),
+                "trees": int(stats.get("trees") or 0),
+                "nodes": int(stats.get("nodes") or 0),
+                "surfaces": int(stats.get("surfaces") or 0),
+                "methods": int(stats.get("methods") or 0),
+                "code_paths": sum(len(m.get("code_paths") or []) for m in (graph.get("code_path_mappings") or [])),
+            }
+        self.threat_graph = graph
+        self.regions = self._sort_audit_items(graph.get("audit_items") or [])
+        new_items = [it for it in self.regions if it.get("id") and it.get("id") not in before_ids]
+        enqueued = 0
+        for item in new_items:
+            if item_key(item) in self.completed_items or self._queue_contains_attack_item(item.get("id")):
+                continue
+            self._enqueue_work(item)
+            enqueued += 1
+        added["audit_items"] = enqueued
+        try:
+            self.store.save_threat_analysis(graph, raw=raw if save_raw else None)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"⚠ 威胁分析图写入失败(忽略继续): {str(e)[:120]}")
+        return added
+
+    def _should_enqueue_threat_delta(self, item: Dict[str, Any]) -> bool:
+        return (
+            item.get("kind") == "attack_method"
+            and bool(self.threat_graph.get("assets") or self.threat_graph.get("nodes"))
+            and bool((item.get("attack_context") or {}).get("method_node_id"))
+        )
+
+    def _enqueue_threat_delta(self, item: Dict[str, Any]) -> None:
+        if not self._should_enqueue_threat_delta(item):
+            return
+        self._enqueue_work({"kind": "_threat_delta", "item": item, "priority": item.get("priority") or "medium"})
+
     async def threat_analysis(self, *, try_restore: bool = True) -> None:
         if try_restore and self.restore_checkpoint():
             return
@@ -1600,22 +1650,14 @@ class Pipeline:
         if not isinstance(raw, dict):
             self.log("⚠ 威胁分析失败:未得到合法攻击树结构,本次不会产生审计项")
             raw = {"assets": [], "attack_trees": [], "code_path_mappings": []}
-        graph = TA.normalize(raw)
-        self.threat_graph = graph
-        self.regions = sorted(graph.get("audit_items") or [],
-                              key=lambda r: ({"high": 0, "medium": 1, "low": 2}).get(r.get("priority"), 3))
+        added = self._apply_threat_analysis_raw(raw, origin="threat-analysis", save_raw=True)
+        graph = self.threat_graph
         self.build_hint = ""
-        for item in self.regions:
-            self._enqueue_work(item)
-        try:
-            self.store.save_threat_analysis(graph, raw=raw)
-        except Exception as e:  # noqa: BLE001
-            self.log(f"⚠ 威胁分析图写入失败(忽略继续): {str(e)[:120]}")
         stats = graph.get("stats") or {}
         self.log("攻击树威胁分析完成:"
                  f"资产 {stats.get('assets', 0)} 个,攻击树 {stats.get('trees', 0)} 棵,"
                  f"攻击面 {stats.get('surfaces', 0)} 个,攻击方式 {stats.get('methods', 0)} 个,"
-                 f"审计项 {stats.get('audit_items', 0)} 个")
+                 f"审计项 {stats.get('audit_items', 0)} 个;新入队 {added.get('audit_items', 0)} 项")
         if graph.get("warnings"):
             self.log(f"⚠ 威胁分析规范化告警 {len(graph.get('warnings') or [])} 条,详见 threat-analysis/warnings.json")
         self.emit(EV.THREAT_ANALYSIS_DONE, {**stats, "warnings": len(graph.get("warnings") or [])})
@@ -1708,9 +1750,8 @@ class Pipeline:
         pattern = (res.get("pattern") or "").strip()
         if not pattern:
             return
-        lens = res.get("lens_hint") if res.get("lens_hint") in self.cfg.lenses else None
         source = (f"{c['hash'][:10]} {c['subject']}").strip()[:120]
-        entry = {"pattern": pattern, "source": source, "lens_hint": lens or "memory",
+        entry = {"pattern": pattern, "source": source,
                  "files": res.get("files") or [], "rationale": res.get("rationale") or ""}
         self._record_history_entry(entry)
 
@@ -1721,7 +1762,6 @@ class Pipeline:
         self.round += 1
         item["pass"] = (item.get("pass") or 0) + 1
         item["newThisRound"] = 0
-        item["newSurfacesThisRound"] = 0
         item["failedFinders"] = 0
         rec = self.ledger_rec(item)
         rec["passes"] = item["pass"]
@@ -1731,38 +1771,31 @@ class Pipeline:
         pending = 0
         if item.get("kind") == "attack_method":
             profile = self.pb.attack_method_audit_profile(item)
-            audit_key = profile.get("id") or "generic-attack-method"
-            rec["audit_skill"] = profile.get("label") or audit_key
+            audit_unit = profile.get("id") or "generic-attack-method"
+            rec["audit_skill"] = profile.get("label") or audit_unit
             rec["audit_skill_files"] = profile.get("files") or []
-            if audit_key not in rec["lenses"]:
-                rec["lenses"].append(audit_key)
-            for i in range(max(1, int(self.cfg.finders_per_lens))):
-                self._enqueue_work({
-                    "kind": "_finder",
-                    "audit_id": audit_id,
-                    "item": item,
-                    "audit_key": audit_key,
-                    "audit_profile": profile,
-                    "idx": i,
-                    "priority": item.get("priority"),
-                })
-                pending += 1
+            audit_profile = profile
         else:
-            lenses = self.lenses_for(item)
-            for lens_key in lenses:
-                if lens_key not in rec["lenses"]:
-                    rec["lenses"].append(lens_key)
-                for i in range(self.cfg.finders_per_lens):
-                    self._enqueue_work({
-                        "kind": "_finder",
-                        "audit_id": audit_id,
-                        "item": item,
-                        "lens_key": lens_key,
-                        "audit_key": lens_key,
-                        "idx": i,
-                        "priority": item.get("priority"),
-                    })
-                    pending += 1
+            audit_profile = None
+            audit_unit = {
+                "variant": "history-pattern",
+                "surface": "threat-supplement",
+                "task": "task",
+                "region": "region",
+            }.get(item.get("kind"), "audit-item")
+        if audit_unit not in rec["audit_units"]:
+            rec["audit_units"].append(audit_unit)
+        for i in range(max(1, int(self.cfg.finders_per_item))):
+            self._enqueue_work({
+                "kind": "_finder",
+                "audit_id": audit_id,
+                "item": item,
+                "audit_unit": audit_unit,
+                "audit_profile": audit_profile,
+                "idx": i,
+                "priority": item.get("priority"),
+            })
+            pending += 1
         self._audit_passes[audit_id] = {"item": item, "rec": rec, "pending": pending}
         self.emit(EV.ROUND_START, {"round": self.round, "queue_len": len(self.queue)})
         if pending == 0:
@@ -1776,9 +1809,9 @@ class Pipeline:
         item = st["item"]
         rec = st["rec"]
         try:
-            audit_key = work.get("audit_key") or work.get("lens_key") or "memory"
+            audit_unit = work.get("audit_unit") or "audit-item"
             await self._run_finder(
-                item, audit_key, int(work.get("idx") or 0), rec,
+                item, audit_unit, int(work.get("idx") or 0), rec,
                 audit_profile=work.get("audit_profile") if isinstance(work.get("audit_profile"), dict) else None,
             )
         except Exception as e:  # noqa: BLE001
@@ -1799,8 +1832,8 @@ class Pipeline:
         if ik in self.completed_items:
             return
         new_findings = int(item.get("newThisRound") or 0)
-        new_surfaces = int(item.get("newSurfacesThisRound") or 0)
         failed = int(item.get("failedFinders") or 0) > 0
+        completed_now = False
         if failed:
             self._mark_retry_after_failure(item)
             self._refresh_enqueue_order(item)
@@ -1818,10 +1851,13 @@ class Pipeline:
             self._clear_retry_after_failure(item)
             self.completed_items.add(ik)
             rec["status"] = "completed-findings" if rec.get("candidates", 0) > 0 else "completed-clean"
-        dry_streak = 0 if (new_findings or new_surfaces) else 1
-        self.log(f"轮 {self.round}: 本项新候选 {new_findings}, 新攻击面 {new_surfaces}, 队列剩 {len(self.queue)}, "
+            completed_now = True
+        if completed_now:
+            self._enqueue_threat_delta(item)
+        dry_streak = 0 if new_findings else 1
+        self.log(f"轮 {self.round}: 本项新候选 {new_findings}, 队列剩 {len(self.queue)}, "
                  f"优先复查队列 {len(self.pq)}")
-        self.emit(EV.ROUND_DONE, {"round": self.round, "new_findings": new_findings, "new_surfaces": new_surfaces,
+        self.emit(EV.ROUND_DONE, {"round": self.round, "new_findings": new_findings, "new_surfaces": 0,
                                   "queue_len": len(self.queue), "dry_streak": dry_streak, "risks": 0})
         self.emit(EV.METRICS, self._summary_snapshot(self.round))
         self.checkpoint(self.round)
@@ -1874,6 +1910,9 @@ class Pipeline:
                 c = work.get("commit") or {}
                 if c:
                     await self._mine_one_commit(c, bypass=False)
+                return
+            if kind == "_threat_delta":
+                await self._run_threat_delta(work.get("item") or {})
                 return
             if kind == "_recheck":
                 self._recheck_inflight += 1
@@ -1969,7 +2008,7 @@ class Pipeline:
         else:
             self._final_failed_sweep_done = True
         if not self.queue and not self.pq and not self._audit_passes and not self._recheck_inflight:
-            self.log(f"轮 {self.round}: 工作队列已空且无新攻击面回灌")
+            self.log(f"轮 {self.round}: 工作队列已空且无待合入威胁增量")
 
         incomplete = self._incomplete_counts()
         if self.stop_requested():
@@ -1998,26 +2037,56 @@ class Pipeline:
         self.emit_coverage()
         quality_issues = sum(1 for c in self.confirmed if is_quality_issue_finding(c))
         confirmed_real = max(0, len(self.confirmed) - quality_issues)
+        threat_stats = self.threat_graph.get("stats") or {}
         self.log(f"流水线排空完成:确认 {confirmed_real} 条漏洞,质量问题 {quality_issues} 条,候选去重池 {len(self.dedup_keys)} 条,"
-                 f"动态攻击面 {len(self.surface_log)} 个。")
+                 f"攻击面 {threat_stats.get('surfaces', 0)} 个,攻击方式 {threat_stats.get('methods', 0)} 个。")
         return stop_reason
 
-    async def _run_finder(self, item: Dict[str, Any], audit_key: str, idx: int, rec: Dict[str, Any],
+    async def _run_finder(self, item: Dict[str, Any], audit_unit: str, idx: int, rec: Dict[str, Any],
                           audit_profile: Optional[Dict[str, Any]] = None) -> None:
         if self.stop_requested():
             item["failedFinders"] = item.get("failedFinders", 0) + 1
             return
         meta: Dict[str, Any] = {}
         res = await self.runner.run(
-            self.pb.audit(item, audit_key, idx, S.FINDINGS_SCHEMA, audit_profile=audit_profile),
+            self.pb.audit(item, audit_unit, idx, S.FINDINGS_SCHEMA, audit_profile=audit_profile),
             role="audit",
-            label=f"audit:{str(item.get('objective') or item.get('name') or item.get('pattern') or 'item')[:20]}:{audit_key}#{item['pass']}.{idx + 1}",
+            label=f"audit:{str(item.get('objective') or item.get('name') or item.get('pattern') or 'item')[:20]}:{audit_unit}#{item['pass']}.{idx + 1}",
             schema=S.FINDINGS_SCHEMA,
             should_stop=self.stop_requested, meta=meta)
         if not res:
             item["failedFinders"] = item.get("failedFinders", 0) + 1
             return
-        self._consume(res, item, rec, audit_key, audit_model=meta.get("model"))
+        if meta.get("session_id"):
+            item["_audit_session_id"] = meta.get("session_id")
+        self._consume(res, item, rec, audit_unit, audit_model=meta.get("model"))
+
+    async def _run_threat_delta(self, item: Dict[str, Any]) -> None:
+        if self.stop_requested() or not self._should_enqueue_threat_delta(item):
+            return
+        label = f"threat-delta:{str(item.get('objective') or item.get('name') or 'item')[:32]}"
+        try:
+            raw = await self.runner.run(
+                self.pb.threat_delta(item, TA.graph_summary(self.threat_graph), S.THREAT_DELTA_SCHEMA),
+                role="threat", label=label, schema=S.THREAT_DELTA_SCHEMA, retries=1,
+                fallback=None, should_stop=self.stop_requested,
+                session_id=item.get("_audit_session_id"),
+                compact_before_prompt=bool(item.get("_audit_session_id")))
+        except Exception as e:  # noqa: BLE001
+            self.log(f"⚠ 威胁分析增量识别失败(忽略继续): {str(e)[:140]}")
+            return
+        if not raw or not isinstance(raw, dict):
+            return
+        added = self._apply_threat_analysis_raw(raw, origin=label, save_raw=False)
+        if any(int(v or 0) > 0 for v in added.values()):
+            stats = self.threat_graph.get("stats") or {}
+            self.log("威胁分析增量合入:"
+                     f"资产 +{added.get('assets', 0)},风险 +{added.get('risks', 0)},"
+                     f"攻击树 +{added.get('trees', 0)},攻击面 +{added.get('surfaces', 0)},"
+                     f"攻击方式 +{added.get('methods', 0)},审计项入队 +{added.get('audit_items', 0)}")
+            self.emit(EV.THREAT_NODE_UPSERTED, {**stats, "added": added, "origin": label})
+            self.checkpoint(self.round)
+            self.emit_coverage()
 
     @staticmethod
     def _finder_result(res: Any) -> Dict[str, Any]:
@@ -2044,13 +2113,12 @@ class Pipeline:
         return value
 
     def _consume(self, res: Any, item: Dict[str, Any], rec: Dict[str, Any],
-                 audit_key: str, from_recheck: bool = False, audit_model: Optional[str] = None) -> None:
-        """消化一次审计 / 复查 agent 的结果:findings→验证流水线、new_surfaces→主队列、risk_notes→即时复查。
+                 audit_unit: str, from_recheck: bool = False, audit_model: Optional[str] = None) -> None:
+        """消化一次审计 / 复查 agent 的结果:findings→验证流水线、risk_notes→即时复查。
         from_recheck=True 时,产出的 risk_notes 不再二次回灌优先队列(防自激)。
         audit_model:产出该批 finding 的模型,归因到候选(随候选流转到验证/确认/报告)。"""
         res = self._finder_result(res)
         findings = self._finder_result_array(res, "findings", required=True)
-        new_surfaces = self._finder_result_array(res, "new_surfaces")
         risk_notes = self._finder_result_array(res, "risk_notes")
         for f in findings:
             fk = finding_key(f)
@@ -2081,39 +2149,22 @@ class Pipeline:
             item["newThisRound"] = item.get("newThisRound", 0) + 1
             rec["candidates"] = rec.get("candidates", 0) + 1
             self.pending_findings[fk] = f
-            f["lens"] = audit_key
+            f["audit_unit"] = audit_unit
             payload = {**self._candidate_payload(f), "status": "pending"}
             self._save_candidate_state(payload)
             self.emit(EV.CANDIDATE_FOUND, payload)
             self._enqueue_finding(f)
-        for s in new_surfaces:
-            sk = (s.get("name") or "").strip().lower()
-            if not sk or sk in self.seen_surface:
-                continue
-            self.seen_surface.add(sk)
-            item["newSurfacesThisRound"] = item.get("newSurfacesThisRound", 0) + 1
-            rec["surfaces"] = rec.get("surfaces", 0) + 1
-            fallback_lens = audit_key if audit_key in self.cfg.lenses else "memory"
-            surface_lens = s.get("lens_hint") if s.get("lens_hint") in self.cfg.lenses else fallback_lens
-            self._enqueue_work({"kind": "surface", "name": s.get("name"), "why": s.get("why"),
-                                "files": s.get("files"), "lens_hint": surface_lens})
-            entry = {"name": s.get("name"), "why": s.get("why"), "files": s.get("files"),
-                     "lens_hint": surface_lens, "round": self.round, "from": rec.get("name")}
-            self.surface_log.append(entry)
-            self.emit(EV.SURFACE_ADDED, entry)
         for n in risk_notes:
-            fallback_lens = audit_key if audit_key in self.cfg.lenses else "memory"
-            if self.record_risk(n, fallback_lens, self.round, from_recheck=from_recheck):
+            if self.record_risk(n, self.round, from_recheck=from_recheck):
                 rec["risks"] = rec.get("risks", 0) + 1
 
     # ──────── 专用优先排查:历史变体 + 风险点复查(统一调度队列中的最高优先级)────────
     def _enqueue_variant(self, entry: Dict[str, Any]) -> None:
         """git 历史挖掘提炼出的问题模式 → 进优先排查队列(同类变体排查)。"""
         self.pq.append({"kind": "variant", "pattern": entry["pattern"], "source": entry["source"],
-                        "files": entry["files"], "lens_hint": entry["lens_hint"]})
+                        "files": entry["files"]})
         self._notify_scheduler()
-        self.emit(EV.RECHECK_ENQUEUED, {"kind": "variant", "pattern": entry["pattern"],
-                                        "lens_hint": entry["lens_hint"]})
+        self.emit(EV.RECHECK_ENQUEUED, {"kind": "variant", "pattern": entry["pattern"]})
 
     def _variant_item_for_ledger(self, rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         pattern = (rec.get("name") or str(rec.get("key") or "").replace("variant:", "", 1)).strip()
@@ -2126,7 +2177,6 @@ class Pipeline:
             "pattern": pattern,
             "source": (hist or {}).get("source") or rec.get("source") or "",
             "files": (hist or {}).get("files") or [],
-            "lens_hint": (hist or {}).get("lens_hint") or (rec.get("lenses") or ["memory"])[0],
         }
 
     def _risk_item_for_ledger(self, rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2138,7 +2188,6 @@ class Pipeline:
             "kind": "risk", "id": rid, "area": area,
             "note": rec.get("risk_note") or "", "file": rec.get("file") or "",
             "severity_hint": rec.get("severity_hint") or "info",
-            "lens": (rec.get("lenses") or ["memory"])[0],
             "callee": rec.get("callee") or "",
             "required_validation": rec.get("required_validation") or "",
             "good_validation_ref": rec.get("good_validation_ref") or "",
@@ -2257,17 +2306,16 @@ class Pipeline:
         rec["lastRound"] = self.round
         item["pass"] = item.get("pass", 0) + 1
         item["newThisRound"] = 0
-        item["newSurfacesThisRound"] = 0
         if kind == "variant":
-            lens_key = item.get("lens_hint") if item.get("lens_hint") in self.cfg.lenses else "memory"
-            prompt = self.pb.audit(item, lens_key, 0, S.FINDINGS_SCHEMA)
+            audit_unit = "history-pattern"
+            prompt = self.pb.audit(item, audit_unit, 0, S.FINDINGS_SCHEMA)
             label = f"recheck:variant:{str(item.get('pattern') or '')[:24]}"
         else:
-            lens_key = item.get("lens") if item.get("lens") in self.cfg.lenses else "memory"
+            audit_unit = "risk-recheck"
             prompt = self.pb.recheck_risk(item, S.FINDINGS_SCHEMA)
             label = f"recheck:risk:{str(item.get('area') or rid or '')[:24]}"
-        if lens_key not in rec["lenses"]:
-            rec["lenses"].append(lens_key)
+        if audit_unit not in rec["audit_units"]:
+            rec["audit_units"].append(audit_unit)
         # recheck 用「快速失败」模式跑:单次调用不在 runner 内部做长退避(retries=0),
         # 失败后的重试改由优先队列层面**有上限地**重排(见下)。这样一条卡住/失败的复查
         # 既不会在退避期间一直占着唯一的 recheck 名额、拖慢其它 agent,也不会无限重排导致管线永不收敛。
@@ -2280,7 +2328,7 @@ class Pipeline:
             return
         self._clear_retry_after_failure(item)
         if res:
-            self._consume(res, item, rec, lens_key, from_recheck=True, audit_model=meta.get("model"))
+            self._consume(res, item, rec, audit_unit, from_recheck=True, audit_model=meta.get("model"))
         self.completed_items.add(item_key(item))
         rec["status"] = "completed-findings" if rec.get("candidates", 0) > 0 else "completed-clean"
         self.checkpoint(self.round)
@@ -2318,7 +2366,7 @@ class Pipeline:
             "target": self.cfg.target, "scope": self.cfg.scope or "(whole repo)",
             "threat_model": self.cfg.threat_model, "backend": self.cfg.backend,
             "methods_used": self.cfg.methods_ok(), "methods_dir": self.cfg.methods_abs,
-            "dynamic_surfaces": len(self.surface_log), "risk_notes": 0,
+            "dynamic_surfaces": 0, "risk_notes": 0,
             "resumed_from_round": self.start_round, "rounds": self.round,
             "converged": converged, "stop_reason": stop_reason, "candidates": len(self.dedup_keys),
             "attack_methods_total": sum(1 for r in self.ledger_arr if r.get("kind") == "attack_method"),
@@ -2345,11 +2393,11 @@ class Pipeline:
         self.store.set_status(STATUS_RUNNING)
         self.emit(EV.RUN_STATUS, {"status": STATUS_RUNNING})
         self.log(f"目标={self.cfg.target}{sn} 模式={self.cfg.run_mode} 后端={self.cfg.backend} 并发={self.cfg.concurrency} "
-                 f"攻击树威胁分析→攻击方式审计 每项finder={self.cfg.finders_per_lens} dryRounds={self.cfg.dry_rounds} "
+                 f"攻击树威胁分析→攻击方式审计 每项finder={self.cfg.finders_per_item} dryRounds={self.cfg.dry_rounds} "
                  f"maxRounds={self.cfg.max_rounds} 验证=witness/blocker(5-agent) PoC={bool(self.poc_components)} "
                  f"resume={self.cfg.resume} 威胁模型={self.cfg.threat_model}")
-        self.log(f"启用 lens: {', '.join(self.cfg.lenses)} | run 目录: {self.store.dir} | "
-                 f"方法库: {self.cfg.methods_abs} ({'就绪' if self.cfg.methods_ok() else '不可用→内联兜底'})")
+        self.log(f"run 目录: {self.store.dir} | 方法库: {self.cfg.methods_abs} "
+                 f"({'就绪' if self.cfg.methods_ok() else '不可用→内联兜底'})")
         history_sched: Optional[asyncio.Task] = None
         try:
             model_error = self.cfg.model_config_error()

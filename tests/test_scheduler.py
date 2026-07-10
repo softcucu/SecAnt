@@ -18,8 +18,7 @@ def _pipe(tmp, **overrides):
     vals = {
         "target": tmp,
         "out_dir": os.path.join(tmp, "out"),
-        "lenses": ["memory"],
-        "finders_per_lens": 1,
+        "finders_per_item": 1,
         "concurrency": 1,
         "models": {
             "threat": ["unit-model"],
@@ -226,36 +225,124 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(roles, ["audit", "audit"])
             self.assertTrue(all("请分析代码实现是否存在" in p for p in runner.prompts))
             self.assertTrue(all("未找到与当前攻击面/攻击方式强相关的专用 skill" not in p for p in runner.prompts))
-            self.assertTrue(all("只查这一个 lens" not in p for p in runner.prompts))
+            self.assertTrue(all("只查当前审计项" not in p for p in runner.prompts))
 
-    def test_threat_attack_method_items_do_not_get_lens_hints(self):
+    def test_threat_attack_method_items_do_not_get_category_hints(self):
         graph = TA.normalize(_threat_raw())
         items = graph["audit_items"]
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["kind"], "attack_method")
-        self.assertNotIn("lens_hint", items[0])
-        self.assertNotIn("lens_hints", items[0])
+        self.assertNotIn("category_hint", items[0])
+        self.assertNotIn("category_hints", items[0])
 
-    def test_attack_method_pass_uses_audit_profile_not_lens_expansion(self):
+    def test_threat_delta_merge_dedups_existing_and_adds_new_method(self):
+        base = TA.normalize(_threat_raw())
+        dup, dup_stats = TA.merge_delta(base, _threat_raw(), origin="unit")
+        self.assertEqual(dup_stats["methods"], 0)
+        self.assertEqual(dup["stats"]["audit_items"], 1)
+
+        raw = _threat_raw()
+        raw["attack_trees"][0]["nodes"].append({
+            "node_id": "NODE-005",
+            "parent_id": "NODE-003",
+            "node_type": "method",
+            "name": "资源耗尽",
+            "order": 2,
+            "basis": ["unit"],
+            "preconditions": [],
+        })
+        merged, stats = TA.merge_delta(base, raw, origin="unit")
+
+        self.assertEqual(stats["methods"], 1)
+        self.assertEqual(merged["stats"]["audit_items"], 2)
+        self.assertEqual([i["attack_context"]["method"] for i in merged["audit_items"]],
+                         ["畸形消息", "资源耗尽"])
+
+    async def test_audit_completion_merges_threat_delta_as_attack_tree_item(self):
+        class Runner:
+            def __init__(self):
+                self.audit_calls = 0
+                self.threat_delta_calls = 0
+                self.threat_session_args = []
+                self.agent_count = 0
+                self.usage_totals = {
+                    "calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "estimated_calls": 0,
+                }
+
+            async def run(self, *_args, **kwargs):
+                role = kwargs.get("role")
+                if role == "audit":
+                    self.audit_calls += 1
+                    meta = kwargs.get("meta")
+                    if isinstance(meta, dict):
+                        meta["session_id"] = f"audit-session-{self.audit_calls}"
+                    return {"findings": [], "risk_notes": []}
+                if role == "threat":
+                    self.threat_delta_calls += 1
+                    self.threat_session_args.append({
+                        "session_id": kwargs.get("session_id"),
+                        "compact_before_prompt": kwargs.get("compact_before_prompt"),
+                    })
+                    if self.threat_delta_calls > 1:
+                        return {"assets": [], "attack_trees": [], "code_path_mappings": []}
+                    raw = _threat_raw()
+                    raw["attack_trees"][0]["nodes"].append({
+                        "node_id": "NODE-005",
+                        "parent_id": "NODE-003",
+                        "node_type": "method",
+                        "name": "资源耗尽",
+                        "order": 2,
+                        "basis": ["unit"],
+                        "preconditions": [],
+                    })
+                    return raw
+                return {"findings": [], "risk_notes": []}
+
         with tempfile.TemporaryDirectory() as tmp:
-            p = _pipe(tmp, lenses=["memory", "integer", "dos"], finders_per_lens=2)
+            p = _pipe(tmp, enable_poc=False)
+            p.threat_graph = TA.normalize(_threat_raw())
+            p.regions = p.threat_graph["audit_items"]
+            p._enqueue_work(p.regions[0])
+            runner = Runner()
+            p.runner = runner
+
+            await p.audit()
+
+            self.assertEqual(p.threat_graph["stats"]["methods"], 2)
+            self.assertEqual(runner.audit_calls, 2)
+            self.assertEqual(runner.threat_session_args[0]["session_id"], "audit-session-1")
+            self.assertTrue(runner.threat_session_args[0]["compact_before_prompt"])
+            methods = [i["attack_context"]["method"] for i in p.threat_graph["audit_items"]]
+            self.assertEqual(methods, ["畸形消息", "资源耗尽"])
+
+    def test_attack_method_pass_uses_audit_profile_not_category_expansion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = _pipe(tmp, finders_per_item=2)
             item = {"kind": "attack_method", "id": "a1", "name": "畸形消息", "priority": "high", "files": []}
             p._start_audit_pass(item)
 
             finders = [w for w in p.queue if w.get("kind") == "_finder"]
             self.assertEqual(len(finders), 2)
-            self.assertTrue(all(w.get("audit_key") == "generic-attack-method" for w in finders))
-            self.assertTrue(all("lens_key" not in w for w in finders))
+            self.assertTrue(all(w.get("audit_unit") == "generic-attack-method" for w in finders))
+            self.assertTrue(all("audit_key" not in w for w in finders))
 
-    def test_attack_method_pass_uses_strongly_relevant_skill(self):
+    def test_attack_method_pass_uses_strongly_relevant_custom_skill(self):
         with tempfile.TemporaryDirectory() as tmp:
-            p = _pipe(tmp, lenses=["memory", "integer", "dos"], finders_per_lens=1)
+            methods = os.path.join(tmp, "methods")
+            os.makedirs(methods)
+            with open(os.path.join(methods, "audit-auth.md"), "w", encoding="utf-8") as f:
+                f.write("# auth audit\nkeywords: 认证, 绕过, auth\n")
+            p = _pipe(tmp, methods_dir=methods, finders_per_item=1)
             item = {"kind": "attack_method", "id": "a1", "name": "认证绕过", "priority": "high", "files": []}
             p._start_audit_pass(item)
 
             finders = [w for w in p.queue if w.get("kind") == "_finder"]
             self.assertEqual(len(finders), 1)
-            self.assertEqual(finders[0].get("audit_key"), "skill:authn")
+            self.assertEqual(finders[0].get("audit_unit"), "skill:audit-auth")
             self.assertEqual(finders[0].get("audit_profile", {}).get("kind"), "skill")
 
     def test_generic_attack_method_template_composes_surface_and_method(self):
@@ -352,7 +439,6 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
                     return {
                         "security_related": True,
                         "pattern": "missing bounds check",
-                        "lens_hint": "memory",
                         "files": [],
                         "rationale": "unit",
                     }
@@ -402,7 +488,7 @@ class TestSchedulerPriority(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             p = _pipe(tmp)
             history = {"kind": "_history_commit", "commit": {"hash": "abc", "subject": "s"}, "priority": "high"}
-            audit = {"kind": "_finder", "audit_id": "a", "item": {}, "lens_key": "memory", "idx": 0, "priority": "high"}
+            audit = {"kind": "_finder", "audit_id": "a", "item": {}, "audit_unit": "audit-item", "idx": 0, "priority": "high"}
 
             self.assertEqual(p._work_priority(history), p._work_priority(audit))
 
@@ -410,7 +496,7 @@ class TestSchedulerPriority(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             p = _pipe(tmp)
             history = {"kind": "_history_commit", "commit": {"hash": "abc", "subject": "s"}, "priority": "high"}
-            audit = {"kind": "_finder", "audit_id": "a", "item": {}, "lens_key": "memory", "idx": 0, "priority": "medium"}
+            audit = {"kind": "_finder", "audit_id": "a", "item": {}, "audit_unit": "audit-item", "idx": 0, "priority": "medium"}
 
             self.assertLess(p._work_priority(history), p._work_priority(audit))
 
@@ -422,7 +508,7 @@ class TestSchedulerPriority(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             p = _pipe(tmp)
             p.runner = CapacityRunner()
-            p._enqueue_work({"kind": "_finder", "audit_id": "a", "item": {}, "lens_key": "memory",
+            p._enqueue_work({"kind": "_finder", "audit_id": "a", "item": {}, "audit_unit": "audit-item",
                              "idx": 0, "priority": "high"})
             p._enqueue_work({"kind": "_history_commit", "commit": {"hash": "abc", "subject": "s"},
                              "priority": "medium"})
@@ -473,7 +559,7 @@ class TestSchedulerPriority(unittest.TestCase):
                 model_time_windows={"closed-model": _future_hour_window()},
             )
             p.runner = AgentRunner(p.cfg, logger=lambda *_a, **_k: None)
-            p._enqueue_work({"kind": "_finder", "audit_id": "a", "item": {}, "lens_key": "memory",
+            p._enqueue_work({"kind": "_finder", "audit_id": "a", "item": {}, "audit_unit": "audit-item",
                              "idx": 0, "priority": "high"})
             p._enqueue_work({"kind": "_history_commit", "commit": {"hash": "abc", "subject": "s"},
                              "priority": "medium"})

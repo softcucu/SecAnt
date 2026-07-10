@@ -36,7 +36,7 @@ class FakeRunner:
 
 def _finding(**over):
     f = {"title": "t", "bug_class": "memory", "file": "a.c", "line": 10,
-         "lens": "memory", "severity": "high", "function": "fn"}
+         "audit_unit": "unit-test", "severity": "high", "function": "fn"}
     f.update(over)
     return f
 
@@ -385,7 +385,7 @@ class TestFinalFailedSweep(_PipelineTestBase):
         p.pending_findings[k] = f
 
         risk = {"kind": "risk", "id": "R1", "area": "auth", "file": "b.c", "severity_hint": "high",
-                "lens": "authn", "note": "n"}
+                "note": "n"}
         rec = p.ledger_rec(risk)
         rec["status"] = "abandoned"
         p.completed_items.add("risk:R1")   # 之前被放弃时标过完成

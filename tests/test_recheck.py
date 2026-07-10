@@ -26,10 +26,10 @@ class TestRiskImmediateRecheck(unittest.TestCase):
     def test_all_non_recheck_seeds_enqueue_without_persisting(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = _pipe(tmp)
-            p.record_risk({"area": "a-high", "note": "n", "severity_hint": "high"}, "memory", 1)
-            p.record_risk({"area": "a-med", "note": "n", "severity_hint": "medium"}, "memory", 1)
-            p.record_risk({"area": "a-low", "note": "n", "severity_hint": "low"}, "memory", 1)
-            p.record_risk({"area": "a-info", "note": "n", "severity_hint": "info"}, "memory", 1)
+            p.record_risk({"area": "a-high", "note": "n", "severity_hint": "high"}, 1)
+            p.record_risk({"area": "a-med", "note": "n", "severity_hint": "medium"}, 1)
+            p.record_risk({"area": "a-low", "note": "n", "severity_hint": "low"}, 1)
+            p.record_risk({"area": "a-info", "note": "n", "severity_hint": "info"}, 1)
             kinds = [(it["kind"], it["severity_hint"]) for it in p.pq]
             self.assertEqual(sorted(s for _, s in kinds), ["high", "info", "low", "medium"])
             self.assertEqual(p.risk_notes, [])
@@ -38,20 +38,20 @@ class TestRiskImmediateRecheck(unittest.TestCase):
     def test_threshold_no_longer_filters_immediate_seed(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = _pipe(tmp, risk_min_severity="high")
-            p.record_risk({"area": "m", "note": "n", "severity_hint": "medium"}, "memory", 1)
+            p.record_risk({"area": "m", "note": "n", "severity_hint": "medium"}, 1)
             self.assertEqual([it["severity_hint"] for it in p.pq], ["medium"])
 
     def test_from_recheck_does_not_reenqueue(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = _pipe(tmp)
-            p.record_risk({"area": "x", "note": "n", "severity_hint": "high"}, "memory", 1, from_recheck=True)
+            p.record_risk({"area": "x", "note": "n", "severity_hint": "high"}, 1, from_recheck=True)
             self.assertEqual(p.pq, [])
             self.assertEqual(p.risk_notes, [])
 
     def test_disabled_recheck_does_not_enqueue_or_persist(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = _pipe(tmp, enabled=False)
-            self.assertFalse(p.record_risk({"area": "x", "note": "n", "severity_hint": "high"}, "memory", 1))
+            self.assertFalse(p.record_risk({"area": "x", "note": "n", "severity_hint": "high"}, 1))
             self.assertEqual(p.pq, [])
             self.assertEqual(p.store.load_risks(), [])
 
@@ -60,9 +60,9 @@ class TestPriorityOrdering(unittest.TestCase):
     def test_variant_pops_before_risk(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = _pipe(tmp)
-            p.record_risk({"area": "r1", "note": "n", "severity_hint": "high"}, "memory", 1)
-            p._enqueue_variant({"pattern": "v1", "source": "c1", "files": [], "lens_hint": "memory"})
-            p.record_risk({"area": "r2", "note": "n", "severity_hint": "high"}, "memory", 1)
+            p.record_risk({"area": "r1", "note": "n", "severity_hint": "high"}, 1)
+            p._enqueue_variant({"pattern": "v1", "source": "c1", "files": []})
+            p.record_risk({"area": "r2", "note": "n", "severity_hint": "high"}, 1)
             first = p._pop_priority()
             self.assertEqual(first["kind"], "variant")
             rest = [p._pop_priority()["kind"], p._pop_priority()["kind"]]
@@ -93,8 +93,7 @@ class TestAuditRetryQueue(unittest.IsolatedAsyncioTestCase):
             cfg = Config(
                 target=tmp,
                 out_dir=os.path.join(tmp, "out"),
-                lenses=["memory"],
-                finders_per_lens=1,
+                finders_per_item=1,
                 max_rounds=1,
                 dry_rounds=1,
             )
@@ -133,7 +132,7 @@ class TestRecheckRetryQueue(unittest.IsolatedAsyncioTestCase):
             p = _pipe(tmp)
             p.runner = DummyRunner()
             p.round = 1
-            item = {"kind": "variant", "pattern": "v1", "source": "c1", "files": [], "lens_hint": "memory"}
+            item = {"kind": "variant", "pattern": "v1", "source": "c1", "files": []}
 
             await p._run_recheck(item)
 
@@ -160,7 +159,7 @@ class TestRecheckGivesUp(unittest.IsolatedAsyncioTestCase):
             p = _pipe(tmp, enabled=True, max_retries=2)
             p.runner = self._FailRunner()
             p.round = 1
-            item = {"kind": "variant", "pattern": "v1", "source": "c1", "files": [], "lens_hint": "memory"}
+            item = {"kind": "variant", "pattern": "v1", "source": "c1", "files": []}
 
             # 前 max_retries 次失败 → 仍回灌重排
             for expected in (1, 2):
@@ -195,13 +194,13 @@ class TestRecheckGivesUp(unittest.IsolatedAsyncioTestCase):
                 return {"findings": [], "new_surfaces": [], "risk_notes": []}
 
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = Config(target=tmp, out_dir=os.path.join(tmp, "out"), lenses=["memory"],
-                         finders_per_lens=1, max_rounds=1, dry_rounds=1)
+            cfg = Config(target=tmp, out_dir=os.path.join(tmp, "out"),
+                         finders_per_item=1, max_rounds=1, dry_rounds=1)
             cfg.recheck = RecheckSpec(enabled=True, max_retries=1)
             store = RunStore(cfg.out_dir).ensure()
             p = Pipeline(cfg, store=store)
             p.runner = MixedRunner()
-            p._enqueue_variant({"pattern": "v1", "source": "c1", "files": [], "lens_hint": "memory"})
+            p._enqueue_variant({"pattern": "v1", "source": "c1", "files": []})
             p.queue.append({"kind": "task", "region": "r", "objective": "o", "files": []})
 
             import asyncio
@@ -218,7 +217,7 @@ class TestAdjustSeverity(unittest.TestCase):
     def test_adjust_severity_is_legacy_noop(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = _pipe(tmp)
-            p.record_risk({"area": "x", "note": "n", "severity_hint": "high"}, "memory", 1)
+            p.record_risk({"area": "x", "note": "n", "severity_hint": "high"}, 1)
             rid = p.pq[0]["id"]
             self.assertFalse(p.adjust_risk_severity(rid, "low"))
             self.assertEqual([it["id"] for it in p.pq], [rid])

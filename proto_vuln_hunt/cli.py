@@ -12,7 +12,7 @@ import asyncio
 import json
 import sys
 
-from .config import ALL_LENSES, load_config, normalize_model_concurrency, normalize_models
+from .config import load_config, normalize_model_concurrency, normalize_models
 from .store import RunStore
 
 
@@ -28,8 +28,7 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--history-import-from", dest="history_import_from",
                    help="从已有 run 目录或 history.json 导入已分析好的历史问题模式,并跳过 git commit 分析")
     p.add_argument("--threat-model", dest="threat_model", choices=["REMOTE", "LOCAL_UNPRIVILEGED", "BOTH"])
-    p.add_argument("--lenses", help="逗号分隔的 lens 子集,如 memory,integer,dos")
-    p.add_argument("--finders-per-lens", dest="finders_per_lens", type=int)
+    p.add_argument("--finders-per-item", dest="finders_per_item", type=int)
     p.add_argument("--max-rounds", dest="max_rounds", type=int)
     p.add_argument("--dry-rounds", dest="dry_rounds", type=int)
     p.add_argument("--verify-votes", dest="verify_votes", type=int)
@@ -59,13 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
 def _overrides_from_args(args) -> dict:
     overrides = {}
     for k in ("target", "scope", "out_dir", "backend", "concurrency", "history_import_from", "threat_model",
-              "finders_per_lens", "max_rounds", "dry_rounds", "verify_votes",
+              "finders_per_item", "max_rounds", "dry_rounds", "verify_votes",
               "enable_poc", "fresh", "methods_dir", "host", "port", "runs_dir"):
         v = getattr(args, k, None)
         if v is not None:
             overrides[k] = v
-    if getattr(args, "lenses", None):
-        overrides["lenses"] = [s.strip() for s in args.lenses.split(",") if s.strip() in ALL_LENSES]
     if getattr(args, "model_concurrency", None):
         overrides["model_concurrency"] = normalize_model_concurrency(args.model_concurrency)
     return overrides
@@ -86,8 +83,8 @@ def cmd_run(args) -> int:
             "run_mode": cfg.run_mode, "history_import_from": cfg.history_import_from,
             "models": cfg.models, "model_concurrency": cfg.model_concurrency,
             "model_time_windows": cfg.model_time_windows,
-            "concurrency": cfg.concurrency, "lenses": cfg.lenses,
-            "threat_model": cfg.threat_model, "finders_per_lens": cfg.finders_per_lens,
+            "concurrency": cfg.concurrency,
+            "threat_model": cfg.threat_model, "finders_per_item": cfg.finders_per_item,
             "max_rounds": cfg.max_rounds, "dry_rounds": cfg.dry_rounds, "verify_votes": cfg.verify_votes,
             "enable_poc": cfg.enable_poc, "poc_components": cfg.poc_components,
             "poc_enabled": cfg.poc_enabled(), "resume": cfg.resume,

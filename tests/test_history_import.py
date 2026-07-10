@@ -25,8 +25,7 @@ def _cfg(tmp, **overrides):
     vals = {
         "target": tmp,
         "out_dir": os.path.join(tmp, "out"),
-        "lenses": ["memory"],
-        "finders_per_lens": 1,
+        "finders_per_item": 1,
         "concurrency": 2,
         "enable_poc": False,
         "models": dict(_MODELS),
@@ -115,7 +114,6 @@ class HistoryImportPipelineTests(unittest.IsolatedAsyncioTestCase):
             src.save_history([{
                 "pattern": "missing bounds check before memcpy",
                 "source": "abc123 fix overflow",
-                "lens_hint": "memory",
                 "files": ["a.c"],
                 "rationale": "unit",
             }])

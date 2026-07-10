@@ -240,8 +240,6 @@ async function viewNew() {
 
   const backendSel = el("select", { id: "backend" }, ...meta.backends.map(b => el("option", { value: b, selected: b === d.backend ? "" : null }, b)));
   const tmSel = el("select", { id: "threat_model" }, ...["REMOTE", "LOCAL_UNPRIVILEGED", "BOTH"].map(t => el("option", { value: t, selected: t === d.threat_model ? "" : null }, t)));
-  const lensChecks = el("div", { class: "checks" }, ...meta.lenses.map(l =>
-    el("label", {}, el("input", { type: "checkbox", value: l, class: "lens", checked: (d.lenses || []).includes(l) ? "" : null }), l)));
   const modelRoles = meta.roles.filter(role => !["synthesis", "util"].includes(role));
   const modelFieldByRole = {};
   modelRoles.forEach(role => {
@@ -258,8 +256,7 @@ async function viewNew() {
     f("导入已有历史模式 run", historyRunSel),
     f("或导入 run 目录 / history.json", inp("history_import_from", d.history_import_from || "", "text")));
 
-  const lensField = el("label", { class: "field" }, el("span", {}, "lens(攻击面镜头)"), lensChecks);
-  const findersField = f("每 lens finder 数", num("finders_per_lens", d.finders_per_lens));
+  const findersField = f("每审计项 finder 数", num("finders_per_item", d.finders_per_item));
   const left = el("div", {},
     f("目标源码根目录 *", inp("target", "")),
     f("子路径 scope(可选)", inp("scope", "")),
@@ -267,7 +264,6 @@ async function viewNew() {
     f("后端 CLI", backendSel),
     f("并发数", num("concurrency", d.concurrency)),
     f("威胁模型", tmSel),
-    lensField,
   );
   const right = el("div", {},
     findersField,
@@ -292,12 +288,11 @@ async function viewNew() {
       const vals = splitModels(document.getElementById("model_" + role).value);
       if (vals.length) models[role] = vals;
     }
-    const lenses = [...document.querySelectorAll(".lens:checked")].map(c => c.value);
     const payload = {
       target, scope: document.getElementById("scope").value.trim(),
       backend: document.getElementById("backend").value, concurrency: +document.getElementById("concurrency").value,
-      threat_model: document.getElementById("threat_model").value, lenses,
-      finders_per_lens: +document.getElementById("finders_per_lens").value, max_rounds: +document.getElementById("max_rounds").value,
+      threat_model: document.getElementById("threat_model").value,
+      finders_per_item: +document.getElementById("finders_per_item").value, max_rounds: +document.getElementById("max_rounds").value,
       dry_rounds: +document.getElementById("dry_rounds").value, verify_votes: +document.getElementById("verify_votes").value,
       enable_poc: document.getElementById("enable_poc").checked,
       models, model_concurrency: parseKvInts(document.getElementById("model_concurrency").value),
@@ -867,7 +862,7 @@ function viewDashboard(runId) {
   function candKeyOf(d) {
     return d.key || `${(d.file || "").trim()}::${d.line || 0}::${(d.bug_class || "").trim().toLowerCase()}`;
   }
-  const CAND_FIELDS = ["title", "bug_class", "file", "line", "lens", "severity", "function", "description",
+  const CAND_FIELDS = ["title", "bug_class", "file", "line", "audit_unit", "severity", "function", "description",
     "source_to_sink", "variant_of", "confidence", "audit_model", "good_validation_ref", "risk_id", "risk_area",
     "epistemic_verdict", "operational_decision", "decision_reason", "residual_uncertainty", "recommended_next_action",
     "risk_note", "id", "corrected_severity", "tags", "finding_status"];
@@ -1061,7 +1056,7 @@ function viewDashboard(runId) {
     const info = paginate("candidates", list, focusIdx);
     const tbl = el("table", { class: "cand-table" }, el("thead", {}, el("tr", {},
       el("th", {}, "状态"), el("th", {}, "严重度"), el("th", {}, "类别"), el("th", {}, "标题"),
-      el("th", {}, "位置"), el("th", {}, "lens"), el("th", {}, "确认编号"))));
+      el("th", {}, "位置"), el("th", {}, "审计来源"), el("th", {}, "确认编号"))));
     const tb = el("tbody");
     for (const c of info.items) {
       const hasDetails = Array.isArray(c.votes) && c.votes.length || c.decision_reason || c.rejection_reason || c.reason || c.residual_uncertainty || c.risk_note;
@@ -1094,7 +1089,7 @@ function viewDashboard(runId) {
         el("td", {}, c.bug_class || ""),
         titleCell,
         el("td", { class: "loc" }, `${c.file || ""}:${c.line || 0}${c.function ? " · " + c.function : ""}`),
-        el("td", {}, c.lens || ""),
+        el("td", {}, c.audit_unit || ""),
         el("td", {}, confirmedRef)));
     }
     tbl.append(tb);
@@ -1130,7 +1125,7 @@ function viewDashboard(runId) {
     const label = invalid ? "无效证据"
       : (op ? (CAND_STATUS_TXT[op] || op)
         : (decision === "confirm" ? "支持问题" : (decision === "reject" ? "支持非问题" : "证据不足")));
-    const meta = [v.phase, v.model, v.verify_lens ? "视角 " + v.verify_lens : ""].filter(Boolean).join(" · ");
+    const meta = [v.phase, v.model, v.verify_focus ? "重点 " + v.verify_focus : ""].filter(Boolean).join(" · ");
     const reason = nonIssueVoteReason(v);
     return el("div", { class: "vote-card " + (invalid ? "vote-invalid" : (isReal ? "vote-real" : "vote-false")) },
       el("div", { class: "vote-head" },
@@ -1727,7 +1722,7 @@ function viewDashboard(runId) {
 
   function subtaskRow(t) {
     const meta = [
-      (t.lenses || []).length ? (t.lenses || []).join("/") : "",
+      (t.audit_units || []).length ? (t.audit_units || []).join("/") : "",
       t.passes ? `${t.passes} 轮` : "",
       t.candidates ? `候选 ${t.candidates}` : "",
       t.risks ? `风险 ${t.risks}` : "",
@@ -1829,39 +1824,6 @@ function viewDashboard(runId) {
       tabBody.append(el("div", { class: "panel" }, vt));
     }
 
-    // 审计中动态新增的攻击面 —— 每个都会作为新审计单元重新入队、扇出 finder 再审计,
-    // 这里把发现信息(surface_log)与台账记录(kind=surface:状态/pass/候选/风险/lens)join 起来,
-    // 体现“动态扩面 → 进一步处理”的闭环,而非只登记一行。
-    if ((c.surfaces || []).length) {
-      const surfaceRecs = new Map();
-      for (const r of ledger) if (r.kind === "surface") surfaceRecs.set(r.name, r);
-      const audited = c.surfaces.filter(s => {
-        const r = surfaceRecs.get(s.name);
-        return r && r.status && r.status !== "pending";
-      }).length;
-      tabBody.append(el("h3", { class: "section-title" },
-        `审计中动态新增的攻击面 · ${c.surfaces.length} 个(已再审 ${audited})`));
-      const st = el("table", {}, el("thead", {}, el("tr", {},
-        el("th", {}, "状态"), el("th", {}, "动态新增攻击面"), el("th", {}, "来自"),
-        el("th", {}, "发现轮"), el("th", {}, "pass"), el("th", {}, "候选"),
-        el("th", {}, "复查种子"), el("th", {}, "lens"), el("th", {}, "为何可疑"))));
-      const stb = el("tbody");
-      for (const s of c.surfaces) {
-        const r = surfaceRecs.get(s.name) || {};
-        stb.append(el("tr", {},
-          el("td", {}, statusBadge(r.status || "pending")),
-          el("td", {}, s.name || ""),
-          el("td", {}, s.from || ""),
-          el("td", {}, "r" + (s.round || "?")),
-          el("td", {}, String(r.passes || 0)),
-          el("td", {}, String(r.candidates || 0)),
-          el("td", {}, String(r.risks || 0)),
-          el("td", {}, (r.lenses || []).join(", ") || (s.lens_hint || "")),
-          el("td", {}, s.why || "")));
-      }
-      st.append(stb);
-      tabBody.append(el("div", { class: "panel" }, el("div", { class: "table-wrap" }, st)));
-    }
   }
   const STATUS_TXT = { "completed-clean": "✅ 未发现", "completed-findings": "⚠️ 有候选", "in-progress": "🔄 进行中", "incomplete": "⛔ 未审完", "abandoned": "⛔ 复查失败", "pending": "⏳ 待审" };
   function statusBadge(s) { return el("span", {}, STATUS_TXT[s] || s || "?"); }
@@ -1900,14 +1862,14 @@ function viewDashboard(runId) {
     const list = riskStatusFilter === "all" ? all : all.filter(r => riskRecheckOf(r) === riskStatusFilter);
     if (!list.length) { tabBody.append(el("div", { class: "panel empty" }, "当前筛选下暂无风险。")); return; }
     const info = paginate("risks", list);
-    const tbl = el("table", { class: "data-table risk-table" }, el("thead", {}, el("tr", {}, el("th", {}, "风险"), el("th", {}, "主题"), el("th", {}, "位置"), el("th", {}, "说明"), el("th", {}, "lens"), el("th", {}, "排查"), el("th", {}, "候选"))));
+    const tbl = el("table", { class: "data-table risk-table" }, el("thead", {}, el("tr", {}, el("th", {}, "风险"), el("th", {}, "主题"), el("th", {}, "位置"), el("th", {}, "说明"), el("th", {}, "排查"), el("th", {}, "候选"))));
     const tb = el("tbody");
     for (const r of info.items) {
       const sevCell = r.id ? severitySelect(r) : sevPill(r.severity_hint);
       const related = candidatesForRisk(r);
       const ledger = r.id ? ledgerByKey("risk:" + r.id) : null;
       const empty = !candidatesLoaded ? "候选关联加载中…" : (ledger?.candidates ? `候选 ${ledger.candidates}(旧数据未保存关联)` : "—");
-      tb.append(el("tr", {}, el("td", {}, sevCell), el("td", {}, r.area || ""), el("td", { class: "loc" }, r.file || "—"), el("td", {}, r.note || ""), el("td", {}, r.lens || ""), el("td", {}, RECHECK_TXT[r.recheck_status] || r.recheck_status || "—"), el("td", {}, renderRelatedCandidates(related, empty))));
+      tb.append(el("tr", {}, el("td", {}, sevCell), el("td", {}, r.area || ""), el("td", { class: "loc" }, r.file || "—"), el("td", {}, r.note || ""), el("td", {}, RECHECK_TXT[r.recheck_status] || r.recheck_status || "—"), el("td", {}, renderRelatedCandidates(related, empty))));
     }
     tbl.append(tb);
     const panel = el("div", { class: "panel" }, el("div", { class: "table-wrap" }, tbl));
@@ -2047,7 +2009,7 @@ function viewDashboard(runId) {
     if (!filtered.length) { tabBody.append(el("div", { class: "panel empty" }, "当前筛选下暂无历史问题模式。")); return; }
     const info = paginate("history", filtered);
     const tbl = el("table", { class: "data-table history-table" }, el("thead", {}, el("tr", {},
-      el("th", {}, "lens"), el("th", {}, "问题模式"), el("th", {}, "是否排查完"),
+      el("th", {}, "问题模式"), el("th", {}, "是否排查完"),
       el("th", {}, "排查状态"), el("th", {}, "候选"), el("th", {}, "出处"), el("th", {}, "相关文件"))));
     const tb = el("tbody");
     for (const h of info.items) {
@@ -2057,7 +2019,6 @@ function viewDashboard(runId) {
       const related = candidatesForHistory(h);
       const empty = !candidatesLoaded ? "候选关联加载中…" : (v?.candidates ? `候选 ${v.candidates}(旧数据未保存关联)` : "—");
       tb.append(el("tr", {},
-        el("td", {}, el("span", { class: "tag" }, h.lens_hint || "—")),
         el("td", {}, h.pattern || ""),
         el("td", {}, historyCheckText(status)),
         el("td", {}, statusBadge(status || "pending")),

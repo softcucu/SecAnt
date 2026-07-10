@@ -28,63 +28,6 @@ def must_struct(schema: Dict[str, Any]) -> str:
     )
 
 
-# ──────────────────────────── Lens 启发式(内联兜底) ────────────────────────────
-LENS: Dict[str, Dict[str, str]] = {
-    "memory": {"name": "内存破坏", "heuristics": (
-        "堆/栈溢出:memcpy/memmove/strcpy/strcat/sprintf/snprintf 的长度或目标缓冲外部可控、off-by-one、栈数组下标越界;\n"
-        "UAF/double-free:错误路径提前 free、释放后仍用、悬垂回调/链表节点、引用计数配对错误;\n"
-        "OOB 读写:数组/指针算术越界、负偏移、flexible array member 尾随数据未校验长度;\n"
-        "未初始化内存使用导致信息泄露。")},
-    "integer": {"name": "整型溢出/类型混淆", "heuristics": (
-        "算术溢出→欠分配/越界:a*b、len+1、size+hdr 溢出后做 malloc/memcpy;\n"
-        "有符号/无符号混用与截断:int 存长度后转 size_t、(short)len、负长度当无符号用;\n"
-        "网络字节序:ntohl/ntohs/be32toh 后未做上下界校验即用作长度/偏移/索引;\n"
-        "长度字段→分配/拷贝链路全程未夹紧;\n"
-        "类型混淆:union/void*/tag 字段不可信即按某型解释、container_of 误用、强制转换丢弃约束。")},
-    "race": {"name": "竞态/TOCTOU", "heuristics": (
-        "TOCTOU:检查(access/stat/lookup)与使用(open/写)之间状态可被改;\n"
-        "缺锁共享态:多线程/信号/回调并发读写同一结构而无锁或锁粒度错;\n"
-        "double-fetch:对同一不可信输入读两次,两次值可不一致;\n"
-        "信号处理重入与非异步安全调用;连接半关闭/断开期间的悬垂状态与重入。")},
-    "injection": {"name": "注入/反序列化", "heuristics": (
-        "命令注入:system/popen/exec* 拼接含外部数据;\n"
-        "路径穿越/符号链接:../、绝对路径、未规范化、follow symlink;\n"
-        "格式化字符串:printf 族格式串含外部数据;\n"
-        "反序列化:长度/计数/偏移/指针/类型标签直接信任,解析时未校验边界与自洽性,嵌套深度无限。")},
-    "authn": {"name": "认证降级/绕过(设计层)", "heuristics": (
-        "空凭证/默认凭证/调试后门被接受;\n"
-        "非常量时间比较密码/HMAC/token(时序侧信道);\n"
-        "认证回退/降级路径:可被诱导退回到弱认证或无认证;协商时未强制最小安全级;\n"
-        "状态机混淆:未认证态即处理本应认证后才允许的报文/操作;认证步骤可跳过或乱序;\n"
-        "会话/令牌/nonce 可预测或可重放;权限检查缺失或在错误的层做。")},
-    "crypto": {"name": "密码算法误用(设计层)", "heuristics": (
-        "弱/过时算法:MD5/SHA1 做签名、DES/RC4/ECB、可被降级协商到弱套件;\n"
-        "分组模式误用:ECB、固定/可预测 IV、nonce 重用(尤其 GCM/CTR);\n"
-        "完整性缺失:仅加密不认证(无 MAC)、MAC-then-encrypt 误序、可被篡改;\n"
-        "证书/主机名校验被关闭或可绕过、信任任意 CA、不校验链/有效期/吊销;\n"
-        "随机数源弱(rand()/时间种子)用于密钥/IV/nonce/会话;密钥硬编码或日志泄露。")},
-    "dos": {"name": "DoS(含协议设计/空口 DoS)", "heuristics": (
-        "空口/未认证单包即可崩溃或挂死服务(畸形长度/标志/类型字段触发 panic、断言、解引用空指针、除零);\n"
-        "无界递归/无界分配/放大攻击(小输入触发大资源消耗);\n"
-        "解析复杂度炸弹(嵌套/重复字段导致 O(n^2)+);\n"
-        "状态/连接/内存耗尽:无上限的会话表、缓冲、定时器;\n"
-        "死锁/活锁;while(len--) 在 len 为 0/负时下溢成超长循环;协议状态机被诱导进入卡死/重传风暴。")},
-    "infoleak": {"name": "信息泄露", "heuristics": (
-        "未初始化内存外泄:栈/堆缓冲或结构体未清零即整体回传(memcpy/copy_to_user/put_user/send/write 整个 struct);\n"
-        "结构体 padding 泄露:对齐填充字节未清零随整块拷贝外发(逐字段赋值后整体外传);\n"
-        "越界读回传(heartbleed 式):回读/回显长度取自不可信字段且大于实际写入,带出相邻内存;\n"
-        "缓冲区复用残留:复用的发送/响应缓冲未按本次长度清空,带出上次内容;\n"
-        "地址/指针泄露削弱 ASLR:把指针/栈地址/内核地址经日志、错误消息、响应字段、%p 泄出;\n"
-        "敏感数据外泄:密钥/口令/token/会话/内部路径进日志、错误信息、调试/诊断接口、崩溃转储;\n"
-        "预言式泄露:错误码/返回长度/响应时间差异构成 oracle(口令/HMAC 非常量时间比较见 crypto)。")},
-    "resource-realtime": {"name": "嵌入式资源/实时性", "heuristics": (
-        "固定资源池耗尽:连接表、会话表、重组缓冲、mbuf/sk_buff、消息块、DMA descriptor、timer、fd/handle 无上限占用或错误路径不归还;\n"
-        "任务/消息队列堆积:输入可持续 enqueue 但消费者受限、队列满策略错误、丢包/背压缺失、重传风暴放大队列压力;\n"
-        "watchdog/心跳/保活失效:攻击者可让主循环、协议任务或喂狗路径长时间阻塞,触发复位或服务离线;\n"
-        "RTOS/task 栈与实时预算:递归、深调用链、大栈对象、长临界区、阻塞 IO/锁等待导致任务栈溢出、deadline miss 或优先级反转;\n"
-        "中断/回调上下文误用:ISR/timer/callback 中做耗时解析、内存分配、锁等待、日志/IO,或与主任务共享资源造成饥饿/抖动。")},
-}
-
 PROTO_EXTRA = (
     "协议栈专项必查:长度/类型/标志字段未校验即读写;TLV/分片重组的偏移与长度重叠或超界;\n"
     "ntohl 后未夹紧;未认证态报文处理路径;重传/重组/重排序中的状态混淆。"
@@ -93,7 +36,7 @@ PROTO_EXTRA = (
 FINDER_ANGLES = [
     "正向数据流:从不可信输入入口出发,顺着数据流跟到危险操作,沿途找缺失的校验/长度夹紧/状态检查。",
     "反向汇聚:从危险原语(memcpy/分配/解引用/拷贝/格式化/锁/比较等)出发,反向回溯其参数是否最终来自攻击者且未被约束。",
-    "全量清点:用 grep 种子把本 lens 的候选站点在范围内尽量全量列出,再逐一核实(广度优先,重在不漏)。",
+    "全量清点:用 grep/rg 种子把当前审计对象的候选站点在范围内尽量全量列出,再逐一核实(广度优先,重在不漏)。",
     "边界与错误路径:聚焦边界条件(0/负/最大长度/空)、错误与异常处理路径、资源清理与释放路径上的缺陷。",
 ]
 
@@ -103,84 +46,6 @@ ATTACK_METHOD_ANGLES = [
     "围绕威胁分析给出的代码路径做候选站点清点,只在 source→sink 或状态机追踪需要时跳读外部函数。",
     "重点检查前置条件、异常路径和边界状态:攻击方式是否能在合法输入域和真实部署状态下触发坏结果。",
 ]
-
-ATTACK_AUDIT_SKILLS = [
-    {
-        "id": "authn",
-        "label": "认证/授权/凭据审计",
-        "file": "lens-authn.md",
-        "keywords": [
-            "认证", "授权", "口令", "密码", "凭据", "会话", "令牌", "权限", "越权", "绕过",
-            "auth", "authn", "authz", "credential", "password", "token", "session", "privilege", "bypass",
-        ],
-    },
-    {
-        "id": "crypto",
-        "label": "加密/签名/密钥审计",
-        "file": "lens-crypto.md",
-        "keywords": [
-            "加密", "签名", "完整性", "证书", "密钥", "随机", "nonce", "iv", "tls", "算法降级",
-            "crypto", "cipher", "certificate", "key", "signature", "random",
-        ],
-    },
-    {
-        "id": "injection",
-        "label": "注入/路径/反序列化审计",
-        "file": "lens-injection.md",
-        "keywords": [
-            "注入", "命令", "路径", "穿越", "反序列化", "格式化", "解释器", "sql", "shell",
-            "inject", "command", "path", "traversal", "deser", "format", "symlink",
-        ],
-    },
-    {
-        "id": "race",
-        "label": "竞态/TOCTOU/状态竞争审计",
-        "file": "lens-race.md",
-        "keywords": ["竞态", "并发", "toctou", "double-fetch", "锁", "重入", "race", "concurrent", "interleaving"],
-    },
-    {
-        "id": "infoleak",
-        "label": "信息泄露/敏感输出审计",
-        "file": "lens-infoleak.md",
-        "keywords": ["泄露", "嗅探", "敏感", "未初始化", "padding", "地址泄露", "leak", "disclosure", "sniff"],
-    },
-    {
-        "id": "resource-realtime",
-        "label": "资源/实时性/嵌入式可用性审计",
-        "file": "lens-resource-realtime.md",
-        "keywords": [
-            "资源池", "实时", "定时器", "连接表", "消息队列", "descriptor", "watchdog", "任务栈",
-            "优先级反转", "deadline", "rtos", "mbuf", "sk_buff", "资源耗尽",
-        ],
-    },
-    {
-        "id": "dos",
-        "label": "拒绝服务/泛洪/崩溃审计",
-        "file": "lens-dos.md",
-        "keywords": ["拒绝服务", "泛洪", "崩溃", "死锁", "重启", "中断", "放大", "dos", "flood", "crash", "deadlock"],
-    },
-    {
-        "id": "integer",
-        "label": "整数/长度/类型边界审计",
-        "file": "lens-integer.md",
-        "keywords": ["整数", "长度", "溢出", "截断", "符号", "偏移", "序列号", "integer", "overflow", "trunc", "offset", "length"],
-    },
-    {
-        "id": "memory",
-        "label": "内存安全/越界/UAF审计",
-        "file": "lens-memory.md",
-        "keywords": ["内存", "越界", "释放", "uaf", "double-free", "oob", "buffer", "heap", "stack", "use-after-free"],
-    },
-]
-
-VERIFY_LENSES = [
-    "可达性:从真实入口能否构造出到达此处的输入?中途有无 return/校验拦截?",
-    "可控性:触发所需的值/长度/状态/顺序,攻击者能否真正控制?上游是否已夹紧?",
-    "影响:这是 OOB 写 / 信息泄露 / 认证绕过 / RCE 还是仅 DoS?严重度是否名副其实?",
-    "前置条件:是否需要难以满足的特权/竞态窗口/特殊配置才能触发?",
-    "既有缓解:是否已有断言/长度检查/编译期约束/sanitizer 使其无害?",
-]
-
 
 class PromptBuilder:
     """持有运行级常量(目标/威胁模型/方法库等),产出各阶段提示词。"""
@@ -197,17 +62,17 @@ class PromptBuilder:
         self.attack_method_catalog = os.path.join(root, "attack-method-reference-catalog.md")
 
     # ── 方法库接入 ──
-    def methods_instruction(self, lens_key: str, is_proto: bool = True) -> str:
+    def methods_instruction(self, is_proto: bool = True) -> str:
         if not self.methods_ok:
             return ""
-        files = [f"{self.methods_dir}/00-methodology.md", f"{self.methods_dir}/lens-{lens_key}.md"]
+        files = [f"{self.methods_dir}/00-methodology.md"]
         if is_proto:
             files.append(f"{self.methods_dir}/protocol-stack.md")
         bullet = "\n".join(f"  - {f}" for f in files)
         return (
             "**先用 Read 读以下方法文件并严格遵循其方法(权威,优先级高于下方速览)**:\n"
             f"{bullet}\n"
-            "按其中的 **Phase A 清点 → Phase B 逐站点验证、coverage 纪律(每个模式 filed 或 cleared)、"
+            "按其中的 **Phase A 清点 → Phase B 逐站点验证、coverage 纪律(关键模式 filed 或 cleared)、"
             "回合预算(够了就收尾,别无限深挖)** 执行。\n\n"
         )
 
@@ -227,11 +92,6 @@ class PromptBuilder:
     @staticmethod
     def attack_method_angle(idx: int) -> str:
         return ATTACK_METHOD_ANGLES[idx % len(ATTACK_METHOD_ANGLES)]
-
-    @staticmethod
-    def lens_block(lens_key: str) -> str:
-        l = LENS[lens_key]
-        return f"【lens:{lens_key} {l['name']}】聚焦以下并只报这一类(速览;完整方法见方法文件):\n{l['heuristics']}"
 
     @staticmethod
     def _attack_context_text(item: Dict[str, Any]) -> str:
@@ -296,7 +156,7 @@ class PromptBuilder:
         text = self._attack_context_text(item)
         anchor = self._attack_anchor_text(item)
         candidates: List[Dict[str, Any]] = []
-        for skill in [*self._custom_attack_audit_skills(), *ATTACK_AUDIT_SKILLS]:
+        for skill in self._custom_attack_audit_skills():
             path = os.path.join(self.methods_dir, skill["file"])
             if not os.path.isfile(path):
                 continue
@@ -341,7 +201,7 @@ class PromptBuilder:
                 f"**审计 skill 模块**:{profile.get('label')}。这是与当前攻击面/攻击方式强相关的方法模块。\n"
                 "**先用 Read 读以下文件并按其中方法执行**:\n"
                 f"{files}\n"
-                "这些模块只提供审计方法和候选站点清点策略;不要把攻击方式重新归类成 lens,也不要泛扫无关缺陷。\n"
+                "这些模块只提供审计方法和候选站点清点策略;不要泛扫无关缺陷。\n"
             )
         ctx = item.get("attack_context") or {}
         surface = ctx.get("surface") or item.get("objective") or item.get("name") or "当前攻击面"
@@ -360,13 +220,13 @@ class PromptBuilder:
 
     def file_partition(self, item: Dict[str, Any], idx: int) -> str:
         fl: List[str] = item.get("files") or []
-        n = self.cfg.finders_per_lens
+        n = self.cfg.finders_per_item
         if n <= 1 or len(fl) <= 1:
             return ""
         mine = [f for i, f in enumerate(fl) if i % n == idx % n]
         if not mine:
             return ""
-        return f"\n本 finder **优先覆盖这些文件**(其余文件由同 lens 的其它并行 finder 负责,避免重叠):{', '.join(mine)}"
+        return f"\n本 finder **优先覆盖这些文件**(其余文件由同一审计项的其它并行 finder 负责,避免重叠):{', '.join(mine)}"
 
     # ── 攻击树威胁分析 ──
     def threat_analysis(self, schema) -> str:
@@ -398,6 +258,41 @@ class PromptBuilder:
             + must_struct(schema)
         )
 
+    def threat_delta(self, item: Dict[str, Any], graph_summary: Dict[str, Any], schema) -> str:
+        ctx_obj = item.get("attack_context") or {}
+        code_paths = ctx_obj.get("code_paths") or []
+        current = {
+            "kind": item.get("kind"),
+            "objective": item.get("objective") or item.get("name"),
+            "asset": ctx_obj.get("asset_name"),
+            "risk": ctx_obj.get("risk_name"),
+            "attack_goal": ctx_obj.get("attack_goal"),
+            "domain": ctx_obj.get("domain"),
+            "surface": ctx_obj.get("surface"),
+            "surface_type": ctx_obj.get("surface_type"),
+            "method": ctx_obj.get("method") or item.get("name"),
+            "preconditions": ctx_obj.get("preconditions") or [],
+            "code_paths": code_paths or [{"path": p, "description": ""} for p in (item.get("files") or [])],
+        }
+        return (
+            f"你在对 C/C++ 源码做白盒审计后的**威胁分析增量识别**。目标:{self.target}{self.scope_note}(威胁模型:{self.threat})\n"
+            "这不是漏洞复查,也不是继续扩大当前审计项;只判断本次审计过程中是否暴露出需要补充到攻击树威胁分析里的"
+            "新关键资产、关键风险、攻击目标、攻击域、攻击面、攻击方式或代码路径。\n\n"
+            "当前已审计对象:\n"
+            f"```json\n{json.dumps(current, ensure_ascii=False, indent=2)}\n```\n\n"
+            "当前威胁分析摘要(用于去重,已存在的不要重复输出):\n"
+            f"```json\n{json.dumps(graph_summary, ensure_ascii=False, indent=2)}\n```\n\n"
+            "判定要求:\n"
+            "1. 只输出**尚未被现有攻击树覆盖**的威胁分析增量;已有资产/攻击面/攻击方式不要重复造同义节点。\n"
+            "2. 新增攻击面必须是独立入口、协议、接口、服务、端口、文件/配置对象、命令、消息、包或关键状态转换。\n"
+            "3. 不要把共享 helper/危险原语调用点枚举、调用方校验依赖当成攻击面;这类跨调用点隐患属于 risk_notes/recheck,不是攻击树补充。\n"
+            "4. 若只发现了新的攻击方式,把它挂在最贴近的已有资产/风险/攻击目标/攻击域/攻击面语义下;若确有新资产或新风险,再新增对应资产/风险/攻击树。\n"
+            "5. 代码路径必须是本次审计已确认相关或可通过少量定位确认的真实路径;不确定就留空。\n"
+            "6. 没有新增威胁分析信息时,返回 assets=[], attack_trees=[], code_path_mappings=[]。\n"
+            "输出结构沿用完整威胁分析 schema,但这里只表示增量。"
+            + must_struct(schema)
+        )
+
     # ── git 历史:单条提交的「是否安全修复 + 问题模式」判定(每条提交一个 agent) ──
     def history_commit(self, commit: Dict[str, Any], schema) -> str:
         h = commit.get("hash") or ""
@@ -412,7 +307,7 @@ class PromptBuilder:
             "反序列化/认证绕过或降级/加密误用/DoS/信息泄露/嵌入式资源或实时性失效等**安全缺陷**;而非纯功能、重构、格式化、文档、构建/CI 改动。"
             "提交信息里的 fix/security/overflow/CVE/vuln/oob/leak/use-after-free 等是线索,但判定以**改动代码本身**为准。\n"
             "(3) 若相关(security_related=true):精读改动前后的代码,提炼一条**可复用于同类变体排查的问题模式**"
-            "(pattern:根因 + 缺陷类型 + 触发条件的抽象描述,**不要只抄提交标题**),标注最相关的 lens_hint、涉及文件,"
+            "(pattern:根因 + 缺陷类型 + 触发条件的抽象描述,**不要只抄提交标题**),标注涉及文件,"
             "并在 rationale 里简述改动要点与判定理由。后续会据此在全仓搜索同类代码模式。\n"
             "(4) 若不相关:security_related=false 即可,其它字段可留空。\n"
             "只输出这一条提交的判定结果。"
@@ -420,7 +315,7 @@ class PromptBuilder:
         )
 
     # ── 审计 finder ──
-    def audit(self, item: Dict[str, Any], lens_key: str, idx: int, schema,
+    def audit(self, item: Dict[str, Any], audit_unit: str, idx: int, schema,
               audit_profile: Optional[Dict[str, Any]] = None) -> str:
         kind = item.get("kind")
         if kind == "attack_method":
@@ -453,7 +348,7 @@ class PromptBuilder:
             angle_note = (
                 f"- **本 agent 的独特调查角度(#{idx + 1},围绕当前攻击面/攻击方式互补排查)**:"
                 f"{self.attack_method_angle(idx)}{self.file_partition(item, idx)}\n"
-                "(不按 lens 分类泛扫;只判断该攻击方式在该攻击面对应代码中是否存在真实可利用缺陷。)"
+                "(只判断该攻击方式在该攻击面对应代码中是否存在真实可利用缺陷。)"
             )
         elif kind == "task":
             head = f"审计子任务「{item.get('objective')}」(属攻击面区域:{item.get('region') or '?'})"
@@ -466,11 +361,15 @@ class PromptBuilder:
                 f"入口点:{', '.join(item.get('entry_points') or []) or '自行定位'}\n"
                 "**严格限定**:只精读上述范围内的代码;**不要通读范围外的文件**,只在追溯 source→sink 时才跳读外部的相关函数;够了就收尾返回。"
             )
-            audit_guidance = f"{self.methods_instruction(lens_key, True)}{self.lens_block(lens_key)}"
+            audit_guidance = (
+                f"{self.methods_instruction(True)}"
+                "审计要求:围绕当前子任务的不可信输入、信任边界、入口点和相关文件,枚举可达危险路径,"
+                "核实是否存在真实可利用的安全缺陷。\n"
+            )
             angle_note = (
-                f"- **本 finder 的独特调查角度(#{idx + 1},与同 lens 的其它并行 finder 互补,不要重复别人的角度)**:"
+                f"- **本 finder 的独特调查角度(#{idx + 1},与同审计项的其它并行 finder 互补,不要重复别人的角度)**:"
                 f"{self.finder_angle(idx)}{self.file_partition(item, idx)}\n"
-                "(只查这一个 lens;其他 lens 与未覆盖代码由别的 agent / 后续轮次覆盖。)"
+                "(只查当前审计项;未覆盖代码由其它 agent / 后续轮次覆盖。)"
             )
         elif kind == "region":
             head = f"攻击面区域「{item.get('name')}」({item.get('category')})"
@@ -480,32 +379,41 @@ class PromptBuilder:
                 f"信任边界:{item.get('trust_boundary') or '(未注明)'}\n"
                 f"入口点:{', '.join(item.get('entry_points') or []) or '自行定位'}"
             )
-            audit_guidance = f"{self.methods_instruction(lens_key, True)}{self.lens_block(lens_key)}"
+            audit_guidance = (
+                f"{self.methods_instruction(True)}"
+                "审计要求:围绕当前攻击面区域的真实入口、输入对象和状态转换,检查可达、可控且能造成安全影响的缺陷。\n"
+            )
             angle_note = (
-                f"- **本 finder 的独特调查角度(#{idx + 1},与同 lens 的其它并行 finder 互补,不要重复别人的角度)**:"
+                f"- **本 finder 的独特调查角度(#{idx + 1},与同审计项的其它并行 finder 互补,不要重复别人的角度)**:"
                 f"{self.finder_angle(idx)}{self.file_partition(item, idx)}\n"
-                "(只查这一个 lens;其他 lens 与未覆盖代码由别的 agent / 后续轮次覆盖。)"
+                "(只查当前审计项;未覆盖代码由其它 agent / 后续轮次覆盖。)"
             )
         elif kind == "variant":
             head = f"**同类变体排查**:历史问题模式「{item.get('pattern')}」(出处:{item.get('source') or '?'})"
             files = ", ".join(item.get("files") or [])
             ctx = ("任务:理解该历史问题的根因后,在**全仓搜索同类代码模式**(可用 rg / semgrep / tree-sitter 脚本 / "
                    "CodeQL 免编译查询枚举全仓同类站点),逐一核实是否存在相同或相似缺陷。这是有的放矢的定向排查,不是盲扫。")
-            audit_guidance = f"{self.methods_instruction(lens_key, True)}{self.lens_block(lens_key)}"
-            angle_note = (
-                f"- **本 finder 的独特调查角度(#{idx + 1},与同 lens 的其它并行 finder 互补,不要重复别人的角度)**:"
-                f"{self.finder_angle(idx)}{self.file_partition(item, idx)}\n"
-                "(只查这一个 lens;其他 lens 与未覆盖代码由别的 agent / 后续轮次覆盖。)"
+            audit_guidance = (
+                f"{self.methods_instruction(True)}"
+                "审计要求:先理解历史问题的根因和触发条件,再在全仓定向枚举同类代码模式并逐一核实。\n"
             )
-        else:  # surface
-            head = f"**动态新增攻击面**「{item.get('name')}」"
+            angle_note = (
+                f"- **本 finder 的独特调查角度(#{idx + 1},与同审计项的其它并行 finder 互补,不要重复别人的角度)**:"
+                f"{self.finder_angle(idx)}{self.file_partition(item, idx)}\n"
+                "(只查当前审计项;未覆盖代码由其它 agent / 后续轮次覆盖。)"
+            )
+        else:  # legacy surface item
+            head = f"**攻击树补充审计项**「{item.get('name')}」"
             files = ", ".join(item.get("files") or [])
             ctx = f"为何可疑:{item.get('why')}"
-            audit_guidance = f"{self.methods_instruction(lens_key, True)}{self.lens_block(lens_key)}"
+            audit_guidance = (
+                f"{self.methods_instruction(True)}"
+                "审计要求:围绕这个补充审计项的可疑理由和涉及文件,定位真实入口与危险路径并核实是否成立。\n"
+            )
             angle_note = (
-                f"- **本 finder 的独特调查角度(#{idx + 1},与同 lens 的其它并行 finder 互补,不要重复别人的角度)**:"
+                f"- **本 finder 的独特调查角度(#{idx + 1},与同审计项的其它并行 finder 互补,不要重复别人的角度)**:"
                 f"{self.finder_angle(idx)}{self.file_partition(item, idx)}\n"
-                "(只查这一个 lens;其他 lens 与未覆盖代码由别的 agent / 后续轮次覆盖。)"
+                "(只查当前审计项;未覆盖代码由其它 agent / 后续轮次覆盖。)"
             )
 
         return (
@@ -519,7 +427,6 @@ class PromptBuilder:
             "- 用 Read/rg 看**真实代码**,回溯数据流,不要臆测。允许用 semgrep / tree-sitter 小脚本 / CodeQL(免编译)辅助定位同类站点,但判定真伪以人工精读为准。\n"
             "- 每条 finding 必须给出 source→sink 传播路径与可控性判断;命中历史模式则填 variant_of。\n"
             "- **宁缺毋滥**:没有可信外部输入路径、或已被上游夹紧的,不要报。\n"
-            "- 若发现新的值得另派 agent 深挖的攻击面/可疑数据流,放进 new_surfaces。\n"
             "- **即时复查种子**:本轮没坐实成漏洞、但发现「A 调 B,A 做了充分校验所以当前路径安全;B 自身不校验,其它调用 B 的地方未必满足同样前提」时,"
             "放进 risk_notes(area/note/file/severity_hint,尽量补 callee/required_validation/good_validation_ref)。系统会立刻派 recheck agent 消费,不会生成风险报告/存档,不要硬凑成 finding。"
             "**最典型的一类**是「校验只在调用方、被调点本身不自洽」的跨调用点隐患:你在审 A 函数时发现 A 调 B,A 做了充分校验、这条路径没问题;"
@@ -548,7 +455,7 @@ class PromptBuilder:
             "2. 逐一判断调用 B 前是否满足上述校验/不变量;接受语义等价的校验方式,不要只按文本匹配 A 的代码。\n"
             "3. 若 C 调 B 前没有直接校验,继续向上枚举并精读所有可达调用 C 的站点;只有能证明所有到达 B 的路径都在上游完成等价校验,才判安全。\n"
             "4. 对存在未校验路径且输入可控/可达的调用链,回溯 source→sink,坐实后输出 finding;finding 的 good_validation_ref 填 A 正例或另一处等价正例(path:line + 一句话)。\n"
-            "5. 不要输出 risk_notes;未坐实为漏洞就不报。若发现新的独立入口/攻击面,放进 new_surfaces。\n"
+            "5. 不要输出 risk_notes;未坐实为漏洞就不报;也不要输出威胁分析增量,系统会在普通审计项完成后单独询问。\n"
             f"{PROTO_EXTRA}\n\n"
             "要求:看真实代码、回溯数据流,不要臆测;**宁缺毋滥**——没有可信外部输入路径、或已被上游夹紧的不要报。\n"
             "(这是有的放矢的定向变体排查,不是全仓盲扫。)"
@@ -568,7 +475,7 @@ class PromptBuilder:
 
     @staticmethod
     def _proof_obligation(f: Dict[str, Any]) -> str:
-        bc = (f.get("bug_class") or f.get("lens") or "").lower()
+        bc = (f.get("bug_class") or "").lower()
         if any(x in bc for x in ["integer", "overflow", "trunc", "signed"]):
             return (
                 "整数类证明义务:不要把“可控”当成“可溢出”。必须同时核对协议/字段宽度/配置上限、"
@@ -749,11 +656,11 @@ class PromptBuilder:
 
     # ── 对抗性验证:裁决 ──
     def verify_judge(self, f: Dict[str, Any], proof: Dict[str, Any],
-                     disproof: Dict[str, Any], lens: str, schema) -> str:
+                     disproof: Dict[str, Any], focus: str, schema) -> str:
         proof_s = json.dumps(proof or {}, ensure_ascii=False)
         disproof_s = json.dumps(disproof or {}, ensure_ascii=False)
         return (
-            f"你是漏洞验证的**裁判 agent**。当前威胁模型:{self.threat}。裁决重点:{lens}\n\n"
+            f"你是漏洞验证的**裁判 agent**。当前威胁模型:{self.threat}。验证重点:{focus}\n\n"
             "你只裁决正反双方已经给出的结构化证据是否足够;不要重新做大范围审计。"
             "可以用 Read/rg 核对双方引用的少量 path:line,但不能凭直觉补齐缺失证据。\n\n"
             f"{self.verify_methods()}Finding:\n{self._finding_brief(f)}\n"

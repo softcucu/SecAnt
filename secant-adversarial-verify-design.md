@@ -111,7 +111,7 @@ operational_decision: confirmed | rejected | suppressed_unproven | needs_manual_
 
 ## 4. 漏洞类型专项证明义务
 
-验证 prompt 会按 finding 的 `bug_class` / `lens` 注入专项证明义务:
+验证 prompt 会按 finding 的 `bug_class` 注入专项证明义务:
 
 - 整数类:证明合法输入空间内溢出/截断条件可满足，并且结果进入危险 sink；“可控”不等于“可溢出”。
 - 内存类:证明合法输入能让访问范围超出对象边界，或对象生命周期进入 UAF / double-free 状态。

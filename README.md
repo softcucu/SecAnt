@@ -36,7 +36,7 @@ pip install -r requirements.txt          # CLI(run)仅需 PyYAML;Web 控制台(s
 | 后端 | 非交互调用 | 模型名格式 |
 |---|---|---|
 | `claude`   | `claude -p --output-format json ...`(提示词走 stdin) | `claude-opus-4-8` / `claude-sonnet-4-6` |
-| `opencode` | `opencode serve`(长驻 server;每个 agent 新建 session) | `anthropic/claude-sonnet-4-6`、`openai/gpt-5` |
+| `opencode` | `opencode serve`(长驻 server;普通 agent 新建 session,审计后威胁增量续用审计 session 并先压缩) | `anthropic/claude-sonnet-4-6`、`openai/gpt-5` |
 | `codex`    | `codex exec --model <m> <prompt>`                     | `gpt-5-codex` / `o3` |
 
 > claude/codex 默认以"绕过审批/全自动"模式运行(`--dangerously-skip-permissions` /
@@ -51,7 +51,7 @@ pip install -r requirements.txt          # CLI(run)仅需 PyYAML;Web 控制台(s
 ```bash
 cp config.example.yaml my.yaml          # 选后端、配模型、设并发
 python -m proto_vuln_hunt serve --config my.yaml --port 8000
-# 打开 http://127.0.0.1:8000 → 「新建审计」填目标/后端/模型/lens/参数 → 启动
+# 打开 http://127.0.0.1:8000 → 「新建审计」填目标/后端/模型/参数 → 启动
 # 仪表盘:状态/轮次/严重度统计 + 威胁分析攻击树 + 漏洞(实时增量、可展开看 7 段报告)+ 覆盖图 + 历史问题 + 风险 + 活动日志 + 导出
 ```
 
@@ -72,7 +72,7 @@ python -m proto_vuln_hunt run --config my.yaml --target /repo --backend codex \
 
 # 冒烟:小范围、单 finder、单轮、单票、关 PoC
 python -m proto_vuln_hunt run --config my.yaml --target /repo --scope src/x.c \
-  --lenses memory,integer --finders-per-lens 1 --max-rounds 1 --dry-rounds 1 --verify-votes 1 --no-poc
+  --finders-per-item 1 --max-rounds 1 --dry-rounds 1 --verify-votes 1 --no-poc
 
 # 从已有 run 目录或 history.json 导入已分析好的历史问题模式;导入后跳过 git commit 分析
 python -m proto_vuln_hunt run --config my.yaml --target /repo \
@@ -114,7 +114,7 @@ model_time_windows:                   # 单个模型的可用时间段;未列出
     - "22:00~24:00"
 
 params:
-  finders_per_lens: 2
+  finders_per_item: 2
   dry_rounds: 2
   max_rounds: 6
   verify_votes: 3
@@ -123,7 +123,6 @@ params:
   poc_components:                     # 设为 [] 表示不做 PoC 验证,也不要求 models.poc
     - type: minimal_poc               # 内置组件:隔离 worktree 中做最小化 PoC 验证
       min_severity: high
-  lenses: [memory, integer, race, injection, authn, crypto, dos, infoleak, resource-realtime]
 
 methods_dir: proto_vuln_hunt/methods  # 默认即项目自带方法库,无需配置;可覆盖为自定义目录
 
@@ -147,7 +146,8 @@ backends:                             # (可选)自定义任意 CLI 的调用方
 **自定义后端**:`command` 是 token 列表,运行时把 `{model}` 替换为当前角色模型、`{prompt}` 替换为提示词
 (仅 `prompt_mode: arg` 时需要)、`{prompt_file}` 替换为提示词临时文件路径(仅 `prompt_mode: file` 时需要);
 `stdin` 模式则把提示词从标准输入喂入。`prompt_mode: serve` 为 opencode 专用,会启动一个长驻
-`opencode serve` 并为每个 agent 创建新 session。`parse` 决定如何从 stdout 取回 agent 文本
+`opencode serve`;普通 agent 创建新 session,审计完成后的威胁增量问话会先压缩并续用对应审计 session。
+`parse` 决定如何从 stdout 取回 agent 文本
 (`claude_json` 取 JSON 的 `.result`,`text` 直接用 stdout)。
 
 ---
@@ -165,7 +165,7 @@ backends:                             # (可选)自定义任意 CLI 的调用方
 │   ├── raw.json         # 威胁分析 agent 原始结构化输出
 │   ├── graph.json       # SecAnt 内部攻击树图(资产/风险/goal/domain/surface/method)
 │   └── warnings.json    # 规范化告警
-├── attack-surface.json  # 攻击面(初始+动态)+ 覆盖台账 + progress,每轮整体快照(状态持续演变)
+├── attack-surface.json  # 审计覆盖台账 + progress,每轮整体快照(状态持续演变)
 ├── findings/<id>.json   # 每条确认漏洞一个文件(确认即写;含全文/votes/poc,人工反馈可追加更新)
 ├── events.jsonl         # append-only 事件日志(SSE 重放 / 服务重启回看)
 └── exports/             # 按需渲染的 MD/SARIF(Web「导出全部」或 CLI --export 时生成)
@@ -189,7 +189,7 @@ REST/SSE 接口(`serve` 时):`/api/runs`(GET/POST)、`/api/runs/{id}`、`/stop`�
 1. **Threat Analysis + History** — 健康检查后启动基于攻击树的威胁分析(role=`threat`):识别关键资产/风险,生成 `goal → domain → surface → method` 攻击树,并为每个 surface 定位代码路径;history 遍历 `git log`,每条提交派 1 个 agent(role=`history`)判定是否安全修复。
 2. **Unified Scheduler** — 威胁分析输出的每个 `surface × method` 会变成一个 `attack_method` 审计项;history commit 分析从启动起就在统一优先级队列里,与 high audit finder 同级;recheck 最高优先级;候选验证/报告流水线高于普通审计。相同优先级按入队时间 FIFO。若队首任务所需模型容量不可用,调度器会扫描后续任务并先启动有可用模型的任务,避免模型空闲。
 3. **History Feedback** — history 提炼出的「历史问题模式」随挖随补,回灌 Web「历史问题」页签与 recheck 同类变体排查队列。
-4. **Audit** — 工作队列 loop-until-dry:每个攻击树叶子 method × lens × N finder;动态回灌新攻击面;每个审计项完成即存断点。
+4. **Audit + Threat Delta** — 工作队列 loop-until-dry:每个攻击树叶子 method × N finder;普通审计 prompt 只聚焦当前审计项。每个审计项完成后,系统单独询问一次威胁分析增量,将新关键资产/攻击面/攻击方式去重后合入 `threat-analysis/graph.json`,新增 method 再作为普通攻击树审计项入队;每个审计项完成即存断点。
 5. **Verify** — 逐发现运行 witness/blocker 交叉验证:正方构造合法触发 witness,反方构造 blocker/不可满足证明,两个裁判分别质询 witness 与 blocker,终局裁判做定向补查并输出 confirmed/rejected/suppressed_unproven/needs_manual_review。
 6. **Report** — 每条存活漏洞立即生成 7 段式正文,作为结构化记录进 state + 发 `finding_confirmed` 事件(SSE 流式呈现)。
 7. **PoC**(可选) — 由 `poc_components` 插拔式组件驱动;内置 `minimal_poc` 组件会在隔离 git worktree 副本里做最小化 PoC 验证(非 git/编不动则降级静态 PoC)。没有 PoC 组件时跳过该阶段。

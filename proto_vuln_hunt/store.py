@@ -4,7 +4,7 @@
   checkpoint.json      —— 运行时机制态(round/seq/processed/pending/dedup…),高频小幅刷
   history.json         —— git 历史安全修复提炼出的历史问题模式
   threat-analysis/graph.json —— 基于攻击树的威胁分析图(资产/风险/goal/domain/surface/method)
-  attack-surface.json  —— 攻击面(初始+动态)+ 覆盖台账 + progress,每轮整体快照(状态持续演变)
+  attack-surface.json  —— 审计覆盖台账 + progress,每轮整体快照(状态持续演变)
   candidates/<hash>.json —— 每条候选/非问题的当前状态(候选、已确认、已否决、验证失败)
   findings/<id>.json   —— 每条确认漏洞一个文件,确认即写;人工反馈可追加更新
   usage.jsonl          —— 每次 agent 调用的 token 使用记录(真实 usage 或轻量估算)
@@ -78,7 +78,7 @@ class RunStore:
         return os.path.join(self.threat_analysis_dir, "warnings.json")
 
     @property
-    def attack_surface_path(self) -> str:        # 攻击面(初始+动态)+ 覆盖台账(每轮快照)
+    def attack_surface_path(self) -> str:        # 审计覆盖台账(每轮快照)
         return os.path.join(self.dir, "attack-surface.json")
 
     @property
@@ -212,7 +212,7 @@ class RunStore:
         d = self._read_json(self.threat_analysis_path)
         return d if isinstance(d, dict) else {}
 
-    # attack-surface:攻击面(初始+动态)+ 覆盖台账 + progress
+    # attack-surface:审计覆盖台账 + progress
     def save_attack_surface(self, d: Dict[str, Any]) -> None:
         _atomic_write(self.attack_surface_path, json.dumps(d, ensure_ascii=False, indent=2))
 

@@ -55,9 +55,9 @@ def render_threat_analysis_md(state: Dict[str, Any], meta: Dict[str, Any]) -> st
         item_table = "(威胁分析未生成审计项)"
     hist = state.get("history") or []
     if hist:
-        rows = ["| 历史问题模式 | 出处 | 相关 lens | 涉及文件 |", "|---|---|---|---|"]
+        rows = ["| 历史问题模式 | 出处 | 涉及文件 |", "|---|---|---|"]
         for h in hist:
-            rows.append(f"| {_nl(h.get('pattern'))} | {h.get('source') or ''} | {h.get('lens_hint') or ''} | {', '.join(h.get('files') or [])} |")
+            rows.append(f"| {_nl(h.get('pattern'))} | {h.get('source') or ''} | {', '.join(h.get('files') or [])} |")
         hist_table = "\n".join(rows)
     else:
         hist_table = "(未提炼到历史问题模式)"
@@ -76,7 +76,6 @@ def render_threat_analysis_md(state: Dict[str, Any], meta: Dict[str, Any]) -> st
 def render_attack_surface_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str:
     sn = _scope_note(meta)
     attack_items = (state.get("threatAnalysis") or {}).get("audit_items") or []
-    surface_log = state.get("surfaceLog") or []
     ledger = state.get("auditLedger") or []
     led_by_key = {r.get("key"): r for r in ledger}
 
@@ -95,36 +94,27 @@ def render_attack_surface_md(state: Dict[str, Any], meta: Dict[str, Any]) -> str
         init_table = "\n".join(rows)
     else:
         init_table = "(无)"
-    if surface_log:
-        rows = ["| 状态 | 轮次 | 新增攻击面 | 来自 | 为何可疑 | 相关 lens | 涉及文件 |", "|---|---|---|---|---|---|---|"]
-        for s in surface_log:
-            rows.append(f"| {label('surface:' + str(s.get('name')))} | r{s.get('round') or '?'} | {s.get('name') or ''} | "
-                        f"{s.get('from') or ''} | {_nl(s.get('why'))} | {s.get('lens_hint') or ''} | {', '.join(s.get('files') or [])} |")
-        dyn_table = "\n".join(rows)
-    else:
-        dyn_table = "(本次审计未动态发现新的攻击面)"
     ord_map = {"completed-findings": 0, "in-progress": 1, "completed-clean": 2, "pending": 3}
     led = sorted(ledger, key=lambda r: ord_map.get(r.get("status"), 9))
     if led:
-        rows = ["| 状态 | 工作项 | 类型 | 审计轮数(passes) | 覆盖 lens | 候选数 | 新攻击面 | 即时复查种子 | 末轮 |",
-                "|---|---|---|---|---|---|---|---|---|"]
+        rows = ["| 状态 | 工作项 | 类型 | 审计轮数(passes) | 审计来源 | 候选数 | 即时复查种子 | 末轮 |",
+                "|---|---|---|---|---|---|---|---|"]
         for r in led:
             rows.append(f"| {LEDGER_STATUS.get(r.get('status'), r.get('status'))} | {r.get('name') or ''} | {r.get('kind') or ''} | "
-                        f"{r.get('passes') or 0} | {'/'.join(r.get('lenses') or [])} | {r.get('candidates') or 0} | "
-                        f"{r.get('surfaces') or 0} | {r.get('risks') or 0} | r{r.get('lastRound') or 0} |")
+                        f"{r.get('passes') or 0} | {'/'.join(r.get('audit_units') or [])} | {r.get('candidates') or 0} | "
+                        f"{r.get('risks') or 0} | r{r.get('lastRound') or 0} |")
         led_table = "\n".join(rows)
     else:
         led_table = "(尚无审计记录)"
     n_done = sum(1 for r in ledger if str(r.get("status")).startswith("completed"))
     n_clean = sum(1 for r in ledger if r.get("status") == "completed-clean")
     return (
-        f"# 攻击面(初始 + 审计中动态扩展)+ 审计覆盖 — {meta.get('target')}{sn}\n\n"
+        f"# 攻击树审计覆盖 — {meta.get('target')}{sn}\n\n"
         f"**威胁模型**: {meta.get('threat_model')}　|　详见 THREAT-ANALYSIS.md。\n"
         f"**状态图例**: {'　'.join(LEDGER_STATUS.values())}\n"
         f"**进度**: 已完成 {n_done} 项(其中未发现漏洞 {n_clean} 项),台账共 {len(ledger)} 项。\n\n"
         f"## A. 攻击树审计项\n{init_table}\n\n"
-        f"## B. 审计中动态新增的攻击面\n{dyn_table}\n\n"
-        f"## C. 审计覆盖台账(每个工作项的结果,含\"审过但未发现漏洞\")\n{led_table}\n\n"
+        f"## B. 审计覆盖台账(每个工作项的结果,含\"审过但未发现漏洞\")\n{led_table}\n\n"
         "---\n*由 proto-vuln-hunt(python) 从结构化态导出。*\n"
     )
 
@@ -138,7 +128,7 @@ def _render_verify_votes_md(votes: List[Dict[str, Any]]) -> str:
         phase = v.get("phase") or "verify"
         decision = v.get("decision") or ("confirm" if v.get("is_real") else "reject")
         valid = "合格" if v.get("validation_ok", True) else f"无效: {v.get('validation_reason') or '未通过证据门槛'}"
-        meta = " / ".join(x for x in [phase, decision, v.get("verify_lens") or "", v.get("model") or ""] if x)
+        meta = " / ".join(x for x in [phase, decision, v.get("verify_focus") or "", v.get("model") or ""] if x)
         rows.append(f"\n### 验证记录 {i}: {meta}\n\n")
         rows.append(f"- 证据有效性: {valid}\n")
         if v.get("verdict_confidence"):
