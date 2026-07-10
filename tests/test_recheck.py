@@ -270,6 +270,29 @@ class TestConfig(unittest.TestCase):
         cfg.recheck.enabled = False
         self.assertEqual(cfg.model_config_error(), "")
 
+    def test_no_poc_components_do_not_require_poc_model(self):
+        cfg = Config(
+            models={
+                "threat": ["m"],
+                "audit": ["m"],
+                "verify": ["m"],
+                "report": ["m"],
+            },
+            enable_poc=True,
+            poc_components=[],
+        )
+        cfg.history.enabled = False
+        cfg.recheck.enabled = False
+
+        self.assertFalse(cfg.poc_enabled())
+        self.assertEqual(cfg.required_model_roles(), ["threat", "audit", "verify", "report"])
+        self.assertEqual(cfg.model_config_error(), "")
+
+    def test_legacy_poc_type_aliases_to_minimal_poc(self):
+        cfg = Config(poc_components=[{"type": "agent"}, {"type": "harness"}])
+
+        self.assertEqual(cfg.poc_components, [{"type": "minimal_poc"}, {"type": "minimal_poc"}])
+
     def test_active_models_only_include_required_roles(self):
         cfg = Config(
             models={

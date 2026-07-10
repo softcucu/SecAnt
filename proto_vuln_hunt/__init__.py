@@ -4,6 +4,7 @@
 """
 from .config import Config, load_config
 from .pipeline import Pipeline
+from .poc import BasePocComponent, register_poc_component
 
-__all__ = ["Config", "load_config", "Pipeline"]
+__all__ = ["Config", "load_config", "Pipeline", "BasePocComponent", "register_poc_component"]
 __version__ = "0.2.0"

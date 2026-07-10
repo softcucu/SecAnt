@@ -119,7 +119,10 @@ params:
   max_rounds: 6
   verify_votes: 3
   threat_model: REMOTE                # REMOTE | LOCAL_UNPRIVILEGED | BOTH
-  enable_poc: true
+  enable_poc: true                    # 总开关;还需要 poc_components 非空才执行
+  poc_components:                     # 设为 [] 表示不做 PoC 验证,也不要求 models.poc
+    - type: minimal_poc               # 内置组件:隔离 worktree 中做最小化 PoC 验证
+      min_severity: high
   lenses: [memory, integer, race, injection, authn, crypto, dos, infoleak, resource-realtime]
 
 methods_dir: proto_vuln_hunt/methods  # 默认即项目自带方法库,无需配置;可覆盖为自定义目录
@@ -189,7 +192,7 @@ REST/SSE 接口(`serve` 时):`/api/runs`(GET/POST)、`/api/runs/{id}`、`/stop`�
 4. **Audit** — 工作队列 loop-until-dry:每个攻击树叶子 method × lens × N finder;动态回灌新攻击面;每个审计项完成即存断点。
 5. **Verify** — 逐发现运行 witness/blocker 交叉验证:正方构造合法触发 witness,反方构造 blocker/不可满足证明,两个裁判分别质询 witness 与 blocker,终局裁判做定向补查并输出 confirmed/rejected/suppressed_unproven/needs_manual_review。
 6. **Report** — 每条存活漏洞立即生成 7 段式正文,作为结构化记录进 state + 发 `finding_confirmed` 事件(SSE 流式呈现)。
-7. **PoC**(可选) — 高危项在隔离 git worktree 副本里尝试最小化编译触发(非 git/编不动则降级静态 PoC)。
+7. **PoC**(可选) — 由 `poc_components` 插拔式组件驱动;内置 `minimal_poc` 组件会在隔离 git worktree 副本里做最小化 PoC 验证(非 git/编不动则降级静态 PoC)。没有 PoC 组件时跳过该阶段。
 7. **Synthesis** — 去重 + 写汇总到 `run.json`/`state.json` + 发 `run_done`(MD/SARIF 留待导出时渲染)。
 
 ---

@@ -23,7 +23,7 @@ models:
     - claude-opus-4-8
   verify: claude-sonnet-4-6     # 对抗验证
   report: claude-sonnet-4-6     # 确认漏洞报告正文
-  poc: claude-sonnet-4-6        # 高危 PoC/harness 尝试(enable_poc=true 时需要)
+  poc: claude-sonnet-4-6        # 内置 minimal_poc 组件启用时需要;无 PoC 组件时不需要
 
 # ── 并发 ──
 # concurrency 是全局 agent 上限;model_concurrency 是单个模型自己的上限。
@@ -72,7 +72,10 @@ params:
   run_mode: full                # 2.0 仅支持完整流程;保留字段用于 run 清单显示
   # history_import_from: ./pvh-runs/<run_id>  # 可选:从既有 run 目录或 history.json 导入历史问题模式;导入后跳过 git commit 分析
   threat_model: REMOTE          # REMOTE | LOCAL_UNPRIVILEGED | BOTH
-  enable_poc: true              # 高危项是否进隔离 worktree 编译 PoC
+  enable_poc: true              # PoC 总开关;为 true 且 poc_components 非空时才执行
+  poc_components:               # 插拔式 PoC 组件;设为 [] 表示不做 PoC 验证
+    - type: minimal_poc         # 内置组件:隔离 worktree 中做最小化 PoC 验证
+      min_severity: high        # 默认只对 high/critical 运行
   lenses: [memory, integer, race, injection, authn, crypto, dos, infoleak, resource-realtime]
 
 # ── git 历史问题模式挖掘(统一调度队列中与 high audit finder 同级) ──

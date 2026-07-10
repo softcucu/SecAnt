@@ -27,7 +27,7 @@ _DASHBOARD_USAGE_LIMIT = 80
 _RUN_FIELDS = {
     "target", "scope", "backend", "concurrency", "history_import_from", "threat_model", "lenses",
     "finders_per_lens", "max_rounds", "dry_rounds", "verify_votes",
-    "enable_poc", "methods_dir", "models", "model_concurrency", "model_time_windows", "resume", "fresh",
+    "enable_poc", "poc_components", "methods_dir", "models", "model_concurrency", "model_time_windows", "resume", "fresh",
 }
 
 # 续跑历史任务时,这些"后端/模型/并发"字段改用本次启动的基础配置(self.base,随服务重启读取最新
@@ -397,6 +397,7 @@ def create_app(cfg: Config, config_path: Optional[str] = None, overrides: Option
                 "finders_per_lens": cfg.finders_per_lens, "max_rounds": cfg.max_rounds,
                 "dry_rounds": cfg.dry_rounds, "verify_votes": cfg.verify_votes,
                 "enable_poc": cfg.enable_poc,
+                "poc_components": cfg.poc_components,
                 "methods_dir": cfg.methods_abs,
                 "health": {"enabled": cfg.health.enabled, "on_start": cfg.health.on_start,
                            "gate": cfg.health.gate, "ttl_s": cfg.health.ttl_s},

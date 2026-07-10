@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import events as EV
 from . import schemas as S
@@ -27,6 +27,7 @@ from .common import (QUALITY_FINDING_STATUS, QUALITY_FINDING_TAG, class_code,
                      finalize_findings, finding_key, is_quality_issue_finding,
                      item_key, most_severe, pad3, slim_finding)
 from .config import Config, normalize_model_time_windows_with_errors, normalize_models
+from .poc import PocComponent, build_poc_components
 from .prompts import PromptBuilder
 from .store import RunStore, STATUS_DONE, STATUS_ERROR, STATUS_INCOMPLETE, STATUS_RUNNING, STATUS_STOPPED
 
@@ -98,6 +99,7 @@ class Pipeline:
         self._poc_worktree: Optional[str] = None
         self._poc_worktree_disabled = False   # 非 git 仓 / 建失败 → 回退主仓目录,且不再反复尝试
         self._poc_lock: Optional[asyncio.Lock] = None  # 惰性创建(兼容 py3.8 在事件循环外构造)
+        self.poc_components: List[PocComponent] = build_poc_components(cfg.active_poc_component_specs())
 
     # ──────────────────────── 日志 / 事件 ────────────────────────
     @staticmethod
@@ -667,6 +669,7 @@ class Pipeline:
             "lenses": cfg.lenses, "finders_per_lens": cfg.finders_per_lens,
             "max_rounds": cfg.max_rounds, "dry_rounds": cfg.dry_rounds,
             "verify_votes": cfg.verify_votes, "enable_poc": cfg.enable_poc,
+            "poc_components": cfg.poc_components,
             "methods_dir": cfg.methods_abs, "methods_ok": cfg.methods_ok(),
         }
 
@@ -1305,10 +1308,11 @@ class Pipeline:
                    "votes": votes, "verify_models": verify_models}
 
             poc = None
-            if self.cfg.enable_poc and corrected in ("critical", "high"):
+            if self.poc_components and corrected in ("critical", "high"):
                 poc = await self.run_poc(rec)
                 if poc:
-                    self.emit(EV.POC_DONE, {"id": fid, "compiled": poc.get("compiled"), "triggered": poc.get("triggered")})
+                    compiled, triggered = self._poc_status(poc)
+                    self.emit(EV.POC_DONE, {"id": fid, "compiled": compiled, "triggered": triggered})
 
             body = await self.runner.run(self.pb.report_body(rec, poc),
                                          role="report", label=f"report:{fid}", schema=None, fallback=None)
@@ -1405,11 +1409,51 @@ class Pipeline:
             pass
 
     async def run_poc(self, rec: Dict[str, Any]) -> Any:
+        if not self.poc_components:
+            return None
         # 串行 + 复用同一 worktree:挡住并发冷启动的内存尖峰,并保护这个共享目录。
         async with self._poc_lock_get():
-            cwd = self._ensure_poc_worktree()
-            return await self.runner.run(self.pb.poc(rec, self.build_hint, S.POC_SCHEMA),
-                                         role="poc", label=f"poc:{rec['id']}", schema=S.POC_SCHEMA, cwd=cwd)
+            results: List[Dict[str, Any]] = []
+            for component in self.poc_components:
+                if not component.should_run(rec):
+                    continue
+                try:
+                    result = await component.run(self, rec)
+                except Exception as e:  # noqa: BLE001
+                    self.log(f"⚠ PoC 组件 {component.name} 执行失败: {str(e)[:140]}")
+                    continue
+                if result:
+                    results.append({
+                        "component": component.name,
+                        "type": getattr(component, "component_type", component.name),
+                        "result": result,
+                    })
+            if not results:
+                return None
+            if len(results) == 1:
+                item = results[0]
+                result = item["result"]
+                if isinstance(result, dict):
+                    out = dict(result)
+                    out.setdefault("component", item["component"])
+                    out.setdefault("component_type", item["type"])
+                    return out
+                return item
+            compiled = any(bool((r.get("result") or {}).get("compiled")) for r in results if isinstance(r.get("result"), dict))
+            triggered = any(bool((r.get("result") or {}).get("triggered")) for r in results if isinstance(r.get("result"), dict))
+            return {"components": results, "compiled": compiled, "triggered": triggered}
+
+    @staticmethod
+    def _poc_status(poc: Any) -> Tuple[Optional[bool], Optional[bool]]:
+        if not isinstance(poc, dict):
+            return None, None
+        if isinstance(poc.get("components"), list):
+            compiled = any(bool((r.get("result") or {}).get("compiled"))
+                           for r in poc["components"] if isinstance(r, dict) and isinstance(r.get("result"), dict))
+            triggered = any(bool((r.get("result") or {}).get("triggered"))
+                            for r in poc["components"] if isinstance(r, dict) and isinstance(r.get("result"), dict))
+            return compiled, triggered
+        return poc.get("compiled"), poc.get("triggered")
 
     # ──────────────────────── 历史模式导入 ────────────────────────
     @staticmethod
@@ -2277,7 +2321,7 @@ class Pipeline:
         self.emit(EV.RUN_STATUS, {"status": STATUS_RUNNING})
         self.log(f"目标={self.cfg.target}{sn} 模式={self.cfg.run_mode} 后端={self.cfg.backend} 并发={self.cfg.concurrency} "
                  f"攻击树威胁分析→攻击方式审计 每项finder={self.cfg.finders_per_lens} dryRounds={self.cfg.dry_rounds} "
-                 f"maxRounds={self.cfg.max_rounds} 验证=witness/blocker(5-agent) PoC={self.cfg.enable_poc} "
+                 f"maxRounds={self.cfg.max_rounds} 验证=witness/blocker(5-agent) PoC={bool(self.poc_components)} "
                  f"resume={self.cfg.resume} 威胁模型={self.cfg.threat_model}")
         self.log(f"启用 lens: {', '.join(self.cfg.lenses)} | run 目录: {self.store.dir} | "
                  f"方法库: {self.cfg.methods_abs} ({'就绪' if self.cfg.methods_ok() else '不可用→内联兜底'})")

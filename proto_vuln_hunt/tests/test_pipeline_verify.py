@@ -23,8 +23,10 @@ class FakeRunner:
         self.report_response = "REPORT BODY"
         self.agent_count = 0
         self.usage_totals = {}
+        self.calls = []
 
     async def run(self, prompt, role=None, label=None, schema=None, fallback=None, **kwargs):
+        self.calls.append({"role": role, "label": label, "schema": schema, "kwargs": kwargs})
         if role == "verify":
             return self.verify_responses.pop(0) if self.verify_responses else None
         if role == "report":
@@ -186,7 +188,9 @@ class _PipelineTestBase(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self._tmp.cleanup)
 
     def make_pipeline(self, **cfg_over):
-        cfg = Config(out_dir=self._tmp.name, enable_poc=False, **cfg_over)
+        cfg_vals = {"out_dir": self._tmp.name, "enable_poc": False}
+        cfg_vals.update(cfg_over)
+        cfg = Config(**cfg_vals)
         events = []
         p = Pipeline(cfg, store=RunStore(self._tmp.name).ensure(),
                      emitter=lambda etype, data, persist=True: events.append((etype, data)))
@@ -227,6 +231,21 @@ class TestAdversarialVerify(_PipelineTestBase):
         self.assertEqual(cands[0]["id"], "MEM-001")
         self.assertEqual(len(p.confirmed[0]["votes"]), 5)
         self.assertTrue(any(v.get("phase") == "witness" for v in p.confirmed[0]["votes"]))
+
+    async def test_no_poc_components_skip_poc_for_high_finding(self):
+        """enable_poc=true 但组件列表为空时,高危确认项不派 PoC agent。"""
+        p = self.make_pipeline(
+            enable_poc=True,
+            poc_components=[],
+            models={"threat": ["m"], "audit": ["m"], "verify": ["m"], "report": ["m"]},
+        )
+        p.runner.verify_responses = [_witness(), _blocker(False), _witness_review("accepted"), _blocker_review("invalid"), _final("confirmed")]
+        await p.process_finding(_finding())
+
+        self.assertEqual(len(p.confirmed), 1)
+        self.assertIsNone(p.confirmed[0]["poc"])
+        self.assertNotIn("poc", [c["role"] for c in p.runner.calls])
+        self.assertNotIn(EV.POC_DONE, self._event_types(p))
 
     async def test_global_blocker_rejects(self):
         """global blocker 被终局确认 → 标记 rejected,不入 confirmed。"""

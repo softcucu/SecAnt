@@ -14,6 +14,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from .poc import (DEFAULT_POC_COMPONENTS, active_poc_component_specs,
+                  normalize_poc_components, required_model_roles_for_poc_specs)
+
 try:
     import yaml  # type: ignore
     _HAS_YAML = True
@@ -198,6 +201,8 @@ class Config:
     verify_votes: int = 3
     threat_model: str = "REMOTE"
     enable_poc: bool = True
+    # PoC 组件列表。默认 minimal_poc 组件保留旧行为;设为 [] 时即使 enable_poc=true 也不会执行 PoC。
+    poc_components: List[Dict[str, Any]] = field(default_factory=lambda: [dict(x) for x in DEFAULT_POC_COMPONENTS])
     lenses: List[str] = field(default_factory=lambda: list(ALL_LENSES))
     # 方法库 / 断点(默认用项目自带的 methods/;可在配置里覆盖为自定义目录)
     methods_dir: str = BUNDLED_METHODS_DIR
@@ -232,6 +237,7 @@ class Config:
         self.dry_rounds = max(1, int(self.dry_rounds))
         self.max_rounds = max(1, int(self.max_rounds))
         self.verify_votes = max(1, int(self.verify_votes))
+        self.poc_components = normalize_poc_components(self.poc_components)
         self.recheck.concurrency = max(1, int(self.recheck.concurrency))
         if self.recheck.risk_min_severity not in ("high", "medium", "low", "info"):
             self.recheck.risk_min_severity = "medium"
@@ -347,14 +353,21 @@ class Config:
                     seen.append(m)
         return seen
 
+    def active_poc_component_specs(self) -> List[Dict[str, Any]]:
+        return active_poc_component_specs(enable_poc=self.enable_poc, components=self.poc_components)
+
+    def poc_enabled(self) -> bool:
+        return bool(self.active_poc_component_specs())
+
     def required_model_roles(self) -> List[str]:
         roles = ["threat", "audit", "verify", "report"]
         if self.history.enabled and not self.history_import_from:
             roles.append("history")
         if self.recheck.enabled:
             roles.append("recheck")
-        if self.enable_poc:
-            roles.append("poc")
+        for role in required_model_roles_for_poc_specs(self.active_poc_component_specs()):
+            if role not in roles:
+                roles.append(role)
         return [r for r in TASK_MODEL_ROLES if r in roles]
 
     def missing_model_roles(self) -> List[str]:
@@ -592,6 +605,24 @@ def load_config(path: Optional[str], overrides: Optional[Dict[str, Any]] = None)
         sub = data.pop(section, {}) or {}
         for k, v in sub.items():
             data.setdefault(k, v)
+
+    # PoC 组件配置:兼容顶层 `enable_poc` / `poc_components`,也支持:
+    # poc:
+    #   enabled: true
+    #   components:
+    #     - type: minimal_poc
+    # 旧配置 type: agent / harness 会作为 minimal_poc 的兼容别名处理。
+    poc_data = data.pop("poc", None)
+    if poc_data is not None:
+        if isinstance(poc_data, dict):
+            if "enabled" in poc_data:
+                data.setdefault("enable_poc", bool(poc_data.get("enabled")))
+            if "components" in poc_data:
+                data.setdefault("poc_components", poc_data.get("components"))
+            elif "type" in poc_data or "kind" in poc_data:
+                data.setdefault("poc_components", [poc_data])
+        else:
+            data.setdefault("poc_components", poc_data)
 
     # 后端定义:合并内置默认 + 用户自定义
     user_backends = data.pop("backends", {}) or {}
