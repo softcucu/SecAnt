@@ -6,7 +6,6 @@ object and turns it into a tolerant graph snapshot plus audit items.
 """
 from __future__ import annotations
 
-import re
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -60,24 +59,6 @@ def _priority_from_asset(asset: Dict[str, Any]) -> str:
     if c == "low":
         return "low"
     return "medium"
-
-
-def _lens_hint(method_name: str) -> str:
-    s = (method_name or "").lower()
-    rules = [
-        ("authn", r"认证|授权|口令|凭据|token|session|credential|auth|bypass"),
-        ("crypto", r"签名|完整性|加密|证书|密钥|随机|nonce|iv|tls|crypto|cipher"),
-        ("injection", r"注入|路径|穿越|命令|反序列化|格式化|symlink|path|inject|deser"),
-        ("race", r"竞态|toctou|double.fetch|race|concurr"),
-        ("infoleak", r"泄露|嗅探|信息|未初始化|leak|disclosure"),
-        ("dos", r"泛洪|耗尽|拒绝服务|中断|崩溃|死锁|重启|dos|flood|exhaust"),
-        ("integer", r"长度|整数|溢出|截断|序列号|offset|length|integer|overflow"),
-        ("memory", r"越界|释放|uaf|double.free|oob|buffer|memory"),
-    ]
-    for lens, pat in rules:
-        if re.search(pat, s, re.IGNORECASE):
-            return lens
-    return "dos"
 
 
 def _nodes_by_parent(nodes: Dict[str, Dict[str, Any]]) -> Dict[Optional[str], List[Dict[str, Any]]]:
@@ -280,8 +261,6 @@ def normalize(raw: Dict[str, Any]) -> Dict[str, Any]:
             "objective": f"{surface_name} / {method_name}",
             "priority": _priority_from_asset(asset),
             "files": files,
-            "lens_hint": _lens_hint(method_name),
-            "lens_hints": [_lens_hint(method_name)],
             "attack_context": {
                 "asset_id": method.get("asset_id"),
                 "asset_name": asset.get("name") or "",
@@ -331,4 +310,3 @@ def normalize(raw: Dict[str, Any]) -> Dict[str, Any]:
             "audit_items": len(audit_items),
         },
     }
-

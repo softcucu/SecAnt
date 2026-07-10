@@ -679,9 +679,6 @@ class Pipeline:
     # ──────────────────────── lens 选择 ────────────────────────
     def lenses_for(self, item: Dict[str, Any]) -> List[str]:
         active = self.cfg.lenses
-        if item.get("kind") == "attack_method":
-            hits = [l for l in (item.get("lens_hints") or [item.get("lens_hint")]) if l in active]
-            return hits or active
         if item.get("kind") == "task":
             hits = [l for l in (item.get("lens_hints") or []) if l in active]
             return hits or active
@@ -1731,21 +1728,41 @@ class Pipeline:
         rec["lastRound"] = self.round
         rec["status"] = "in-progress"
         audit_id = f"{ik}#{item['pass']}#{self.round}"
-        lenses = self.lenses_for(item)
         pending = 0
-        for lens_key in lenses:
-            if lens_key not in rec["lenses"]:
-                rec["lenses"].append(lens_key)
-            for i in range(self.cfg.finders_per_lens):
+        if item.get("kind") == "attack_method":
+            profile = self.pb.attack_method_audit_profile(item)
+            audit_key = profile.get("id") or "generic-attack-method"
+            rec["audit_skill"] = profile.get("label") or audit_key
+            rec["audit_skill_files"] = profile.get("files") or []
+            if audit_key not in rec["lenses"]:
+                rec["lenses"].append(audit_key)
+            for i in range(max(1, int(self.cfg.finders_per_lens))):
                 self._enqueue_work({
                     "kind": "_finder",
                     "audit_id": audit_id,
                     "item": item,
-                    "lens_key": lens_key,
+                    "audit_key": audit_key,
+                    "audit_profile": profile,
                     "idx": i,
                     "priority": item.get("priority"),
                 })
                 pending += 1
+        else:
+            lenses = self.lenses_for(item)
+            for lens_key in lenses:
+                if lens_key not in rec["lenses"]:
+                    rec["lenses"].append(lens_key)
+                for i in range(self.cfg.finders_per_lens):
+                    self._enqueue_work({
+                        "kind": "_finder",
+                        "audit_id": audit_id,
+                        "item": item,
+                        "lens_key": lens_key,
+                        "audit_key": lens_key,
+                        "idx": i,
+                        "priority": item.get("priority"),
+                    })
+                    pending += 1
         self._audit_passes[audit_id] = {"item": item, "rec": rec, "pending": pending}
         self.emit(EV.ROUND_START, {"round": self.round, "queue_len": len(self.queue)})
         if pending == 0:
@@ -1759,7 +1776,11 @@ class Pipeline:
         item = st["item"]
         rec = st["rec"]
         try:
-            await self._run_finder(item, work.get("lens_key") or "memory", int(work.get("idx") or 0), rec)
+            audit_key = work.get("audit_key") or work.get("lens_key") or "memory"
+            await self._run_finder(
+                item, audit_key, int(work.get("idx") or 0), rec,
+                audit_profile=work.get("audit_profile") if isinstance(work.get("audit_profile"), dict) else None,
+            )
         except Exception as e:  # noqa: BLE001
             item["failedFinders"] = item.get("failedFinders", 0) + 1
             self.log(f"⚠ finder 调度异常,审计项稍后重试: {str(e)[:140]}")
@@ -1981,21 +2002,22 @@ class Pipeline:
                  f"动态攻击面 {len(self.surface_log)} 个。")
         return stop_reason
 
-    async def _run_finder(self, item: Dict[str, Any], lens_key: str, idx: int, rec: Dict[str, Any]) -> None:
+    async def _run_finder(self, item: Dict[str, Any], audit_key: str, idx: int, rec: Dict[str, Any],
+                          audit_profile: Optional[Dict[str, Any]] = None) -> None:
         if self.stop_requested():
             item["failedFinders"] = item.get("failedFinders", 0) + 1
             return
         meta: Dict[str, Any] = {}
         res = await self.runner.run(
-            self.pb.audit(item, lens_key, idx, S.FINDINGS_SCHEMA),
+            self.pb.audit(item, audit_key, idx, S.FINDINGS_SCHEMA, audit_profile=audit_profile),
             role="audit",
-            label=f"audit:{str(item.get('objective') or item.get('name') or item.get('pattern') or 'item')[:20]}:{lens_key}#{item['pass']}.{idx + 1}",
+            label=f"audit:{str(item.get('objective') or item.get('name') or item.get('pattern') or 'item')[:20]}:{audit_key}#{item['pass']}.{idx + 1}",
             schema=S.FINDINGS_SCHEMA,
             should_stop=self.stop_requested, meta=meta)
         if not res:
             item["failedFinders"] = item.get("failedFinders", 0) + 1
             return
-        self._consume(res, item, rec, lens_key, audit_model=meta.get("model"))
+        self._consume(res, item, rec, audit_key, audit_model=meta.get("model"))
 
     @staticmethod
     def _finder_result(res: Any) -> Dict[str, Any]:
@@ -2022,7 +2044,7 @@ class Pipeline:
         return value
 
     def _consume(self, res: Any, item: Dict[str, Any], rec: Dict[str, Any],
-                 lens_key: str, from_recheck: bool = False, audit_model: Optional[str] = None) -> None:
+                 audit_key: str, from_recheck: bool = False, audit_model: Optional[str] = None) -> None:
         """消化一次审计 / 复查 agent 的结果:findings→验证流水线、new_surfaces→主队列、risk_notes→即时复查。
         from_recheck=True 时,产出的 risk_notes 不再二次回灌优先队列(防自激)。
         audit_model:产出该批 finding 的模型,归因到候选(随候选流转到验证/确认/报告)。"""
@@ -2059,7 +2081,7 @@ class Pipeline:
             item["newThisRound"] = item.get("newThisRound", 0) + 1
             rec["candidates"] = rec.get("candidates", 0) + 1
             self.pending_findings[fk] = f
-            f["lens"] = lens_key
+            f["lens"] = audit_key
             payload = {**self._candidate_payload(f), "status": "pending"}
             self._save_candidate_state(payload)
             self.emit(EV.CANDIDATE_FOUND, payload)
@@ -2071,14 +2093,17 @@ class Pipeline:
             self.seen_surface.add(sk)
             item["newSurfacesThisRound"] = item.get("newSurfacesThisRound", 0) + 1
             rec["surfaces"] = rec.get("surfaces", 0) + 1
+            fallback_lens = audit_key if audit_key in self.cfg.lenses else "memory"
+            surface_lens = s.get("lens_hint") if s.get("lens_hint") in self.cfg.lenses else fallback_lens
             self._enqueue_work({"kind": "surface", "name": s.get("name"), "why": s.get("why"),
-                                "files": s.get("files"), "lens_hint": s.get("lens_hint")})
+                                "files": s.get("files"), "lens_hint": surface_lens})
             entry = {"name": s.get("name"), "why": s.get("why"), "files": s.get("files"),
-                     "lens_hint": s.get("lens_hint") or lens_key, "round": self.round, "from": rec.get("name")}
+                     "lens_hint": surface_lens, "round": self.round, "from": rec.get("name")}
             self.surface_log.append(entry)
             self.emit(EV.SURFACE_ADDED, entry)
         for n in risk_notes:
-            if self.record_risk(n, lens_key, self.round, from_recheck=from_recheck):
+            fallback_lens = audit_key if audit_key in self.cfg.lenses else "memory"
+            if self.record_risk(n, fallback_lens, self.round, from_recheck=from_recheck):
                 rec["risks"] = rec.get("risks", 0) + 1
 
     # ──────── 专用优先排查:历史变体 + 风险点复查(统一调度队列中的最高优先级)────────

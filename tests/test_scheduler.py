@@ -11,6 +11,7 @@ from proto_vuln_hunt.backends import AgentRunner
 from proto_vuln_hunt.config import Config, HistorySpec, RecheckSpec
 from proto_vuln_hunt.pipeline import Pipeline
 from proto_vuln_hunt.store import RunStore
+from proto_vuln_hunt import threat_analysis as TA
 
 
 def _pipe(tmp, **overrides):
@@ -195,6 +196,7 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
         class DummyRunner:
             def __init__(self):
                 self.order = []
+                self.prompts = []
                 self.agent_count = 0
                 self.usage_totals = {
                     "calls": 0,
@@ -208,6 +210,7 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
                 role = kwargs.get("role")
                 label = kwargs.get("label") or role
                 self.order.append((role, label))
+                self.prompts.append(_args[0] if _args else "")
                 return {"findings": [], "new_surfaces": [], "risk_notes": []}
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -221,6 +224,58 @@ class TestUnifiedScheduler(unittest.IsolatedAsyncioTestCase):
 
             roles = [r for r, _ in runner.order]
             self.assertEqual(roles, ["audit", "audit"])
+            self.assertTrue(all("请分析代码实现是否存在" in p for p in runner.prompts))
+            self.assertTrue(all("未找到与当前攻击面/攻击方式强相关的专用 skill" not in p for p in runner.prompts))
+            self.assertTrue(all("只查这一个 lens" not in p for p in runner.prompts))
+
+    def test_threat_attack_method_items_do_not_get_lens_hints(self):
+        graph = TA.normalize(_threat_raw())
+        items = graph["audit_items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["kind"], "attack_method")
+        self.assertNotIn("lens_hint", items[0])
+        self.assertNotIn("lens_hints", items[0])
+
+    def test_attack_method_pass_uses_audit_profile_not_lens_expansion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = _pipe(tmp, lenses=["memory", "integer", "dos"], finders_per_lens=2)
+            item = {"kind": "attack_method", "id": "a1", "name": "畸形消息", "priority": "high", "files": []}
+            p._start_audit_pass(item)
+
+            finders = [w for w in p.queue if w.get("kind") == "_finder"]
+            self.assertEqual(len(finders), 2)
+            self.assertTrue(all(w.get("audit_key") == "generic-attack-method" for w in finders))
+            self.assertTrue(all("lens_key" not in w for w in finders))
+
+    def test_attack_method_pass_uses_strongly_relevant_skill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = _pipe(tmp, lenses=["memory", "integer", "dos"], finders_per_lens=1)
+            item = {"kind": "attack_method", "id": "a1", "name": "认证绕过", "priority": "high", "files": []}
+            p._start_audit_pass(item)
+
+            finders = [w for w in p.queue if w.get("kind") == "_finder"]
+            self.assertEqual(len(finders), 1)
+            self.assertEqual(finders[0].get("audit_key"), "skill:authn")
+            self.assertEqual(finders[0].get("audit_profile", {}).get("kind"), "skill")
+
+    def test_generic_attack_method_template_composes_surface_and_method(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = _pipe(tmp)
+            item = {
+                "kind": "attack_method",
+                "name": "认证绕过",
+                "attack_context": {
+                    "surface": "IPSec协议",
+                    "method": "认证绕过",
+                    "preconditions": ["远程攻击者可发送协商报文"],
+                },
+            }
+
+            text = p.pb.attack_method_instruction(item, {"kind": "generic"})
+
+            self.assertIn("请分析代码实现是否存在IPSec协议认证绕过问题。", text)
+            self.assertIn("攻击方式成立前提:远程攻击者可发送协商报文", text)
+            self.assertNotIn("未找到与当前攻击面/攻击方式强相关的专用 skill", text)
 
     async def test_threat_completion_does_not_wait_for_active_history_before_audit(self):
         class DummyRunner:

@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List
+import re
+from typing import Any, Dict, List, Optional
 
 
 OUTPUT_LANGUAGE_ZH = (
@@ -96,6 +97,82 @@ FINDER_ANGLES = [
     "边界与错误路径:聚焦边界条件(0/负/最大长度/空)、错误与异常处理路径、资源清理与释放路径上的缺陷。",
 ]
 
+ATTACK_METHOD_ANGLES = [
+    "从攻击面入口出发,按理论攻击方式还原攻击者可控输入、协议状态或文件/配置对象,追踪到能实现关键风险的代码路径。",
+    "从攻击方式需要破坏的安全不变量出发,反向寻找相应校验、状态门、完整性校验、配额或隔离边界是否真实支配所有路径。",
+    "围绕威胁分析给出的代码路径做候选站点清点,只在 source→sink 或状态机追踪需要时跳读外部函数。",
+    "重点检查前置条件、异常路径和边界状态:攻击方式是否能在合法输入域和真实部署状态下触发坏结果。",
+]
+
+ATTACK_AUDIT_SKILLS = [
+    {
+        "id": "authn",
+        "label": "认证/授权/凭据审计",
+        "file": "lens-authn.md",
+        "keywords": [
+            "认证", "授权", "口令", "密码", "凭据", "会话", "令牌", "权限", "越权", "绕过",
+            "auth", "authn", "authz", "credential", "password", "token", "session", "privilege", "bypass",
+        ],
+    },
+    {
+        "id": "crypto",
+        "label": "加密/签名/密钥审计",
+        "file": "lens-crypto.md",
+        "keywords": [
+            "加密", "签名", "完整性", "证书", "密钥", "随机", "nonce", "iv", "tls", "算法降级",
+            "crypto", "cipher", "certificate", "key", "signature", "random",
+        ],
+    },
+    {
+        "id": "injection",
+        "label": "注入/路径/反序列化审计",
+        "file": "lens-injection.md",
+        "keywords": [
+            "注入", "命令", "路径", "穿越", "反序列化", "格式化", "解释器", "sql", "shell",
+            "inject", "command", "path", "traversal", "deser", "format", "symlink",
+        ],
+    },
+    {
+        "id": "race",
+        "label": "竞态/TOCTOU/状态竞争审计",
+        "file": "lens-race.md",
+        "keywords": ["竞态", "并发", "toctou", "double-fetch", "锁", "重入", "race", "concurrent", "interleaving"],
+    },
+    {
+        "id": "infoleak",
+        "label": "信息泄露/敏感输出审计",
+        "file": "lens-infoleak.md",
+        "keywords": ["泄露", "嗅探", "敏感", "未初始化", "padding", "地址泄露", "leak", "disclosure", "sniff"],
+    },
+    {
+        "id": "resource-realtime",
+        "label": "资源/实时性/嵌入式可用性审计",
+        "file": "lens-resource-realtime.md",
+        "keywords": [
+            "资源池", "实时", "定时器", "连接表", "消息队列", "descriptor", "watchdog", "任务栈",
+            "优先级反转", "deadline", "rtos", "mbuf", "sk_buff", "资源耗尽",
+        ],
+    },
+    {
+        "id": "dos",
+        "label": "拒绝服务/泛洪/崩溃审计",
+        "file": "lens-dos.md",
+        "keywords": ["拒绝服务", "泛洪", "崩溃", "死锁", "重启", "中断", "放大", "dos", "flood", "crash", "deadlock"],
+    },
+    {
+        "id": "integer",
+        "label": "整数/长度/类型边界审计",
+        "file": "lens-integer.md",
+        "keywords": ["整数", "长度", "溢出", "截断", "符号", "偏移", "序列号", "integer", "overflow", "trunc", "offset", "length"],
+    },
+    {
+        "id": "memory",
+        "label": "内存安全/越界/UAF审计",
+        "file": "lens-memory.md",
+        "keywords": ["内存", "越界", "释放", "uaf", "double-free", "oob", "buffer", "heap", "stack", "use-after-free"],
+    },
+]
+
 VERIFY_LENSES = [
     "可达性:从真实入口能否构造出到达此处的输入?中途有无 return/校验拦截?",
     "可控性:触发所需的值/长度/状态/顺序,攻击者能否真正控制?上游是否已夹紧?",
@@ -148,9 +225,138 @@ class PromptBuilder:
         return FINDER_ANGLES[idx % len(FINDER_ANGLES)]
 
     @staticmethod
+    def attack_method_angle(idx: int) -> str:
+        return ATTACK_METHOD_ANGLES[idx % len(ATTACK_METHOD_ANGLES)]
+
+    @staticmethod
     def lens_block(lens_key: str) -> str:
         l = LENS[lens_key]
         return f"【lens:{lens_key} {l['name']}】聚焦以下并只报这一类(速览;完整方法见方法文件):\n{l['heuristics']}"
+
+    @staticmethod
+    def _attack_context_text(item: Dict[str, Any]) -> str:
+        ctx = item.get("attack_context") or {}
+        code_paths = ctx.get("code_paths") or []
+        parts = [
+            item.get("name"), item.get("objective"),
+            ctx.get("asset_name"), ctx.get("risk_name"), ctx.get("attack_goal"),
+            ctx.get("domain"), ctx.get("surface"), ctx.get("surface_type"),
+            ctx.get("method"), " ".join(ctx.get("preconditions") or []),
+            " ".join(str(p.get("description") or "") for p in code_paths if isinstance(p, dict)),
+            " ".join(item.get("files") or []),
+        ]
+        return "\n".join(str(p) for p in parts if p).lower()
+
+    @staticmethod
+    def _attack_anchor_text(item: Dict[str, Any]) -> str:
+        ctx = item.get("attack_context") or {}
+        return " ".join(str(x) for x in [ctx.get("surface"), ctx.get("method"), item.get("name")] if x).lower()
+
+    @staticmethod
+    def _keyword_hits(text: str, keywords: List[str]) -> int:
+        return sum(1 for kw in keywords if kw and kw.lower() in text)
+
+    @staticmethod
+    def _read_skill_keywords(path: str) -> List[str]:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                head = "\n".join([next(f, "") for _ in range(80)])
+        except Exception:
+            return []
+        hits: List[str] = []
+        for line in head.splitlines():
+            if not re.match(r"\s*(keywords|applies_to|match)\s*:", line, re.IGNORECASE):
+                continue
+            _, value = line.split(":", 1)
+            value = value.strip().strip("[]")
+            hits.extend(x.strip().strip("'\"") for x in re.split(r"[,，;；]", value) if x.strip())
+        return hits
+
+    def _custom_attack_audit_skills(self) -> List[Dict[str, Any]]:
+        if not self.methods_ok:
+            return []
+        try:
+            names = sorted(os.listdir(self.methods_dir))
+        except Exception:
+            return []
+        out: List[Dict[str, Any]] = []
+        for name in names:
+            if not (name.startswith("audit-") or name.startswith("skill-")) or not name.endswith(".md"):
+                continue
+            path = os.path.join(self.methods_dir, name)
+            stem = os.path.splitext(name)[0]
+            keywords = self._read_skill_keywords(path)
+            if not keywords:
+                keywords = [x for x in re.split(r"[-_\s]+", stem) if x not in ("audit", "skill")]
+            out.append({"id": stem, "label": stem, "file": name, "keywords": keywords, "custom": True})
+        return out
+
+    def attack_method_audit_profile(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Select a strongly relevant pluggable audit skill for a threat method, or generic."""
+        text = self._attack_context_text(item)
+        anchor = self._attack_anchor_text(item)
+        candidates: List[Dict[str, Any]] = []
+        for skill in [*self._custom_attack_audit_skills(), *ATTACK_AUDIT_SKILLS]:
+            path = os.path.join(self.methods_dir, skill["file"])
+            if not os.path.isfile(path):
+                continue
+            keywords = [str(x).lower() for x in skill.get("keywords") or []]
+            anchor_hits = self._keyword_hits(anchor, keywords)
+            total_hits = self._keyword_hits(text, keywords)
+            if anchor_hits <= 0 or total_hits < 2:
+                continue
+            candidates.append({**skill, "path": path, "score": total_hits + anchor_hits})
+        if candidates:
+            best = sorted(candidates, key=lambda x: (-int(x.get("score") or 0), str(x.get("id") or "")))[0]
+            files = []
+            methodology = os.path.join(self.methods_dir, "00-methodology.md")
+            if os.path.isfile(methodology):
+                files.append(methodology)
+            files.append(best["path"])
+            if self._attack_context_is_protocolish(item):
+                proto = os.path.join(self.methods_dir, "protocol-stack.md")
+                if os.path.isfile(proto):
+                    files.append(proto)
+            return {
+                "id": f"skill:{best['id']}",
+                "kind": "skill",
+                "label": best.get("label") or best["id"],
+                "files": files,
+                "score": best.get("score") or 0,
+            }
+        return {"id": "generic-attack-method", "kind": "generic", "label": "通用攻击方式审计", "files": []}
+
+    @staticmethod
+    def _attack_context_is_protocolish(item: Dict[str, Any]) -> bool:
+        ctx = item.get("attack_context") or {}
+        text = " ".join(str(x) for x in [
+            ctx.get("surface_type"), ctx.get("surface"), ctx.get("method"), ctx.get("domain")
+        ] if x).lower()
+        return any(x in text for x in ["protocol", "message", "port", "service", "协议", "报文", "消息", "接口", "端口"])
+
+    def attack_method_instruction(self, item: Dict[str, Any], profile: Dict[str, Any]) -> str:
+        if profile.get("kind") == "skill":
+            files = "\n".join(f"  - {f}" for f in profile.get("files") or [])
+            return (
+                f"**审计 skill 模块**:{profile.get('label')}。这是与当前攻击面/攻击方式强相关的方法模块。\n"
+                "**先用 Read 读以下文件并按其中方法执行**:\n"
+                f"{files}\n"
+                "这些模块只提供审计方法和候选站点清点策略;不要把攻击方式重新归类成 lens,也不要泛扫无关缺陷。\n"
+            )
+        ctx = item.get("attack_context") or {}
+        surface = ctx.get("surface") or item.get("objective") or item.get("name") or "当前攻击面"
+        method = ctx.get("method") or item.get("name") or "当前攻击方式"
+        preconditions = "; ".join(ctx.get("preconditions") or []) or "无额外前置条件"
+        return (
+            f"请分析代码实现是否存在{surface}{method}问题。\n"
+            f"攻击方式成立前提:{preconditions}\n"
+            "审计要求:\n"
+            "1. 先定位该攻击面对应的真实入口、输入对象、状态转换或文件/配置对象。\n"
+            "2. 按该攻击方式构造 source→sink / state→effect 路径,核实攻击者是否可达、可控。\n"
+            "3. 检查代码中是否存在能阻断该攻击方式的认证、授权、完整性校验、长度边界、资源配额、状态门或隔离边界。\n"
+            "4. 只有能证明缺少有效约束并可导致关键风险时才输出 finding。\n"
+            "5. 若当前路径安全但发现共享 helper 依赖调用方校验,按 risk_notes 登记即时复查种子。\n"
+        )
 
     def file_partition(self, item: Dict[str, Any], idx: int) -> str:
         fl: List[str] = item.get("files") or []
@@ -214,7 +420,8 @@ class PromptBuilder:
         )
 
     # ── 审计 finder ──
-    def audit(self, item: Dict[str, Any], lens_key: str, idx: int, schema) -> str:
+    def audit(self, item: Dict[str, Any], lens_key: str, idx: int, schema,
+              audit_profile: Optional[Dict[str, Any]] = None) -> str:
         kind = item.get("kind")
         if kind == "attack_method":
             ctx_obj = item.get("attack_context") or {}
@@ -240,6 +447,14 @@ class PromptBuilder:
                 "任务:围绕这个攻击树叶子 method,判断代码中是否存在可达、可控、能导致对应风险的真实漏洞。"
                 "不要泛扫整个仓,优先覆盖威胁分析给出的代码路径;只有追踪 source→sink 时才跳读外部相关函数。"
             )
+            audit_guidance = self.attack_method_instruction(
+                item, audit_profile or self.attack_method_audit_profile(item)
+            )
+            angle_note = (
+                f"- **本 agent 的独特调查角度(#{idx + 1},围绕当前攻击面/攻击方式互补排查)**:"
+                f"{self.attack_method_angle(idx)}{self.file_partition(item, idx)}\n"
+                "(不按 lens 分类泛扫;只判断该攻击方式在该攻击面对应代码中是否存在真实可利用缺陷。)"
+            )
         elif kind == "task":
             head = f"审计子任务「{item.get('objective')}」(属攻击面区域:{item.get('region') or '?'})"
             files = ", ".join(item.get("files") or [])
@@ -251,6 +466,12 @@ class PromptBuilder:
                 f"入口点:{', '.join(item.get('entry_points') or []) or '自行定位'}\n"
                 "**严格限定**:只精读上述范围内的代码;**不要通读范围外的文件**,只在追溯 source→sink 时才跳读外部的相关函数;够了就收尾返回。"
             )
+            audit_guidance = f"{self.methods_instruction(lens_key, True)}{self.lens_block(lens_key)}"
+            angle_note = (
+                f"- **本 finder 的独特调查角度(#{idx + 1},与同 lens 的其它并行 finder 互补,不要重复别人的角度)**:"
+                f"{self.finder_angle(idx)}{self.file_partition(item, idx)}\n"
+                "(只查这一个 lens;其他 lens 与未覆盖代码由别的 agent / 后续轮次覆盖。)"
+            )
         elif kind == "region":
             head = f"攻击面区域「{item.get('name')}」({item.get('category')})"
             files = ", ".join(item.get("files") or [])
@@ -259,22 +480,40 @@ class PromptBuilder:
                 f"信任边界:{item.get('trust_boundary') or '(未注明)'}\n"
                 f"入口点:{', '.join(item.get('entry_points') or []) or '自行定位'}"
             )
+            audit_guidance = f"{self.methods_instruction(lens_key, True)}{self.lens_block(lens_key)}"
+            angle_note = (
+                f"- **本 finder 的独特调查角度(#{idx + 1},与同 lens 的其它并行 finder 互补,不要重复别人的角度)**:"
+                f"{self.finder_angle(idx)}{self.file_partition(item, idx)}\n"
+                "(只查这一个 lens;其他 lens 与未覆盖代码由别的 agent / 后续轮次覆盖。)"
+            )
         elif kind == "variant":
             head = f"**同类变体排查**:历史问题模式「{item.get('pattern')}」(出处:{item.get('source') or '?'})"
             files = ", ".join(item.get("files") or [])
             ctx = ("任务:理解该历史问题的根因后,在**全仓搜索同类代码模式**(可用 rg / semgrep / tree-sitter 脚本 / "
                    "CodeQL 免编译查询枚举全仓同类站点),逐一核实是否存在相同或相似缺陷。这是有的放矢的定向排查,不是盲扫。")
+            audit_guidance = f"{self.methods_instruction(lens_key, True)}{self.lens_block(lens_key)}"
+            angle_note = (
+                f"- **本 finder 的独特调查角度(#{idx + 1},与同 lens 的其它并行 finder 互补,不要重复别人的角度)**:"
+                f"{self.finder_angle(idx)}{self.file_partition(item, idx)}\n"
+                "(只查这一个 lens;其他 lens 与未覆盖代码由别的 agent / 后续轮次覆盖。)"
+            )
         else:  # surface
             head = f"**动态新增攻击面**「{item.get('name')}」"
             files = ", ".join(item.get("files") or [])
             ctx = f"为何可疑:{item.get('why')}"
+            audit_guidance = f"{self.methods_instruction(lens_key, True)}{self.lens_block(lens_key)}"
+            angle_note = (
+                f"- **本 finder 的独特调查角度(#{idx + 1},与同 lens 的其它并行 finder 互补,不要重复别人的角度)**:"
+                f"{self.finder_angle(idx)}{self.file_partition(item, idx)}\n"
+                "(只查这一个 lens;其他 lens 与未覆盖代码由别的 agent / 后续轮次覆盖。)"
+            )
 
         return (
             f"你在对 C/C++ 源码做白盒**定向人工审计**。目标:{self.target}{self.scope_note}(威胁模型:{self.threat})\n"
             f"审计对象:{head}\n"
             f"涉及文件:{files or '(自行定位)'}\n"
             f"{ctx}\n\n"
-            f"{self.methods_instruction(lens_key, True)}{self.lens_block(lens_key)}\n\n"
+            f"{audit_guidance}\n\n"
             f"{PROTO_EXTRA}\n\n"
             "要求:\n"
             "- 用 Read/rg 看**真实代码**,回溯数据流,不要臆测。允许用 semgrep / tree-sitter 小脚本 / CodeQL(免编译)辅助定位同类站点,但判定真伪以人工精读为准。\n"
@@ -287,8 +526,7 @@ class PromptBuilder:
             "但 B(或某个危险原语/共享 helper)的安全**依赖调用方传入已校验的参数**,而**全仓其它调用 B 的地方未必都做了等价校验**。"
             "此时 note 写明:B 的位置、B 被调用前必须满足的前提/校验、A 中已做对的校验代码位置与逻辑;good_validation_ref 填 A 的 path:line + 一句话正例。\n"
             "- **聚焦、限时**:挑最相关的约 8~12 个函数/代码段精读即可,不要遍历整个大仓;够了就收尾返回。\n"
-            f"- **本 finder 的独特调查角度(#{idx + 1},与同 lens 的其它并行 finder 互补,不要重复别人的角度)**:{self.finder_angle(idx)}{self.file_partition(item, idx)}\n"
-            "(只查这一个 lens;其他 lens 与未覆盖代码由别的 agent / 后续轮次覆盖。)"
+            f"{angle_note}"
             + must_struct(schema)
         )
 
