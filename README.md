@@ -102,7 +102,7 @@ models:                               # 按 role 显式配模型;不支持 model
   poc:     claude-sonnet-4-6
 
 concurrency: 4                        # 全局同时运行的 agent 上限
-model_concurrency:                    # 单个模型自己的并发上限;未列出则默认等于全局 concurrency
+model_concurrency:                    # 单个模型自己的并发上限;未列出则默认 1,可用 default 覆盖
   default: 1
   claude-sonnet-4-6: 2
   claude-opus-4-8: 1

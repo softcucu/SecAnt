@@ -364,6 +364,9 @@ function viewDashboard(runId) {
   let candidatesLoading = null;
   let usageLoaded = false;
   let usageLoading = null;
+  let threatLoadAttempted = false;
+  let threatLoading = null;
+  let threatRefreshTimer = null;
   let elapsedBase = 0;
   let elapsedBaseAt = Date.now();
   // 候选列表缓存:仅在新增/清空候选时失效,渲染期间复用同一数组,
@@ -1890,7 +1893,7 @@ function viewDashboard(runId) {
     const g = S.threat;
     if (!g || !Array.isArray(g.assets)) {
       tabBody.append(el("div", { class: "panel empty" }, "攻击树威胁分析尚未完成。"));
-      fetchThreat();
+      if (!threatLoadAttempted) scheduleThreatFetch(0);
       return;
     }
     const stats = g.stats || {};
@@ -2166,8 +2169,8 @@ function viewDashboard(runId) {
         if (activeTab === "coverage" || activeTab === "history") renderTab(); break;
       case "round_start": S.round = d.round; renderHeader(); break;
       case "round_done": S.round = d.round; S.dry = d.dry_streak; renderHeader(); break;
-      case "threat_analysis_done": fetchThreat(); fetchCoverage(); break;
-      case "threat_node_upserted": fetchThreat(); break;
+      case "threat_analysis_done": scheduleThreatFetch(0); fetchCoverage(); break;
+      case "threat_node_upserted": scheduleThreatFetch(); break;
       case "history_added": flash(`🕮 历史问题模式 +1(共 ${d.total || "?"} 条):${(d.pattern || "").slice(0, 50)}`); fetchHistory(); fetchCoverage(); break;
       case "run_done": applyMetrics(d); setRunStatus(d.status || "done"); renderHeader(); break;
       case "config_updated":
@@ -2186,7 +2189,25 @@ function viewDashboard(runId) {
     }
   }
   async function fetchHistory() { try { S.history = await api("GET", `/api/runs/${encodeURIComponent(runId)}/history`) || []; renderHeader(); renderTabs(); if (activeTab === "history" || activeTab === "coverage") renderTab(); } catch (e) {} }
-  async function fetchThreat() { try { S.threat = await api("GET", `/api/runs/${encodeURIComponent(runId)}/threat-analysis`); renderTabs(); if (activeTab === "threat") renderTab(); } catch (e) {} }
+  function scheduleThreatFetch(delay = 500) {
+    if (threatRefreshTimer) return;
+    threatRefreshTimer = setTimeout(() => {
+      threatRefreshTimer = null;
+      fetchThreat();
+    }, delay);
+  }
+  async function fetchThreat() {
+    threatLoadAttempted = true;
+    if (threatLoading) return threatLoading;
+    threatLoading = (async () => {
+      try {
+        S.threat = await api("GET", `/api/runs/${encodeURIComponent(runId)}/threat-analysis`);
+        renderTabs();
+        if (activeTab === "threat") renderTab();
+      } catch (e) {}
+    })().finally(() => { threatLoading = null; });
+    return threatLoading;
+  }
   async function fetchCoverage() { try { const c = await api("GET", `/api/runs/${encodeURIComponent(runId)}/coverage`); if (c) { S.coverage = Object.assign({}, S.coverage, c); if (activeTab === "coverage" || activeTab === "history") renderTab(); } } catch (e) {} }
   async function fetchRisks() { try { const list = await api("GET", `/api/runs/${encodeURIComponent(runId)}/risks`); for (const r of (list || [])) { const k = (r.area || "") + "::" + (r.file || ""); S.risks.set(k, r); } S.riskTotal = Math.max(S.riskTotal || 0, S.risks.size); renderHeader(); renderTabs(); if (activeTab === "risks") renderTab(); } catch (e) {} }
   async function fetchHealth() { try { const h = await api("GET", `/api/runs/${encodeURIComponent(runId)}/health`); for (const r of (h.models || [])) if (r.model) S.health.set(r.model, r); renderTabs(); if (activeTab === "health") renderTab(); } catch (e) {} }

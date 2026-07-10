@@ -30,7 +30,7 @@ models:
 
 # ── 并发 ──
 # concurrency 是全局 agent 上限;model_concurrency 是单个模型自己的上限。
-# 未在 model_concurrency 里列出的模型,默认最多可用到全局 concurrency。
+# 未在 model_concurrency 里列出的模型,默认最多同时跑 1 个;可用 default 覆盖。
 concurrency: 4
 model_concurrency:
   default: 1                    # 可选:所有未单独列出的模型默认同时只跑 1 个
